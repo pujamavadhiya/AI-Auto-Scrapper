@@ -196,54 +196,243 @@ def run_search_engine(
     return [] if answered else None
 
 
+TITLE_WORDS = re.compile(
+    r"\b(CEO|CTO|COO|CFO|CMO|CIO|CRO|CCO|Founder|Co-Founder|Co-founder|Owner|Co-Owner|President|VP|Vice President|Director|Head|Lead|Partner|Managing Director|Officer|Executive)\b",
+    re.I,
+)
+
+ROLE_WORDS = re.compile(
+    r"\b(architect|consultant|analyst|developer|engineer|specialist|manager|director|officer|executive|president|founder|owner|partner|head|lead|leader|leadership|strategist|advisor|entrepreneur|technologist|operator|member|innovator|evangelist|enthusiast|mentor|decision maker|decision-maker)\b",
+    re.I,
+)
+
+GENERIC_COMPANY_TERMS = re.compile(
+    r"^(helping|services|it services|software|technology|consulting|incubator|building|experienced|seasoned|passionate|professional|specialist|business|commercialization|co|self-employed|freelance|stealth|ex-|award-winning|growth-driven|results-driven|visionary|champion|expert)$",
+    re.I,
+)
+
+ING_WORDS = re.compile(
+    r"^(helping|scaling|building|driving|growing|empowering|leading|managing|innovating|transforming|accelerating|creating|enabling|providing|delivering|advising|consulting|investing|ex-)\b",
+    re.I,
+)
+
+DISCIPLINE_TERMS = re.compile(
+    r"\b(decision maker|business decision|decision-maker|project management|construction management|product management|business development|operations management|marketing strategy|digital marketing|full stack|software development|it services|sales management|account management|management|execution)\b",
+    re.I,
+)
+
+
+def clean_title(title: str) -> str:
+    title = re.sub(r"^[↳\s*•·]+", "", title).strip()
+    title = re.sub(r"\s*\((?:he/him|she/her|they/them)\)", "", title, flags=re.I).strip()
+    if "•" in title or "·" in title or "|" in title:
+        subparts = [p.strip() for p in re.split(r"[•·|]+", title) if p.strip()]
+        for sp in subparts:
+            if TITLE_WORDS.search(sp):
+                title = sp
+                break
+    m_broken = re.search(r"^(.*?)\s*&\s*[A-Za-z]{1,4}$", title)
+    if m_broken:
+        title = m_broken.group(1).strip()
+    return title
+
+NON_LOCATION_WORDS = re.compile(
+    r"\b(is|are|was|were|has|have|had|been|alone|doesn|incubator|technologist|entrepreneur|helping|scale|growth|platform|solution|solutions|team|services|companies|firm|global|author|consultant|mentor|speaker|enthusiast|leader|engineer|developer|developers|group|organiser|organizer|driving|delivering|commercialization|innovations|products|engineering|community|builder|member|volunteer)\b",
+    re.I,
+)
+
+LOCATION_INDICATORS = re.compile(
+    r"\b(Area|City|State|Region|District|Province|India|United States|USA|UK|United Kingdom|Canada|Australia|Germany|France|Netherlands|Singapore|UAE|Dubai|Gujarat|Maharashtra|Karnataka|Delhi|Texas|California|New York|Florida|Illinois|London|San Francisco|Austin|Ahmedabad|Mumbai|Bangalore|Bengaluru|Pune|Hyderabad|Chennai|Kolkata)\b",
+    re.I,
+)
+
+
 def tidy(v: Any) -> str:
     return re.sub(r"\s*(\.{3}|\u2026)\s*$", "", str(v or "")).strip()
 
 
-def parse_result(r: Dict[str, str]) -> Optional[Dict[str, str]]:
+def extract_location_from_snippet(snip: str, default_location: str = "") -> str:
+    # 1. Explicit "Location: X"
+    m_loc = re.search(r"Location:\s*([A-Za-z0-9\s,.-]+?)(?=\s*(?:[|·•\n]|\bconnections\b|Experience:|$))", snip, re.I)
+    if m_loc:
+        cand = m_loc.group(1).strip()
+        if (
+            len(cand) >= 2
+            and not NON_LOCATION_WORDS.search(cand)
+            and not ROLE_WORDS.search(cand)
+            and not TITLE_WORDS.search(cand)
+            and (LOCATION_INDICATORS.search(cand) or "," in cand)
+        ):
+            return cand
+
+    # 2. Look for middots with geographic keywords: · Greater Ahmedabad Area ·
+    m_mid = re.findall(r"[·•]\s*([A-Z][A-Za-z\s,.-]{2,45}?)\s*[·•]", snip)
+    for cand in m_mid:
+        cand = cand.strip()
+        if (
+            not NON_LOCATION_WORDS.search(cand)
+            and not ROLE_WORDS.search(cand)
+            and not TITLE_WORDS.search(cand)
+            and LOCATION_INDICATORS.search(cand)
+        ):
+            return cand
+
+    # 3. Look for City, State / Country in snippet (must match known geographic indicator)
+    m_geo = re.search(r"\b([A-Z][a-zA-Z\s]+,\s*[A-Z][a-zA-Z\s]+(?:Area|India|United States|USA|UK|Canada|Australia|Germany)?)\b", snip)
+    if m_geo:
+        cand = m_geo.group(1).strip()
+        if (
+            len(cand.split()) <= 5
+            and not NON_LOCATION_WORDS.search(cand)
+            and not ROLE_WORDS.search(cand)
+            and not TITLE_WORDS.search(cand)
+            and LOCATION_INDICATORS.search(cand)
+        ):
+            return cand
+
+    # 4. If search location is mentioned in snippet, use default_location
+    if default_location:
+        for part in [p.strip() for p in re.split(r"[,/]+", default_location) if len(p.strip()) > 2]:
+            if re.search(r"\b" + re.escape(part) + r"\b", snip, re.I):
+                return default_location
+
+    return default_location
+
+
+def parse_result(r: Dict[str, str], default_location: str = "") -> Optional[Dict[str, str]]:
     link = r.get("url") or ""
     if not re.search(r"linkedin\.com/in/", link, re.I):
         return None
-    clean = re.sub(r"\s*[|\-\u2013]\s*LinkedIn\s*$", "", str(r.get("title") or ""), flags=re.I)
+    raw_title = str(r.get("title") or "")
+    # If search engines glued multiple profiles with ... or …, take the first profile segment
+    if "..." in raw_title or "…" in raw_title:
+        raw_title = re.split(r"(?:\.{2,3}|\u2026)", raw_title)[0].strip()
+    clean = re.sub(r"\s*[|\-\u2013]\s*LinkedIn.*$", "", raw_title, flags=re.I).strip()
     
-    # Split by hyphen or pipe
     parts = [x.strip() for x in re.split(r"\s+[-\u2013|]\s+", clean) if x.strip()]
     if not parts:
         return None
 
     full_name = parts[0]
+    full_name = re.sub(r"^[↳\s*•·]+", "", full_name).strip()
+    full_name = re.sub(r"\s*\((?:he/him|she/her|they/them)\)", "", full_name, flags=re.I).strip()
     snip = str(r.get("snippet") or "")
-    title = parts[1] if len(parts) > 1 else ""
-    company = tidy(parts[2]) if len(parts) > 2 else ""
 
-    at = re.match(r"^(.*?)\s+(?:at|@)\s+(.+)$", title, re.I)
-    if at:
-        title = at.group(1).strip()
-        company = company or tidy(at.group(2))
-    elif re.search(r"\s+(?:at|@)\s+", clean, re.I):
-        m_at = re.search(r"\s+(?:at|@)\s+([A-Za-z0-9\s.,&'-]+)", clean, re.I)
-        if m_at and not company:
-            company = tidy(m_at.group(1))
+    title = ""
+    company = ""
 
-    if re.search(r"area|united states|region", company, re.I):
+    rem_parts = parts[1:]
+    if len(rem_parts) == 1:
+        p = rem_parts[0]
+        m_at = re.search(r"^(.*?)\s+(?:at|@)\s+(.+)$", p, re.I)
+        if m_at:
+            title = m_at.group(1).strip()
+            company = m_at.group(2).strip()
+        else:
+            if TITLE_WORDS.search(p):
+                title = p
+            else:
+                company = p
+    elif len(rem_parts) >= 2:
+        p1, p2 = rem_parts[0], rem_parts[1]
+        p1_has_title = bool(TITLE_WORDS.search(p1))
+        p2_has_title = bool(TITLE_WORDS.search(p2))
+
+        if p1_has_title and not p2_has_title:
+            title = p1
+            company = p2
+        elif p2_has_title and not p1_has_title:
+            company = p1
+            title = p2
+        else:
+            title = p1
+            company = p2
+
+    if company.startswith("↳"):
+        company = re.sub(r"^[↳\s*•·]+", "", company).strip()
+    if title.startswith("↳"):
+        title = re.sub(r"^[↳\s*•·]+", "", title).strip()
+
+    # Check if title is formatted strictly as "Role, Company" (e.g., "CEO, Ajmera Infotech Inc.")
+    m_comma_title = re.match(r"^(CEO|CTO|COO|CFO|CMO|CIO|CRO|CCO|Founder|Co-Founder|Co-founder|Owner|President|VP|Vice President|Director|Managing Director),\s+([A-Za-z0-9&.,'’ -]{2,50})$", title, re.I)
+    if m_comma_title:
+        cand = m_comma_title.group(2).strip()
+        if not (cand.startswith("&") or cand.lower().startswith("and ") or ROLE_WORDS.search(cand) or TITLE_WORDS.search(cand)):
+            title = m_comma_title.group(1).strip()
+            if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
+                company = cand
+
+    # If company was accidentally populated by a role keyword
+    if company.lower() in ("owner", "founder", "co-founder", "ceo", "cto", "coo", "cfo", "director", "president", "managing director", "partner", "executive"):
         company = ""
 
-    # Look for Experience snippet
-    exp = re.search(r"Experience:\s*([^.\u00b7|\n]+?)(?=\s*(?:\.|\bLocation:|$))", snip, re.I)
-    if exp and not company:
-        company = tidy(exp.group(1))
+    # Look into snippet for company if missing or generic
+    if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
+        # Check "Experience: Company"
+        m_exp = re.search(r"Experience:\s*([A-Za-z0-9&.,'’ -]{2,40}?)(?=\s*(?:[·•|\n]|--|\bLocation:|\bconnections\b|$))", snip, re.I)
+        if m_exp:
+            c_cand = m_exp.group(1).strip()
+            if not GENERIC_COMPANY_TERMS.match(c_cand) and len(c_cand) > 2:
+                company = c_cand
 
-    # Look for current company in snippet (e.g., "CEO at Acme Corp")
-    if not company:
-        snip_comp = re.search(r"(?:at|@)\s+([A-Z][A-Za-z0-9&.,' -]{2,30})", snip)
-        if snip_comp:
-            company = tidy(snip_comp.group(1))
+        # Check "CEO of Company" or "Founder of Company"
+        if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
+            m_of = re.search(r"\b(?:CEO|Founder|Owner|President|Director|VP|COO|CTO)\b[^\n|·•]*?\bof\s+([A-Za-z0-9&.,'’ -]{2,40}?)(?=\s*(?:[|·•\n,]|\(|\ba\b|\ban\b|\bthe\b|\bwhich\b|\bwhere\b|$))", snip, re.I)
+            if m_of:
+                c_cand = m_of.group(1).strip()
+                if not GENERIC_COMPANY_TERMS.match(c_cand) and len(c_cand) > 2:
+                    company = c_cand
+
+        # Check "CEO at Company"
+        if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
+            m_at = re.search(r"\b(?:CEO|Founder|Owner|President|Director|VP|COO|CTO|Lead)\b[^\n|·•]*?\bat\s+([A-Za-z0-9&.,'’ -]{2,40}?)(?=\s*(?:[|·•\n,]|\(|\bwith\b|\bhelping\b|\bdelivering\b|\bdriving\b|$))", snip, re.I)
+            if m_at:
+                c_cand = m_at.group(1).strip()
+                if not GENERIC_COMPANY_TERMS.match(c_cand) and len(c_cand) > 2:
+                    company = c_cand
+
+        # Check "CEO @ Company"
+        if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
+            m_snip_at = re.search(r"(?:CEO|Founder|Director|Owner|President|VP|Partner|Lead)[^@\n]*@\s*([A-Za-z0-9&.,'’ -]{2,40}?)(?=\s*(?:[|·•\n]|\(|$))", snip, re.I)
+            if m_snip_at:
+                c_cand = m_snip_at.group(1).strip()
+                if not GENERIC_COMPANY_TERMS.match(c_cand) and len(c_cand) > 2:
+                    company = c_cand
+
+    # Clean company name
+    company = re.split(r"\s*[|·•]+\s*", company)[0].strip()
+    if "..." in company or "…" in company:
+        company = re.split(r"(?:\.{2,3}|\u2026)\s*", company)[-1].strip()
+    m_at_comp = re.search(r"(?:at|@)\s*([A-Za-z0-9&.,'’ -]{2,40})", company, re.I)
+    if m_at_comp:
+        company = m_at_comp.group(1).strip()
+    company = re.sub(r"[\s.]*(?:\.{2,3}|\u2026).*$", "", company).strip()
+    company = re.sub(r"^(at|@)\s*", "", company, flags=re.I).strip()
+    company = re.sub(r"\s+(?:LinkedIn.*|Area|Region)$", "", company, flags=re.I).strip()
+
+    # If title has @Company or at Company (e.g. "Founder & CEO @Technource")
+    m_at_title = re.search(r"^(.*?)\s*[@|at]\s*([A-Za-z0-9&.,'’ -]+)$", title, re.I)
+    if m_at_title:
+        title = m_at_title.group(1).strip()
+        comp_from_title = m_at_title.group(2).strip()
+        if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
+            company = comp_from_title
+
+    # Validate that company is not actually a job title (e.g. "Solutions Architect") or discipline
+    has_company_suffix = bool(re.search(r"\b(Technologies|Software|Pvt|Ltd|Inc|LLC|Corp|Group|Labs|Media|Holdings|Ventures|Enterprises|Studio|Agency|Network)\b|\bSolutions\s+(?:Pvt|Ltd|LLC|Inc|Private|Company)", company, re.I))
+    if (ROLE_WORDS.search(company) or DISCIPLINE_TERMS.search(company)) and not has_company_suffix:
+        company = ""
+
+    # Validate that company is not just a geographic entity
+    if LOCATION_INDICATORS.search(company) and not has_company_suffix:
+        company = ""
 
     profile_url = link.split("?")[0].rstrip("/")
-    loc = re.search(r"Location:\s*([^.\u00b7|\n]+)", snip, re.I) or re.search(
-        r"([A-Za-z\s]+,\s*[A-Za-z\s]+(?:Area)?|[A-Za-z\s]+(?:Area)?)", snip
-    )
-    location = loc.group(1).strip() if loc else ""
+    location = extract_location_from_snippet(snip, default_location)
+    if DISCIPLINE_TERMS.search(location):
+        location = default_location
+
+    title = clean_title(title)
 
     return {
         "full_name": full_name,
@@ -365,6 +554,16 @@ class KeywordLinkedInCollector:
             parts.append(self.config.country.strip())
         return " ".join(parts)
 
+    def get_formatted_location(self) -> str:
+        parts = []
+        if self.config.city:
+            parts.append(self.config.city.strip())
+        if self.config.state:
+            parts.append(self.config.state.strip())
+        if self.config.country:
+            parts.append(self.config.country.strip())
+        return ", ".join(parts) if parts else "Global"
+
     def build_search_queries(self) -> List[Dict[str, Any]]:
         loc_term = self.build_location_term()
         loc_clause = f'"{loc_term}"' if loc_term else ""
@@ -421,46 +620,69 @@ class KeywordLinkedInCollector:
         if not parsed or not parsed.get("profile_url") or not parsed.get("full_name"):
             return None
 
+        full_name = parsed.get("full_name", "").strip()
+        # Filter directory / list pages or invalid person names
+        if (
+            LOCATION_INDICATORS.search(full_name)
+            or re.search(r"\b(Top|Best|Profiles|Founders|Companies|Community|Members|Directory|List)\b", full_name, re.I)
+            or len(full_name.split()) > 4
+            or len(full_name) <= 2
+        ):
+            return None
+
         url_key = parsed["profile_url"].lower().rstrip("/")
         if url_key in self.seen_urls:
             return None
 
-        title = parsed.get("title", "")
-        company = parsed.get("company", "")
-        loc = parsed.get("location", "")
+        title = parsed.get("title", "").strip()
+        company = parsed.get("company", "").strip()
+        loc = parsed.get("location", "").strip()
 
         if BAD_TITLE.search(title):
             return None
 
-        if not company:
-            # If no explicit company parsed, fallback to industry/keyword or self-employed
-            company = f"{query_meta.get('keyword', 'Business')} Enterprise"
+        # Ensure title is actually a decision-maker title
+        if not TITLE_WORDS.search(title) and not any(k in title.lower() for k in ("chief", "head", "lead", "principal", "manager")):
+            return None
 
-        self.seen_urls.add(url_key)
+        # Do not accept generic terms, slogans, or role keywords as company name
+        has_company_suffix = bool(re.search(r"\b(Technologies|Software|Pvt|Ltd|Inc|LLC|Corp|Group|Labs|Media|Holdings|Ventures|Enterprises|Studio|Agency|Network)\b|\bSolutions\s+(?:Pvt|Ltd|LLC|Inc|Private|Company)", company, re.I))
+        if (
+            not company
+            or GENERIC_COMPANY_TERMS.match(company)
+            or len(company) <= 2
+            or ING_WORDS.match(company)
+            or company.lower() in ("owner", "founder", "co-founder", "ceo", "cto", "coo", "cfo", "director", "president", "managing director", "partner", "executive")
+            or ((ROLE_WORDS.search(company) or DISCIPLINE_TERMS.search(company)) and not has_company_suffix)
+        ):
+            return None
 
-        # Check location conflict if specific state or city was given
-        req_loc = self.build_location_term().lower()
-        if req_loc and loc:
-            # If location is present in snippet and does not match requested location
-            req_tokens = [tok for tok in re.split(r"[\s,]+", req_loc) if len(tok) > 2]
-            if req_tokens and not any(tok in loc.lower() for tok in req_tokens):
-                # We won't strictly discard unless clearly different country
-                pass
+        # If location is empty, contains prose junk, roles, or raw search terms
+        fmt_loc = self.get_formatted_location()
+        if (
+            not loc
+            or NON_LOCATION_WORDS.search(loc)
+            or ROLE_WORDS.search(loc)
+            or TITLE_WORDS.search(loc)
+            or len(loc) <= 2
+            or loc == self.build_location_term()
+        ):
+            loc = fmt_loc
 
         self.seen_urls.add(url_key)
 
         return {
             "tab": "Collected",
-            "Region": self.config.state or self.config.country or "Global",
+            "Region": self.config.state or self.config.city or self.config.country or "Global",
             "Segment": query_meta.get("keyword", "General"),
             "Company name": company,
             "Company size": "",
             "Industry": "",
             "Industry source": "",
             "Full name": parsed["full_name"],
-            "Title": title,
+            "Title": title or "Executive",
             "Profile URL": parsed["profile_url"],
-            "Location": loc or self.build_location_term(),
+            "Location": loc,
             "Contact type": "Decision Maker",
             "Search used": query_meta.get("query", ""),
             "Date collected": datetime.now().strftime("%Y-%m-%d"),
@@ -471,6 +693,7 @@ class KeywordLinkedInCollector:
         queries = self.build_search_queries()
         target = self.config.target_count
         engines = ["ddg", "bing"]
+        def_loc = self.build_location_term()
 
         self.emit("start", {
             "message": f"Starting keyword scraper. Target: {target} profiles.",
@@ -518,7 +741,7 @@ class KeywordLinkedInCollector:
                 if len(self.collected_rows) >= target or self.stop_requested.is_set():
                     break
 
-                parsed = parse_result(r)
+                parsed = parse_result(r, default_location=def_loc)
                 row = self.accept_profile(parsed, q_item)
                 if not row:
                     continue
