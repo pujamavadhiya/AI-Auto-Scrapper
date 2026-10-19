@@ -7,8 +7,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sys
 import tempfile
+import threading
+import time
 import traceback
 import unittest
 import uuid
@@ -27,7 +30,7 @@ load_dotenv(BASE_DIR / ".env")
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import pandas as pd
@@ -41,6 +44,7 @@ from linkedin_finder import (
     RowResult,
     FatalSerpError,
 )
+from linkedin_collector import CollectorConfig, KeywordLinkedInCollector
 
 app = FastAPI(title="AI Auto Scrapper API", version="1.0.0")
 
@@ -53,6 +57,7 @@ app.add_middleware(
 )
 
 TEMP_STORAGE: Dict[str, Path] = {}
+COLLECTOR_TASKS: Dict[str, Dict[str, Any]] = {}
 
 
 class EnrichRowsPayload(BaseModel):
@@ -270,6 +275,206 @@ def download_generated_file(file_id: str):
         filename=file_path.name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+class StartCollectorPayload(BaseModel):
+    keywords: List[str]
+    country: Optional[str] = ""
+    state: Optional[str] = ""
+    city: Optional[str] = ""
+    targetCount: Optional[int] = 50
+    titles: Optional[List[str]] = None
+    companySize: Optional[str] = "all"
+    enrichCompany: Optional[bool] = True
+
+
+def _run_collector_thread(task_id: str, cfg: CollectorConfig):
+    task = COLLECTOR_TASKS[task_id]
+
+    def on_event(event: Dict[str, Any]):
+        task["events"].append(event)
+        etype = event.get("type")
+        if etype == "query_start":
+            task["latestQuery"] = event.get("query", "")
+            task["activeEngine"] = event.get("engine", "")
+            task["progressMessage"] = f"Searching {event.get('engine', '').upper()} for {event.get('query', '')[:40]}..."
+        elif etype == "profile_found":
+            prof = event.get("profile")
+            if prof:
+                task["records"].append(prof)
+                task["progressMessage"] = f"Found {prof.get('Full name')} at {prof.get('Company name')}"
+        elif etype == "target_reached":
+            task["progressMessage"] = event.get("message", "Target profile count reached!")
+        elif etype == "enrich_start":
+            task["progressMessage"] = "Enriching company industry & size without guessing..."
+        elif etype == "company_enriched":
+            task["progressMessage"] = f"Enriched {event.get('company')}: {event.get('industry')}"
+        elif etype == "completed":
+            task["progressMessage"] = event.get("message", "Scraping completed.")
+
+    try:
+        collector = KeywordLinkedInCollector(config=cfg, on_event=on_event)
+        task["collector"] = collector
+        rows = collector.run()
+
+        # Generate output Excel file
+        temp_dir = tempfile.mkdtemp()
+        kw_slug = re.sub(r"[^a-zA-Z0-9]+", "_", cfg.keywords[0] if cfg.keywords else "leads")[:20]
+        out_filename = f"linkedin_profiles_{kw_slug}_{int(time.time())}.xlsx"
+        out_path = Path(temp_dir) / out_filename
+        collector.write_excel(out_path)
+
+        file_id = f"col_{uuid.uuid4().hex[:12]}"
+        TEMP_STORAGE[file_id] = out_path
+        task["fileId"] = file_id
+        task["downloadUrl"] = f"/api/download/{file_id}"
+        task["fileName"] = out_filename
+        task["status"] = "stopped" if collector.stop_requested.is_set() else "completed"
+        task["progressMessage"] = f"Done! {len(rows)} profiles ready for download."
+
+    except Exception as e:
+        traceback.print_exc()
+        task["status"] = "error"
+        task["error"] = str(e)
+        task["progressMessage"] = f"Error during scraping: {str(e)}"
+
+
+@app.post("/api/collector/start")
+def start_keyword_collector(payload: StartCollectorPayload):
+    clean_kws = [k.strip() for k in payload.keywords if k.strip()]
+    if not clean_kws:
+        raise HTTPException(status_code=400, detail="At least one keyword is required.")
+
+    target = max(1, min(int(payload.targetCount or 50), 2000))
+    titles = payload.titles if payload.titles else ["CEO", "Founder", "COO", "Owner", "Director", "VP"]
+
+    cfg = CollectorConfig(
+        keywords=clean_kws,
+        country=payload.country or "",
+        state=payload.state or "",
+        city=payload.city or "",
+        target_count=target,
+        titles=titles,
+        company_size_filter=payload.companySize or "all",
+        enrich_company=bool(payload.enrichCompany),
+        delay_range=(1.2, 2.8),
+    )
+
+    task_id = f"task_{uuid.uuid4().hex[:10]}"
+    COLLECTOR_TASKS[task_id] = {
+        "id": task_id,
+        "status": "running",
+        "target": target,
+        "records": [],
+        "events": [],
+        "latestQuery": "",
+        "activeEngine": "ddg",
+        "progressMessage": "Initializing scraping workers...",
+        "downloadUrl": None,
+        "fileId": None,
+        "fileName": None,
+        "createdAt": time.time(),
+        "error": None,
+        "collector": None,
+    }
+
+    t = threading.Thread(target=_run_collector_thread, args=(task_id, cfg), daemon=True)
+    t.start()
+
+    return {
+        "taskId": task_id,
+        "status": "running",
+        "target": target,
+        "keywords": clean_kws,
+    }
+
+
+@app.get("/api/collector/status/{task_id}")
+def get_collector_status(task_id: str, from_index: int = 0):
+    task = COLLECTOR_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Collector task not found.")
+
+    all_records = task["records"]
+    new_records = all_records[from_index:] if from_index < len(all_records) else []
+
+    return {
+        "taskId": task_id,
+        "status": task["status"],
+        "target": task["target"],
+        "totalCollected": len(all_records),
+        "newRecords": new_records,
+        "latestQuery": task.get("latestQuery", ""),
+        "activeEngine": task.get("activeEngine", ""),
+        "progressMessage": task.get("progressMessage", ""),
+        "downloadUrl": task.get("downloadUrl"),
+        "fileName": task.get("fileName"),
+        "error": task.get("error"),
+    }
+
+
+@app.post("/api/collector/stop/{task_id}")
+def stop_collector(task_id: str):
+    task = COLLECTOR_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Collector task not found.")
+
+    collector = task.get("collector")
+    if collector:
+        collector.stop()
+
+    task["status"] = "stopping"
+    task["progressMessage"] = "Stopping scraper and building Excel output..."
+
+    # If Excel not yet generated, generate from current rows
+    if not task.get("downloadUrl") and task.get("records"):
+        try:
+            temp_dir = tempfile.mkdtemp()
+            out_filename = f"linkedin_profiles_partial_{int(time.time())}.xlsx"
+            out_path = Path(temp_dir) / out_filename
+            collector.write_excel(out_path)
+            file_id = f"col_{uuid.uuid4().hex[:12]}"
+            TEMP_STORAGE[file_id] = out_path
+            task["fileId"] = file_id
+            task["downloadUrl"] = f"/api/download/{file_id}"
+            task["fileName"] = out_filename
+            task["status"] = "stopped"
+        except Exception as e:
+            logger.error(f"Error writing partial Excel: {e}")
+
+    return {
+        "taskId": task_id,
+        "status": task["status"],
+        "totalCollected": len(task["records"]),
+        "downloadUrl": task.get("downloadUrl"),
+    }
+
+
+@app.get("/api/collector/events/{task_id}")
+async def stream_collector_events(task_id: str):
+    """Server-Sent Events stream for live scraping progress."""
+    task = COLLECTOR_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Collector task not found.")
+
+    import asyncio
+
+    async def event_generator():
+        last_event_idx = 0
+        while True:
+            events = task.get("events", [])
+            while last_event_idx < len(events):
+                evt = events[last_event_idx]
+                last_event_idx += 1
+                yield f"data: {json.dumps(evt)}\n\n"
+
+            if task.get("status") in ("completed", "stopped", "error"):
+                yield f"data: {json.dumps({'type': 'finished', 'status': task.get('status'), 'downloadUrl': task.get('downloadUrl')})}\n\n"
+                break
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":

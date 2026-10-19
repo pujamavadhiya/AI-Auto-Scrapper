@@ -5,6 +5,7 @@ import { Dashboard } from './pages/Dashboard';
 import { AIResearchAssistant } from './pages/AIResearchAssistant';
 import { DecisionMakerFinder } from './pages/DecisionMakerFinder';
 import { LinkedInFinder } from './pages/LinkedInFinder';
+import { KeywordLeadCollector } from './pages/KeywordLeadCollector';
 import { ContactFinder } from './pages/ContactFinder';
 import { WebsiteFinder } from './pages/WebsiteFinder';
 import { SocialMediaFinder } from './pages/SocialMediaFinder';
@@ -19,6 +20,7 @@ export function App() {
         <Route path="/" element={<AppLayout />}>
           <Route index element={<Dashboard />} />
           <Route path="ai-assistant" element={<AIResearchAssistant />} />
+          <Route path="keyword-collector" element={<KeywordLeadCollector />} />
           <Route path="decision-maker" element={<DecisionMakerFinder />} />
           <Route path="linkedin-finder" element={<LinkedInFinder />} />
           <Route path="contact-finder" element={<ContactFinder />} />

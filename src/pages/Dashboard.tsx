@@ -17,6 +17,7 @@ import {
   Layers,
   Sparkles,
   ExternalLink,
+  Search,
 } from 'lucide-react';
 import { StatsCard } from '../components/common/StatsCard';
 import { Button } from '../components/ui/Button';
@@ -35,6 +36,15 @@ export const Dashboard: React.FC = () => {
   const totalExports = exportHistory.length;
 
   const modules = [
+    {
+      title: 'Keyword Lead Collector',
+      path: '/keyword-collector',
+      icon: Search,
+      description: 'Scrape verified LinkedIn decision-maker profiles by custom keywords, location, and data limits without paid APIs.',
+      badge: 'Free / Live',
+      color: 'text-emerald-600',
+      bg: 'bg-emerald-50 border-emerald-100',
+    },
     {
       title: 'Decision Maker Finder',
       path: '/decision-maker',

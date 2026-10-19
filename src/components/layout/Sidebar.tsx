@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Sparkles,
   ShieldCheck,
+  Search,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { Badge } from '../ui/Badge';
@@ -49,6 +50,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
   ];
 
   const enrichmentModules = [
+    {
+      title: 'Keyword Lead Collector',
+      path: '/keyword-collector',
+      icon: Search,
+      badge: 'Free / Live',
+    },
     {
       title: 'Decision Maker Finder',
       path: '/decision-maker',
