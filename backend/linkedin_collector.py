@@ -242,9 +242,19 @@ NON_LOCATION_WORDS = re.compile(
 )
 
 LOCATION_INDICATORS = re.compile(
-    r"\b(Area|City|State|Region|District|Province|India|United States|USA|UK|United Kingdom|Canada|Australia|Germany|France|Netherlands|Singapore|UAE|Dubai|Gujarat|Maharashtra|Karnataka|Delhi|Texas|California|New York|Florida|Illinois|London|San Francisco|Austin|Ahmedabad|Mumbai|Bangalore|Bengaluru|Pune|Hyderabad|Chennai|Kolkata)\b",
+    r"\b(Area|City|State|Region|District|Province|India|United States|USA|UK|United Kingdom|Canada|Australia|Germany|France|Netherlands|Singapore|UAE|Dubai|Gujarat|Maharashtra|Karnataka|Delhi|Texas|California|New York|Florida|Illinois|London|San Francisco|Austin|Ahmedabad|Mumbai|Bangalore|Bengaluru|Pune|Hyderabad|Chennai|Kolkata|Europe|Asia|Americas|Middle East|Worldwide|Global|APAC|EMEA|North America|South America|Africa)\b",
     re.I,
 )
+
+FOREIGN_LOCATIONS = re.compile(
+    r"\b(United States|USA|U\.S\.A\.|United Kingdom|UK|U\.K\.|London|UAE|Dubai|Abu Dhabi|United Arab Emirates|Canada|Toronto|Vancouver|Australia|Sydney|Melbourne|Germany|Berlin|Munich|France|Paris|Singapore|Netherlands|Amsterdam|Switzerland|Sweden|Ireland|Dublin|Philippines|Pakistan|Karachi|Lahore|Bangladesh|Dhaka|Nigeria|Lagos|South Africa|Europe|Asia|Americas|Middle East|North America|South America|Africa|EMEA|APAC)\b",
+    re.I,
+)
+
+FOREIGN_SUBDOMAINS_FOR_INDIA = {
+    "ae", "uk", "ca", "au", "de", "fr", "sg", "nl", "ch", "se", "ie", "nz",
+    "ph", "pk", "bd", "ng", "za", "br", "mx", "es", "it", "at", "be", "dk"
+}
 
 
 def tidy(v: Any) -> str:
@@ -296,7 +306,7 @@ def extract_location_from_snippet(snip: str, default_location: str = "") -> str:
             if re.search(r"\b" + re.escape(part) + r"\b", snip, re.I):
                 return default_location
 
-    return default_location
+    return ""
 
 
 def parse_result(r: Dict[str, str], default_location: str = "") -> Optional[Dict[str, str]]:
@@ -418,9 +428,10 @@ def parse_result(r: Dict[str, str], default_location: str = "") -> Optional[Dict
         if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
             company = comp_from_title
 
-    # Validate that company is not actually a job title (e.g. "Solutions Architect") or discipline
+    # Validate that company is not actually a job title (e.g. "Solutions Architect", "COO") or discipline
+    company = re.sub(r"^(?:and|&|\band\b|nd)\s+", "", company, flags=re.I).strip()
     has_company_suffix = bool(re.search(r"\b(Technologies|Software|Pvt|Ltd|Inc|LLC|Corp|Group|Labs|Media|Holdings|Ventures|Enterprises|Studio|Agency|Network)\b|\bSolutions\s+(?:Pvt|Ltd|LLC|Inc|Private|Company)", company, re.I))
-    if (ROLE_WORDS.search(company) or DISCIPLINE_TERMS.search(company)) and not has_company_suffix:
+    if (ROLE_WORDS.search(company) or DISCIPLINE_TERMS.search(company) or TITLE_WORDS.search(company)) and not has_company_suffix:
         company = ""
 
     # Validate that company is not just a geographic entity
@@ -440,6 +451,8 @@ def parse_result(r: Dict[str, str], default_location: str = "") -> Optional[Dict
         "company": company,
         "profile_url": profile_url,
         "location": location,
+        "raw_title": raw_title,
+        "snippet": snip,
     }
 
 
@@ -550,9 +563,96 @@ class KeywordLinkedInCollector:
             parts.append(self.config.city.strip())
         if self.config.state:
             parts.append(self.config.state.strip())
-        if self.config.country and not parts:
+        if self.config.country:
             parts.append(self.config.country.strip())
         return " ".join(parts)
+
+    def is_india_target(self) -> bool:
+        c = (self.config.country or "").lower().strip()
+        s = (self.config.state or "").lower().strip()
+        ci = (self.config.city or "").lower().strip()
+        if c in ("india", "in"):
+            return True
+        indian_states = {"gujarat", "maharashtra", "karnataka", "delhi", "tamil nadu", "telangana", "haryana", "uttar pradesh", "rajasthan", "punjab", "kerala", "west bengal", "madhya pradesh"}
+        indian_cities = {"ahmedabad", "surat", "vadodara", "rajkot", "gandhinagar", "mumbai", "pune", "bangalore", "bengaluru", "delhi", "new delhi", "noida", "gurgaon", "gurugram", "hyderabad", "chennai", "kolkata", "jaipur", "indore"}
+        return s in indian_states or ci in indian_cities
+
+    def matches_location_preference(self, parsed: Dict[str, str]) -> bool:
+        user_city = (self.config.city or "").strip().lower()
+        user_state = (self.config.state or "").strip().lower()
+        user_country = (self.config.country or "").strip().lower()
+
+        if not user_city and not user_state and not user_country:
+            return True
+
+        url = (parsed.get("profile_url") or "").lower()
+        loc = (parsed.get("location") or "").lower()
+        snip = (parsed.get("snippet") or "").lower()
+        title = (parsed.get("title") or "").lower()
+        raw_title = (parsed.get("raw_title") or "").lower()
+        full_text = f"{loc} {snip} {title} {raw_title}"
+
+        is_target_india = self.is_india_target()
+
+        # 1. Foreign country subdomain rejection
+        m_sub = re.search(r"https?://([a-z]{2})\.linkedin\.com/in/", url)
+        if m_sub:
+            sub = m_sub.group(1)
+            if is_target_india:
+                if sub in FOREIGN_SUBDOMAINS_FOR_INDIA and sub != "in":
+                    # Must have explicit evidence of target city in actual snippet or title, otherwise REJECT
+                    if not (user_city and re.search(r"\b" + re.escape(user_city) + r"\b", f"{snip} {title} {raw_title}")):
+                        return False
+            elif user_country in ("united states", "usa", "us"):
+                if sub in ("in", "uk", "ae", "ca", "au", "de", "fr", "sg", "nl"):
+                    return False
+            elif user_country in ("united kingdom", "uk"):
+                if sub not in ("uk", "www"):
+                    return False
+            elif user_country in ("united arab emirates", "uae"):
+                if sub not in ("ae", "www"):
+                    return False
+
+        # 2. Rejection of conflicting foreign countries in snippet location or extracted location
+        if is_target_india:
+            m_exp_loc = re.search(r"Location:\s*([A-Za-z0-9\s,.-]+?)(?=\s*(?:[|·•\n]|\bconnections\b|$))", snip, re.I)
+            if m_exp_loc:
+                cand_loc = m_exp_loc.group(1).strip()
+                if FOREIGN_LOCATIONS.search(cand_loc) and not re.search(r"\b(India|Gujarat|" + re.escape(user_city) + r")\b", cand_loc, re.I):
+                    return False
+            if loc and FOREIGN_LOCATIONS.search(loc) and not re.search(r"\b(india|gujarat|" + re.escape(user_city) + r")\b", loc):
+                return False
+        elif user_country in ("united states", "usa", "us"):
+            if loc and re.search(r"\b(India|UK|United Kingdom|UAE|Dubai|Canada|Australia|Germany)\b", loc, re.I):
+                return False
+
+        # 3. Strict City Filter
+        if user_city:
+            city_in_loc = bool(re.search(r"\b" + re.escape(user_city) + r"\b", loc))
+            city_in_text = bool(re.search(r"\b" + re.escape(user_city) + r"\b", full_text))
+            if not city_in_text:
+                return False
+
+            other_major_cities = re.compile(
+                r"\b(Mumbai|Pune|Bangalore|Bengaluru|Delhi|New Delhi|Hyderabad|Chennai|Kolkata|Jaipur|Indore|London|Dubai|New York|San Francisco|Chicago|Austin|Los Angeles|Seattle)\b",
+                re.I
+            )
+            if other_major_cities.search(loc) and not city_in_loc:
+                return False
+
+        # 4. Strict State Filter (if city not specified)
+        elif user_state:
+            state_in_text = bool(re.search(r"\b" + re.escape(user_state) + r"\b", full_text))
+            if not state_in_text:
+                return False
+
+        # 5. Strict Country Filter
+        elif user_country:
+            country_in_text = bool(re.search(r"\b" + re.escape(user_country) + r"\b", full_text))
+            if not country_in_text and not is_target_india:
+                return False
+
+        return True
 
     def get_formatted_location(self) -> str:
         parts = []
@@ -566,7 +666,8 @@ class KeywordLinkedInCollector:
 
     def build_search_queries(self) -> List[Dict[str, Any]]:
         loc_term = self.build_location_term()
-        loc_clause = f'"{loc_term}"' if loc_term else ""
+        city_term = self.config.city.strip() if self.config.city else loc_term
+        loc_clause = f'"{city_term}"' if city_term else ""
 
         title_clauses = []
         simple_title_clauses = []
@@ -581,6 +682,9 @@ class KeywordLinkedInCollector:
             title_clauses = ['(CEO OR Founder OR Owner OR COO OR "VP")']
             simple_title_clauses = ["CEO Founder Owner"]
 
+        is_india = self.is_india_target()
+        primary_domain = "in.linkedin.com/in" if is_india else "linkedin.com/in"
+
         queries = []
         for kw in self.config.keywords:
             kw_clean = kw.strip()
@@ -588,7 +692,7 @@ class KeywordLinkedInCollector:
                 continue
             kw_fmt = f'"{kw_clean}"' if " " in kw_clean else kw_clean
 
-            # Format 1: Direct domain search (compatible with DDGS / privacy engines)
+            # Format 1: Direct domain search with full location
             for s_title in simple_title_clauses:
                 q_direct = f"linkedin.com/in {kw_clean} {s_title} {loc_term}".strip()
                 queries.append({
@@ -598,9 +702,9 @@ class KeywordLinkedInCollector:
                     "search_id": f"{kw_clean}|direct|{s_title[:15]}",
                 })
 
-            # Format 2: site: dork
+            # Format 2: site: dork on primary domain
             for t_clause in title_clauses:
-                parts = ["site:linkedin.com/in", kw_fmt]
+                parts = [f"site:{primary_domain}", kw_fmt]
                 if loc_clause:
                     parts.append(loc_clause)
                 parts.append(t_clause)
@@ -612,6 +716,17 @@ class KeywordLinkedInCollector:
                         "query": q_text,
                         "page": page,
                         "search_id": f"{kw_clean}|site|p{page}|{t_clause[:15]}",
+                    })
+
+            # Format 3: site:in.linkedin.com/in with plain terms
+            if is_india and loc_clause:
+                for s_title in simple_title_clauses:
+                    q_in = f"site:in.linkedin.com/in {kw_clean} {s_title} {city_term}".strip()
+                    queries.append({
+                        "keyword": kw_clean,
+                        "query": q_in,
+                        "page": 1,
+                        "search_id": f"{kw_clean}|site_in|{s_title[:15]}",
                     })
 
         return queries
@@ -657,16 +772,21 @@ class KeywordLinkedInCollector:
         ):
             return None
 
-        # If location is empty, contains prose junk, roles, or raw search terms
+        # Strict user-specified location preference check
+        if not self.matches_location_preference(parsed):
+            return None
+
+        # Canonicalize profile URL to in.linkedin.com if target is India
+        profile_url = parsed["profile_url"]
+        if self.is_india_target() and re.search(r"https?://[a-z]{2}\.linkedin\.com/in/", profile_url):
+            profile_url = re.sub(r"https?://[a-z]{2}\.linkedin\.com/in/", "https://in.linkedin.com/in/", profile_url)
+
+        # Cleanly format verified location
         fmt_loc = self.get_formatted_location()
-        if (
-            not loc
-            or NON_LOCATION_WORDS.search(loc)
-            or ROLE_WORDS.search(loc)
-            or TITLE_WORDS.search(loc)
-            or len(loc) <= 2
-            or loc == self.build_location_term()
-        ):
+        user_city = (self.config.city or "").strip()
+        if user_city and re.search(r"\b" + re.escape(user_city) + r"\b", loc, re.I):
+            loc = fmt_loc
+        elif not loc or NON_LOCATION_WORDS.search(loc) or ROLE_WORDS.search(loc) or TITLE_WORDS.search(loc) or len(loc) <= 2:
             loc = fmt_loc
 
         self.seen_urls.add(url_key)
@@ -681,7 +801,7 @@ class KeywordLinkedInCollector:
             "Industry source": "",
             "Full name": parsed["full_name"],
             "Title": title or "Executive",
-            "Profile URL": parsed["profile_url"],
+            "Profile URL": profile_url,
             "Location": loc,
             "Contact type": "Decision Maker",
             "Search used": query_meta.get("query", ""),
@@ -741,7 +861,7 @@ class KeywordLinkedInCollector:
                 if len(self.collected_rows) >= target or self.stop_requested.is_set():
                     break
 
-                parsed = parse_result(r, default_location=def_loc)
+                parsed = parse_result(r, default_location="")
                 row = self.accept_profile(parsed, q_item)
                 if not row:
                     continue
