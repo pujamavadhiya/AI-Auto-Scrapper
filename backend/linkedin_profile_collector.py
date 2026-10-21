@@ -242,25 +242,13 @@ def tidy(v):
 def clean_linkedin_url(url: str, full_name: str = "", company: str = "") -> str:
     if not url:
         return ""
-    base = "https://in.linkedin.com/in/" if ("in.linkedin.com" in url or "/in/" in url) else "https://www.linkedin.com/in/"
+    is_india = bool(re.search(r"https?://in\.linkedin\.com", url, re.I))
+    base = "https://in.linkedin.com/in/" if is_india else "https://www.linkedin.com/in/"
     m = re.search(r"linkedin\.com/in/([^/?#]+)", url, re.I)
     if not m:
         return url.split("?")[0].rstrip("/")
-    slug = m.group(1).strip()
-
-    if full_name:
-        name_clean = re.sub(r"[^a-zA-Z0-9]+", "", full_name).lower()
-        slug_clean = re.sub(r"[^a-zA-Z0-9]+", "", slug).lower()
-        if name_clean and (slug_clean.startswith(name_clean) or name_clean in slug_clean):
-            rem = slug_clean[len(name_clean):]
-            if re.match(r"^\d+$", rem):
-                return f"{base}{name_clean}{rem}"
-            else:
-                return f"{base}{name_clean}"
-
-    # Remove trailing hyphen or noise
-    clean_slug = slug.strip("-")
-    return f"{base}{clean_slug}"
+    slug = m.group(1).strip().strip("-")
+    return f"{base}{slug}"
 
 
 def parse_result(r):

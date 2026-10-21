@@ -185,27 +185,6 @@ def resolve_country(raw: str) -> Tuple[str, Set[str], str]:
     return n, {n}, ""
 
 
-INDUSTRY_EXPANSIONS = {
-    "saas": ["Software Development", "IT Services and IT Consulting", "Technology, Information and Internet", "Computer Software", "Information Technology & Services"],
-    "software": ["Software Development", "IT Services and IT Consulting", "Technology, Information and Internet", "Computer Software"],
-    "cloud": ["Software Development", "IT Services and IT Consulting", "Technology, Information and Internet", "Computer & Network Security", "Information Technology & Services"],
-    "cloud infrastructure": ["Software Development", "IT Services and IT Consulting", "Technology, Information and Internet", "Computer & Network Security", "Information Technology & Services"],
-    "infrastructure": ["Software Development", "IT Services and IT Consulting", "Technology, Information and Internet", "Civil Engineering", "Construction"],
-    "ai": ["Software Development", "IT Services and IT Consulting", "Technology, Information and Internet", "Research Services"],
-    "artificial intelligence": ["Software Development", "IT Services and IT Consulting", "Technology, Information and Internet", "Research Services"],
-    "fintech": ["Financial Services", "Software Development", "Banking", "IT Services and IT Consulting"],
-    "cybersecurity": ["Computer & Network Security", "Software Development", "IT Services and IT Consulting", "Information Technology & Services"],
-    "e-commerce": ["Retail", "Technology, Information and Internet", "Software Development", "Internet"],
-    "clean energy": ["Renewables & Environment", "Oil & Energy", "Utilities", "Environmental Services"],
-    "digital marketing": ["Advertising Services", "Marketing Services", "Public Relations and Communications"],
-    "logistics": ["Logistics & Supply Chain", "Transportation, Logistics and Storage", "Freight and Package Transportation"],
-    "tobacco": ["Tobacco Manufacturing", "Food and Beverage Manufacturing", "Manufacturing"],
-    "manufacturing": ["Manufacturing", "Machinery Manufacturing", "Electrical Equipment Electric Parts Manufacturing"],
-    "healthcare": ["Hospitals and Health Care", "Medical Equipment Manufacturing", "Biotechnology"],
-}
-
-
-# --------------------------------------------------------------------------- criteria
 @dataclass
 class Criteria:
     industries: list                      # LinkedIn industry names / words to verify, e.g. ["Tobacco Manufacturing"]
@@ -235,16 +214,6 @@ class Criteria:
             self.country_canon, self.country_names, self.country_code = resolve_country(self.country)
         if not self.industries:
             self.industries = list(self.keywords) if self.keywords else ["Technology"]
-
-        # Map discovery keywords to official LinkedIn industry taxonomies
-        exp = []
-        for kw in self.keywords + self.industries:
-            k_low = nt(kw)
-            for map_k, map_vals in INDUSTRY_EXPANSIONS.items():
-                if map_k in k_low or k_low in map_k:
-                    exp.extend(map_vals)
-        if exp:
-            self.industries = list(dict.fromkeys(self.industries + exp))
 
     def signature(self) -> Dict[str, Any]:
         return {
@@ -676,8 +645,16 @@ def eval_dm(r: Dict[str, str], names: List[str], crit: Criteria, generic: bool) 
     how = ""
     if parsed["company"] and any(same_company(parsed["company"], n) for n in names):
         how = "field"
-    elif any(has_phrase(hay, company_phrase(n)) for n in names if company_phrase(n)):
-        how = "text"
+    # Strict geographic validation to prevent cross-country mismatch
+    url_low = (parsed["profile_url"] or "").lower()
+    full_text = (head + " " + snippet).lower()
+    if crit.country_code == "US":
+        if "in.linkedin.com" in url_low or re.search(r"\b(india|mumbai|delhi|bengaluru|bangalore|pune|hyderabad|ahmedabad|noida|gurgaon)\b", full_text):
+            return None
+    elif crit.country_code == "IN":
+        if any(x in url_low for x in ("uk.linkedin.com", "ca.linkedin.com", "au.linkedin.com")) or re.search(r"\b(united states|usa|united kingdom|london|canada|australia)\b", full_text):
+            return None
+
     if not how:
         return None
     rank = title_rank(parsed["title"] or after, crit.titles)
@@ -685,6 +662,8 @@ def eval_dm(r: Dict[str, str], names: List[str], crit: Criteria, generic: bool) 
         return None
     loc = person_location_status(snippet, crit)
     if generic and loc != "match":
+        return None
+    if crit.city and loc == "conflict":
         return None
     conf = (
         "High"
@@ -748,26 +727,47 @@ def find_decision_makers(cand_name: str, info: Dict[str, Any], crit: Criteria, i
 
 # --------------------------------------------------------------------------- discovery
 def build_jobs(crit: Criteria) -> List[Dict[str, Any]]:
-    locs = [x for x in (crit.city, crit.state) if x] or [crit.country]
-    tq = " OR ".join(f'"{t}"' if " " in t or "-" in t else t for t in crit.titles)
-    jobs = []
-    for page in sorted(set(COMPANY_SEARCH_PAGES + PEOPLE_SEARCH_PAGES)):
+    # Location variations: "city, state", "city, state_abbr", "city", "state", "country"
+    loc_variants: List[str] = []
+    if crit.city and crit.state:
+        loc_variants.append(f"{crit.city}, {crit.state}")
+        if crit.st_abbr:
+            loc_variants.append(f"{crit.city}, {crit.st_abbr}")
+    if crit.city and crit.city not in loc_variants:
+        loc_variants.append(crit.city)
+    if crit.state and crit.state not in loc_variants:
+        loc_variants.append(crit.state)
+    if not loc_variants:
+        loc_variants.append(crit.country or "US")
+
+    # Scale query volume based on requested limit
+    max_pages = 5 if crit.limit >= 20 else 3
+    pages = list(range(1, max_pages + 1))
+    jobs: List[Dict[str, Any]] = []
+    seen_q: Set[str] = set()
+
+    for page in pages:
         for kw in crit.keywords:
-            if page in COMPANY_SEARCH_PAGES:
-                for loc in locs:
-                    jobs.append({
-                        "kind": "company",
-                        "page": page,
-                        "key": f"company|{kw}|{loc}|p{page}",
-                        "q": f'site:linkedin.com/company "{kw}" "{loc}"',
-                    })
-            if page in PEOPLE_SEARCH_PAGES:
-                jobs.append({
-                    "kind": "people",
-                    "page": page,
-                    "key": f"people|{kw}|{locs[0]}|p{page}",
-                    "q": f'site:linkedin.com/in "{locs[0]}" "{kw}"',
-                })
+            for loc in loc_variants:
+                q1 = f'site:linkedin.com/company "{kw}" "{loc}"'
+                if q1 not in seen_q:
+                    seen_q.add(q1)
+                    jobs.append({"kind": "company", "page": page, "key": f"co|{kw}|{loc}|p{page}", "q": q1})
+
+                q2 = f'site:linkedin.com/company {kw} {loc}'
+                if q2 not in seen_q:
+                    seen_q.add(q2)
+                    jobs.append({"kind": "company", "page": page, "key": f"co_u|{kw}|{loc}|p{page}", "q": q2})
+
+            # Leadership discovery queries to discover candidate companies
+            if page <= 3:
+                loc_main = loc_variants[0]
+                for role in ("Founder", "CEO", "Director", "President"):
+                    pq = f'site:linkedin.com/in "{loc_main}" "{kw}" "{role}"'
+                    if pq not in seen_q:
+                        seen_q.add(pq)
+                        jobs.append({"kind": "people", "page": page, "key": f"ppl|{kw}|{loc_main}|{role}|p{page}", "q": pq})
+
     return jobs
 
 
@@ -1012,28 +1012,16 @@ def clean_linkedin_url(url: str, full_name: str = "", company: str = "") -> str:
     """
     Cleans LinkedIn profile URLs:
     - Removes tracking parameters (?.*) and trailing slashes
-    - Removes hyphens and unnecessary suffixes
-    - If full_name matches slug, standardizes to clean slug (e.g. manojbhuva)
+    - Preserves correct LinkedIn subdomain: www.linkedin.com/in/ for US/global, in.linkedin.com/in/ only if original was in.linkedin.com
+    - Strips trailing punctuation and noise
     """
     if not url:
         return ""
-    base = "https://in.linkedin.com/in/" if ("in.linkedin.com" in url or "/in/" in url) else "https://www.linkedin.com/in/"
+    is_india = bool(re.search(r"https?://in\.linkedin\.com", url, re.I))
+    base = "https://in.linkedin.com/in/" if is_india else "https://www.linkedin.com/in/"
     m = re.search(r"linkedin\.com/in/([^/?#]+)", url, re.I)
     if not m:
         return url.split("?")[0].rstrip("/")
-    slug = m.group(1).strip()
-
-    if full_name:
-        name_clean = re.sub(r"[^a-zA-Z0-9]+", "", full_name).lower()
-        slug_clean = re.sub(r"[^a-zA-Z0-9]+", "", slug).lower()
-        if name_clean and (slug_clean.startswith(name_clean) or name_clean in slug_clean):
-            rem = slug_clean[len(name_clean):]
-            if re.match(r"^\d+$", rem):
-                return f"{base}{name_clean}{rem}"
-            else:
-                return f"{base}{name_clean}"
-
-    # Remove hyphens, underscores and noise suffixes
-    clean_slug = re.sub(r"[^a-zA-Z0-9]+", "", slug)
-    return f"{base}{clean_slug}"
+    slug = m.group(1).strip().strip("-")
+    return f"{base}{slug}"
 

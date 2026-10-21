@@ -12,7 +12,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   defaultExportFormat: 'xlsx',
   includeConfidenceScore: true,
   includeTimestampInExport: true,
-  adapterMode: 'mock',
+  adapterMode: 'real',
 };
 
 export const storageService = {
