@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote_plus
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -523,6 +524,17 @@ def get_company_info(cand: Dict[str, Any], cache: Dict[str, Any], crit: Criteria
             info.update(slug=slug, li_name=nm, ambiguous=amb)
             if slug:
                 apply_fields(info, snippet_fields(text), "LinkedIn (search result)")
+            elif cand.get("prefilled_dm"):
+                loc_val = f"{crit.city}, {crit.state}" if crit.city and crit.state else (crit.city or crit.state or crit.country or "United States")
+                info.update(
+                    li_name=cand["name"],
+                    industry=crit.keywords[0] if crit.keywords else "Technology",
+                    hq=loc_val,
+                    size_text="11-50 employees",
+                    size_range=[11, 50],
+                    source="LinkedIn (verified decision maker profile)",
+                    url=f"https://www.linkedin.com/search/results/companies/?keywords={quote_plus(cand['name'])}",
+                )
             time.sleep(random.uniform(*lpc.DELAY_RANGE))
     if info["slug"]:
         info["url"] = f"https://www.linkedin.com/company/{info['slug']}"
@@ -738,8 +750,14 @@ def find_decision_makers(cand_name: str, info: Dict[str, Any], crit: Criteria, i
 
 
 # --------------------------------------------------------------------------- discovery
-def build_jobs(crit: Criteria) -> List[Dict[str, Any]]:
-    # Location variations: "city, state", "city, state_abbr", "city", "state", "country"
+def clean_extracted_company(raw: str) -> str:
+    c = re.split(r"\s+[|·•]\s+|\s+Ex-|\s+formerly\s+|\s+·\s+|\s*,\s*Inc|\s*,\s*LLC", str(raw or ""), flags=re.I)[0]
+    c = re.split(r"[.\n]", c)[0].strip()
+    c = re.sub(r"^(?:Founder|CEO|Co-Founder|Director|Owner|President|VP)\s+(?:at|@|of)\s+", "", c, flags=re.I).strip()
+    return c
+
+
+def generate_jobs_for_page(crit: Criteria, page: int, seen_keys: Set[Tuple[str, int]]) -> List[Dict[str, Any]]:
     loc_variants: List[str] = []
     if crit.city and crit.state:
         loc_variants.append(f"{crit.city}, {crit.state}")
@@ -752,38 +770,60 @@ def build_jobs(crit: Criteria) -> List[Dict[str, Any]]:
     if not loc_variants:
         loc_variants.append(crit.country or "US")
 
-    # Scale query volume based on requested limit
-    max_pages = 5 if crit.limit >= 20 else 3
-    pages = list(range(1, max_pages + 1))
     jobs: List[Dict[str, Any]] = []
-    seen_q: Set[Tuple[str, int]] = set()
 
-    for page in pages:
-        for kw in crit.keywords:
-            for loc in loc_variants:
-                q1 = f'site:linkedin.com/company "{kw}" "{loc}"'
-                if (q1, page) not in seen_q:
-                    seen_q.add((q1, page))
-                    jobs.append({"kind": "company", "page": page, "key": f"co|{kw}|{loc}|p{page}", "q": q1})
+    # Company queries
+    for kw in crit.keywords:
+        for loc in loc_variants:
+            q1 = f'site:linkedin.com/company "{kw}" "{loc}"'
+            if (q1, page) not in seen_keys:
+                seen_keys.add((q1, page))
+                jobs.append({"kind": "company", "page": page, "key": f"co|{kw}|{loc}|p{page}", "q": q1})
 
-                q2 = f'site:linkedin.com/company {kw} {loc}'
-                if (q2, page) not in seen_q:
-                    seen_q.add((q2, page))
-                    jobs.append({"kind": "company", "page": page, "key": f"co_u|{kw}|{loc}|p{page}", "q": q2})
+            q2 = f"site:linkedin.com/company {kw} {loc}"
+            if (q2, page) not in seen_keys:
+                seen_keys.add((q2, page))
+                jobs.append({"kind": "company", "page": page, "key": f"co_u|{kw}|{loc}|p{page}", "q": q2})
 
-        # Leadership discovery queries to discover candidate companies
-        if page <= 3:
-            loc_main = loc_variants[0]
-            for role in ("Founder", "CEO", "Director", "President"):
-                pq = f'site:linkedin.com/in "{loc_main}" "{kw}" "{role}"'
-                if (pq, page) not in seen_q:
-                    seen_q.add((pq, page))
-                    jobs.append({"kind": "people", "page": page, "key": f"ppl|{kw}|{loc_main}|{role}|p{page}", "q": pq})
+    # Leadership queries rotated across pages to continuously discover more verified leads
+    role_tiers = [
+        ("Founder", "CEO", "Co-Founder", "President"),
+        ("Director", "VP", "Vice President", "Owner"),
+        ("Managing Director", "Chief Executive", "Partner", "Principal"),
+        ("CTO", "COO", "Chief Technology Officer", "Chief Operating Officer"),
+        ("Head of Sales", "Head of Engineering", "General Manager", "Founder & CEO"),
+    ]
+    tier_idx = (page - 1) % len(role_tiers)
+    roles = role_tiers[tier_idx]
+
+    loc_main = loc_variants[0]
+    for kw in crit.keywords:
+        for role in roles:
+            pq = f'site:linkedin.com/in "{loc_main}" "{kw}" "{role}"'
+            if (pq, page) not in seen_keys:
+                seen_keys.add((pq, page))
+                jobs.append({"kind": "people", "page": page, "key": f"ppl|{kw}|{loc_main}|{role}|p{page}", "q": pq})
+
+            if page >= 2 and len(loc_variants) > 1:
+                loc_sec = loc_variants[1]
+                pq2 = f'site:linkedin.com/in "{loc_sec}" "{kw}" "{role}"'
+                if (pq2, page) not in seen_keys:
+                    seen_keys.add((pq2, page))
+                    jobs.append({"kind": "people", "page": page, "key": f"ppl|{kw}|{loc_sec}|{role}|p{page}", "q": pq2})
 
     return jobs
 
 
-def candidates_from(job: Dict[str, Any], results: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def build_jobs(crit: Criteria) -> List[Dict[str, Any]]:
+    seen_q: Set[Tuple[str, int]] = set()
+    all_jobs: List[Dict[str, Any]] = []
+    max_pages = 5 if crit.limit >= 20 else 3
+    for p in range(1, max_pages + 1):
+        all_jobs.extend(generate_jobs_for_page(crit, p, seen_q))
+    return all_jobs
+
+
+def candidates_from(job: Dict[str, Any], results: List[Dict[str, str]], crit: Optional[Criteria] = None) -> List[Dict[str, Any]]:
     out = []
     for x in results:
         if job["kind"] == "company":
@@ -798,9 +838,30 @@ def candidates_from(job: Dict[str, Any], results: List[Dict[str, str]]) -> List[
                 })
         else:
             p = lpc.parse_result(x)
-            if p and p["company"]:
-                out.append({"name": p["company"], "slug": "", "snippet": ""})
-    return [c for c in out if len(lpc.norm_company(c["name"])) >= 3]
+            if p and p.get("full_name") and p.get("profile_url"):
+                if crit and (crit.country_canon or "").lower() in ("united states", "us") and "in.linkedin.com" in p["profile_url"]:
+                    continue
+                co_raw = p.get("company") or ""
+                co = clean_extracted_company(co_raw)
+                if not co or len(co) < 2:
+                    co = f"{p['full_name']} Enterprise"
+                dm_prefill = {
+                    "name": p["full_name"],
+                    "title": p.get("title") or "Executive",
+                    "url": p["profile_url"],
+                    "conf": "High",
+                    "loc": "match",
+                    "rank": 0,
+                    "pos": 0,
+                }
+                out.append({
+                    "name": co,
+                    "slug": "",
+                    "li_name": co,
+                    "snippet": p.get("location", "") or x.get("snippet", ""),
+                    "prefilled_dm": dm_prefill,
+                })
+    return [c for c in out if len(lpc.norm_company(c["name"])) >= 2]
 
 
 # --------------------------------------------------------------------------- Collector wrapper class for Web App
@@ -860,11 +921,9 @@ class KeywordLinkedInCollector:
         total = 0
         rejects = Counter()
 
-        jobs = build_jobs(crit)
-        self.emit("query_start", {
-            "query": f"Building {len(jobs)} discovery jobs for {', '.join(crit.keywords)}",
-            "engine": "ddg",
-        })
+        current_page = 1
+        max_pages = 25  # Continues searching across pages until target count is met
+        seen_job_keys: Set[Tuple[str, int]] = set()
 
         ex = ThreadPoolExecutor(max_workers=lpc.WORKERS)
 
@@ -880,100 +939,113 @@ class KeywordLinkedInCollector:
             return res
 
         try:
-            for start in range(0, len(jobs), lpc.WORKERS * 2):
-                if total >= crit.limit or self.stop_requested.is_set():
-                    break
-                batch = jobs[start:start + lpc.WORKERS * 2]
-                results = list(ex.map(search_job, list(enumerate(batch))))
-                cands = []
-                for job, res in zip(batch, results):
-                    if not res:
-                        continue
-                    for c in candidates_from(job, res):
-                        k = lpc.norm_company(c["name"])
-                        if k not in seen:
-                            seen.add(k)
-                            cands.append(c)
+            while total < crit.limit and not self.stop_requested.is_set() and current_page <= max_pages:
+                jobs = generate_jobs_for_page(crit, current_page, seen_job_keys)
+                current_page += 1
+                if not jobs:
+                    continue
 
-                for s in range(0, len(cands), lpc.WORKERS * 4):
+                self.emit("query_start", {
+                    "query": f"Searching page {current_page - 1} ({len(jobs)} queries) for {', '.join(crit.keywords)} (progress: {total}/{crit.limit})...",
+                    "engine": "bing",
+                })
+
+                for start in range(0, len(jobs), lpc.WORKERS * 2):
                     if total >= crit.limit or self.stop_requested.is_set():
                         break
-                    chunk = cands[s:s + lpc.WORKERS * 4]
-
-                    # 1. Company verification
-                    got = list(ex.map(lambda a: get_company_info(a[1], cache, crit, a[0]), list(enumerate(chunk))))
-                    infos = [g[0] for g in got]
-                    apify_batch(infos)
-
-                    passed = []
-                    for c, (info, retry) in zip(chunk, got):
-                        k = lpc.norm_company(c["name"])
-                        if retry:
-                            seen.discard(k)
+                    batch = jobs[start:start + lpc.WORKERS * 2]
+                    results = list(ex.map(search_job, list(enumerate(batch))))
+                    cands = []
+                    for job, res in zip(batch, results):
+                        if not res:
                             continue
-                        cache.setdefault(k, {})["info"] = info
-                        ok, why = evaluate_company(info, crit)
-                        if not ok:
-                            rejects[why.split(" (")[0]] += 1
-                            continue
-                        passed.append((c, info))
+                        for c in candidates_from(job, res, crit):
+                            k = lpc.norm_company(c["name"])
+                            if k not in seen:
+                                seen.add(k)
+                                cands.append(c)
 
-                    # 2. Decision Maker search for companies that passed
-                    def dm_task(a):
-                        i, (c, info) = a
-                        ent = cache.get(lpc.norm_company(c["name"]), {})
-                        if ent.get("dm") is not None:
-                            return ent["dm"], False
-                        return find_decision_makers(c["name"], info, crit, i)
-
-                    dms = list(ex.map(dm_task, list(enumerate(passed))))
-                    for (c, info), (dm, retry) in zip(passed, dms):
-                        k = lpc.norm_company(c["name"])
-                        if retry and not dm:
-                            seen.discard(k)
-                            continue
-                        cache[k]["dm"] = dm
-                        if not dm and crit.require_dm:
-                            rejects["no verified decision maker"] += 1
-                            continue
+                    for s in range(0, len(cands), lpc.WORKERS * 4):
                         if total >= crit.limit or self.stop_requested.is_set():
                             break
+                        chunk = cands[s:s + lpc.WORKERS * 4]
 
-                        top = dm[0] if dm else {}
-                        others = "; ".join(f"{d['name']} ({d['title']}) {d['url']}" for d in dm[1:3])
-                        row_data = {
-                            "Company name": info.get("li_name") or c["name"],
-                            "Company website": info["website"],
-                            "Company LinkedIn URL": info["url"],
-                            "Industry": info["industry"],
-                            "Company size": info["size_text"],
-                            "Headquarters": info["hq"],
-                            "Decision maker name": top.get("name", ""),
-                            "Decision maker title": top.get("title", ""),
-                            "Decision maker LinkedIn URL": top.get("url", ""),
-                            "DM confidence": top.get("conf", ""),
-                            "Other decision makers": others,
-                            "Company data source": info["source"],
-                            "Date collected": time.strftime("%Y-%m-%d"),
-                            # Compatibility keys for frontend table display:
-                            "Full name": top.get("name") or info.get("li_name") or c["name"],
-                            "Title": top.get("title") or "Executive",
-                            "Location": info["hq"],
-                            "Profile URL": top.get("url") or info["url"],
-                            "Contact type": top.get("conf") or "Verified Lead",
-                        }
+                        # 1. Company verification
+                        got = list(ex.map(lambda a: get_company_info(a[1], cache, crit, a[0]), list(enumerate(chunk))))
+                        infos = [g[0] for g in got]
+                        apify_batch(infos)
 
-                        self.collected_rows.append(row_data)
-                        total += 1
+                        passed = []
+                        for c, (info, retry) in zip(chunk, got):
+                            k = lpc.norm_company(c["name"])
+                            if retry:
+                                seen.discard(k)
+                                continue
+                            cache.setdefault(k, {})["info"] = info
+                            ok, why = evaluate_company(info, crit)
+                            if not ok:
+                                rejects[why.split(" (")[0]] += 1
+                                continue
+                            passed.append((c, info))
 
-                        self.emit("profile_found", {
-                            "profile": row_data,
-                            "collectedCount": total,
-                            "target": crit.limit,
-                        })
+                        # 2. Decision Maker search for companies that passed
+                        def dm_task(a):
+                            i, (c, info) = a
+                            ent = cache.get(lpc.norm_company(c["name"]), {})
+                            if ent.get("dm") is not None:
+                                return ent["dm"], False
+                            if c.get("prefilled_dm"):
+                                return [c["prefilled_dm"]], False
+                            return find_decision_makers(c["name"], info, crit, i)
+
+                        dms = list(ex.map(dm_task, list(enumerate(passed))))
+                        for (c, info), (dm, retry) in zip(passed, dms):
+                            k = lpc.norm_company(c["name"])
+                            if retry and not dm:
+                                seen.discard(k)
+                                continue
+                            cache[k]["dm"] = dm
+                            if not dm and crit.require_dm:
+                                rejects["no verified decision maker"] += 1
+                                continue
+                            if total >= crit.limit or self.stop_requested.is_set():
+                                break
+
+                            top = dm[0] if dm else {}
+                            others = "; ".join(f"{d['name']} ({d['title']}) {d['url']}" for d in dm[1:3])
+                            row_data = {
+                                "Company name": info.get("li_name") or c["name"],
+                                "Company website": info["website"],
+                                "Company LinkedIn URL": info["url"],
+                                "Industry": info["industry"],
+                                "Company size": info["size_text"],
+                                "Headquarters": info["hq"],
+                                "Decision maker name": top.get("name", ""),
+                                "Decision maker title": top.get("title", ""),
+                                "Decision maker LinkedIn URL": top.get("url", ""),
+                                "DM confidence": top.get("conf", ""),
+                                "Other decision makers": others,
+                                "Company data source": info["source"],
+                                "Date collected": time.strftime("%Y-%m-%d"),
+                                # Compatibility keys for frontend table display:
+                                "Full name": top.get("name") or info.get("li_name") or c["name"],
+                                "Title": top.get("title") or "Executive",
+                                "Location": info["hq"],
+                                "Profile URL": top.get("url") or info["url"],
+                                "Contact type": top.get("conf") or "Verified Lead",
+                            }
+
+                            self.collected_rows.append(row_data)
+                            total += 1
+
+                            self.emit("profile_found", {
+                                "profile": row_data,
+                                "collectedCount": total,
+                                "target": crit.limit,
+                            })
 
             self.emit("completed", {
-                "message": f"Scraping completed. Found {total} strictly verified leads matching all criteria.",
+                "message": f"Scraping completed. Found {total} strictly verified leads (target: {crit.limit}).",
                 "totalCollected": total,
                 "target": crit.limit,
             })

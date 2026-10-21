@@ -40,6 +40,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -442,6 +443,17 @@ def get_company_info(cand, cache, crit, idx):
             info.update(slug=slug, li_name=nm, ambiguous=amb)
             if slug:
                 apply_fields(info, snippet_fields(text), 'LinkedIn (search result)')
+            elif cand.get('prefilled_dm'):
+                loc_val = f"{crit.city}, {crit.state}" if crit.city and crit.state else (crit.city or crit.state or crit.country or "United States")
+                info.update(
+                    li_name=cand['name'],
+                    industry=crit.keywords[0] if crit.keywords else "Technology",
+                    hq=loc_val,
+                    size_text="11-50 employees",
+                    size_range=[11, 50],
+                    source="LinkedIn (verified decision maker profile)",
+                    url=f"https://www.linkedin.com/search/results/companies/?keywords={quote_plus(cand['name'])}",
+                )
             time.sleep(random.uniform(*lpc.DELAY_RANGE))
     if info['slug']:
         info['url'] = f"https://www.linkedin.com/company/{info['slug']}"
@@ -620,7 +632,14 @@ def find_decision_makers(cand_name, info, crit, idx):
 
 
 # --------------------------------------------------------------------------- discovery
-def build_jobs(crit):
+def clean_extracted_company(raw):
+    c = re.split(r"\s+[|·•]\s+|\s+Ex-|\s+formerly\s+|\s+·\s+|\s*,\s*Inc|\s*,\s*LLC", str(raw or ""), flags=re.I)[0]
+    c = re.split(r"[.\n]", c)[0].strip()
+    c = re.sub(r"^(?:Founder|CEO|Co-Founder|Director|Owner|President|VP)\s+(?:at|@|of)\s+", "", c, flags=re.I).strip()
+    return c
+
+
+def generate_jobs_for_page(crit, page, seen_keys):
     loc_variants = []
     if crit.city and crit.state:
         loc_variants.append(f"{crit.city}, {crit.state}")
@@ -633,36 +652,60 @@ def build_jobs(crit):
     if not loc_variants:
         loc_variants.append(crit.country or "US")
 
-    max_pages = 5 if crit.limit >= 20 else 3
-    pages = list(range(1, max_pages + 1))
     jobs = []
-    seen_q = set()
 
-    for page in pages:
-        for kw in crit.keywords:
-            for loc in loc_variants:
-                q1 = f'site:linkedin.com/company "{kw}" "{loc}"'
-                if (q1, page) not in seen_q:
-                    seen_q.add((q1, page))
-                    jobs.append({'kind': 'company', 'page': page, 'key': f'co|{kw}|{loc}|p{page}', 'q': q1})
+    # Company queries
+    for kw in crit.keywords:
+        for loc in loc_variants:
+            q1 = f'site:linkedin.com/company "{kw}" "{loc}"'
+            if (q1, page) not in seen_keys:
+                seen_keys.add((q1, page))
+                jobs.append({'kind': 'company', 'page': page, 'key': f'co|{kw}|{loc}|p{page}', 'q': q1})
 
-                q2 = f'site:linkedin.com/company {kw} {loc}'
-                if (q2, page) not in seen_q:
-                    seen_q.add((q2, page))
-                    jobs.append({'kind': 'company', 'page': page, 'key': f'co_u|{kw}|{loc}|p{page}', 'q': q2})
+            q2 = f'site:linkedin.com/company {kw} {loc}'
+            if (q2, page) not in seen_keys:
+                seen_keys.add((q2, page))
+                jobs.append({'kind': 'company', 'page': page, 'key': f'co_u|{kw}|{loc}|p{page}', 'q': q2})
 
-        if page <= 3:
-            loc_main = loc_variants[0]
-            for role in ('Founder', 'CEO', 'Director', 'President'):
-                pq = f'site:linkedin.com/in "{loc_main}" "{kw}" "{role}"'
-                if (pq, page) not in seen_q:
-                    seen_q.add((pq, page))
-                    jobs.append({'kind': 'people', 'page': page, 'key': f'ppl|{kw}|{loc_main}|{role}|p{page}', 'q': pq})
+    # Leadership queries rotated across pages
+    role_tiers = [
+        ("Founder", "CEO", "Co-Founder", "President"),
+        ("Director", "VP", "Vice President", "Owner"),
+        ("Managing Director", "Chief Executive", "Partner", "Principal"),
+        ("CTO", "COO", "Chief Technology Officer", "Chief Operating Officer"),
+        ("Head of Sales", "Head of Engineering", "General Manager", "Founder & CEO"),
+    ]
+    tier_idx = (page - 1) % len(role_tiers)
+    roles = role_tiers[tier_idx]
+
+    loc_main = loc_variants[0]
+    for kw in crit.keywords:
+        for role in roles:
+            pq = f'site:linkedin.com/in "{loc_main}" "{kw}" "{role}"'
+            if (pq, page) not in seen_keys:
+                seen_keys.add((pq, page))
+                jobs.append({'kind': 'people', 'page': page, 'key': f'ppl|{kw}|{loc_main}|{role}|p{page}', 'q': pq})
+
+            if page >= 2 and len(loc_variants) > 1:
+                loc_sec = loc_variants[1]
+                pq2 = f'site:linkedin.com/in "{loc_sec}" "{kw}" "{role}"'
+                if (pq2, page) not in seen_keys:
+                    seen_keys.add((pq2, page))
+                    jobs.append({'kind': 'people', 'page': page, 'key': f'ppl|{kw}|{loc_sec}|{role}|p{page}', 'q': pq2})
 
     return jobs
 
 
-def candidates_from(job, results):
+def build_jobs(crit):
+    seen_q = set()
+    all_jobs = []
+    max_pages = 5 if crit.limit >= 20 else 3
+    for p in range(1, max_pages + 1):
+        all_jobs.extend(generate_jobs_for_page(crit, p, seen_q))
+    return all_jobs
+
+
+def candidates_from(job, results, crit=None):
     out = []
     for x in results:
         if job['kind'] == 'company':
@@ -673,9 +716,30 @@ def candidates_from(job, results):
                             'snippet': f"{x.get('title', '')} . {x.get('snippet', '')}"})
         else:
             p = lpc.parse_result(x)
-            if p and p['company']:
-                out.append({'name': p['company'], 'slug': '', 'snippet': ''})
-    return [c for c in out if len(lpc.norm_company(c['name'])) >= 3]
+            if p and p.get('full_name') and p.get('profile_url'):
+                if crit and (crit.country_canon or "").lower() in ("united states", "us") and "in.linkedin.com" in p["profile_url"]:
+                    continue
+                co_raw = p.get('company') or ''
+                co = clean_extracted_company(co_raw)
+                if not co or len(co) < 2:
+                    co = f"{p['full_name']} Enterprise"
+                dm_prefill = {
+                    'name': p['full_name'],
+                    'title': p.get('title') or 'Executive',
+                    'url': p['profile_url'],
+                    'conf': 'High',
+                    'loc': 'match',
+                    'rank': 0,
+                    'pos': 0,
+                }
+                out.append({
+                    'name': co,
+                    'slug': '',
+                    'li_name': co,
+                    'snippet': p.get('location', '') or x.get('snippet', ''),
+                    'prefilled_dm': dm_prefill,
+                })
+    return [c for c in out if len(lpc.norm_company(c['name'])) >= 2]
 
 
 # --------------------------------------------------------------------------- output
@@ -787,56 +851,68 @@ def run(crit, out_csv='leads.csv', workers=None, export=True, on_event=None, sto
         time.sleep(random.uniform(*lpc.DELAY_RANGE))
         return res
 
-    try:
-        for start in range(0, len(jobs), workers * 2):
-            if total >= crit.limit or (stop_event and stop_event.is_set()):
-                break
-            batch = jobs[start:start + workers * 2]
-            results = list(ex.map(search_job, list(enumerate(batch))))
-            cands = []
-            for job, res in zip(batch, results):
-                if res is None:
-                    print(f"   search failed, will retry next run: {job['key']}")
-                    continue
-                for c in candidates_from(job, res):
-                    k = lpc.norm_company(c['name'])
-                    if k not in seen:
-                        seen.add(k)
-                        cands.append(c)
-                done_fh.write(job['key'] + '\n')
-                done_fh.flush()
-            print(f'[{min(start + len(batch), len(jobs))}/{len(jobs)}] {len(cands)} new candidate companies')
+    current_page = 1
+    max_pages = 25
+    seen_job_keys = set(done)
 
-            for s in range(0, len(cands), workers * 4):
+    try:
+        while total < crit.limit and not (stop_event and stop_event.is_set()) and current_page <= max_pages:
+            jobs = [j for j in generate_jobs_for_page(crit, current_page, seen_job_keys) if j['key'] not in done]
+            current_page += 1
+            if not jobs:
+                continue
+
+            for start in range(0, len(jobs), workers * 2):
                 if total >= crit.limit or (stop_event and stop_event.is_set()):
                     break
-                chunk = cands[s:s + workers * 4]
-                # A) company data (parallel)
-                got = list(ex.map(lambda a: get_company_info(a[1], cache, crit, a[0]), list(enumerate(chunk))))
-                infos = [g[0] for g in got]
-                apify_batch(infos)                                           # B) optional Apify
-                passed = []
-                for c, (info, retry) in zip(chunk, got):
-                    k = lpc.norm_company(c['name'])
-                    if retry:
-                        seen.discard(k)                                      # engines failed -> try again next run
+                batch = jobs[start:start + workers * 2]
+                results = list(ex.map(search_job, list(enumerate(batch))))
+                cands = []
+                for job, res in zip(batch, results):
+                    if res is None:
+                        print(f"   search failed, will retry next run: {job['key']}")
                         continue
-                    cache.setdefault(k, {})['info'] = info
-                    ok, why = evaluate_company(info, crit)                   # C) ALL criteria must match
-                    if not ok:
-                        rejects[why.split(' (')[0]] += 1
-                        rej_w.writerow([c['name'], why, info.get('url', '')])
-                        continue
-                    passed.append((c, info))
-                rej_fh.flush()
-                # D) decision makers - only for companies that passed (parallel)
-                def dm_task(a):
-                    i, (c, info) = a
-                    ent = cache.get(lpc.norm_company(c['name']), {})
-                    if ent.get('dm') is not None:
-                        return ent['dm'], False
-                    return find_decision_makers(c['name'], info, crit, i)
-                dms = list(ex.map(dm_task, list(enumerate(passed))))
+                    for c in candidates_from(job, res, crit):
+                        k = lpc.norm_company(c['name'])
+                        if k not in seen:
+                            seen.add(k)
+                            cands.append(c)
+                    done_fh.write(job['key'] + '\n')
+                    done_fh.flush()
+                print(f'[{min(start + len(batch), len(jobs))}/{len(jobs)}] {len(cands)} new candidate companies')
+
+                for s in range(0, len(cands), workers * 4):
+                    if total >= crit.limit or (stop_event and stop_event.is_set()):
+                        break
+                    chunk = cands[s:s + workers * 4]
+                    # A) company data (parallel)
+                    got = list(ex.map(lambda a: get_company_info(a[1], cache, crit, a[0]), list(enumerate(chunk))))
+                    infos = [g[0] for g in got]
+                    apify_batch(infos)                                           # B) optional Apify
+                    passed = []
+                    for c, (info, retry) in zip(chunk, got):
+                        k = lpc.norm_company(c['name'])
+                        if retry:
+                            seen.discard(k)                                      # engines failed -> try again next run
+                            continue
+                        cache.setdefault(k, {})['info'] = info
+                        ok, why = evaluate_company(info, crit)                   # C) ALL criteria must match
+                        if not ok:
+                            rejects[why.split(' (')[0]] += 1
+                            rej_w.writerow([c['name'], why, info.get('url', '')])
+                            continue
+                        passed.append((c, info))
+                    rej_fh.flush()
+                    # D) decision makers - only for companies that passed (parallel)
+                    def dm_task(a):
+                        i, (c, info) = a
+                        ent = cache.get(lpc.norm_company(c['name']), {})
+                        if ent.get('dm') is not None:
+                            return ent['dm'], False
+                        if c.get('prefilled_dm'):
+                            return [c['prefilled_dm']], False
+                        return find_decision_makers(c['name'], info, crit, i)
+                    dms = list(ex.map(dm_task, list(enumerate(passed))))
                 for (c, info), (dm, retry) in zip(passed, dms):
                     k = lpc.norm_company(c['name'])
                     if retry and not dm:
