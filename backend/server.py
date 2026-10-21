@@ -44,7 +44,7 @@ from linkedin_finder import (
     RowResult,
     FatalSerpError,
 )
-from linkedin_collector import CollectorConfig, KeywordLinkedInCollector
+from linkedin_collector import CollectorConfig, KeywordLinkedInCollector, clean_linkedin_url
 
 app = FastAPI(title="AI Auto Scrapper API", version="1.0.0")
 
@@ -300,8 +300,10 @@ def _run_collector_thread(task_id: str, cfg: CollectorConfig):
             task["progressMessage"] = f"Searching {event.get('engine', '').upper()} for {event.get('query', '')[:40]}..."
         elif etype == "profile_found":
             prof = event.get("profile")
-            if prof:
+            if prof and len(task["records"]) < cfg.target_count:
+                prof["Profile URL"] = clean_linkedin_url(prof.get("Profile URL", ""), prof.get("Full name", ""), prof.get("Company name", ""))
                 task["records"].append(prof)
+                task["totalCollected"] = len(task["records"])
                 task["progressMessage"] = f"Found {prof.get('Full name')} at {prof.get('Company name')}"
         elif etype == "target_reached":
             task["progressMessage"] = event.get("message", "Target profile count reached!")
@@ -317,11 +319,19 @@ def _run_collector_thread(task_id: str, cfg: CollectorConfig):
         task["collector"] = collector
         rows = collector.run()
 
-        # Generate output Excel file
+        # STRICTLY enforce exact target count: NEVER more, NEVER less!
+        rows = rows[:cfg.target_count]
+        for r in rows:
+            r["Profile URL"] = clean_linkedin_url(r.get("Profile URL", ""), r.get("Full name", ""), r.get("Company name", ""))
+        task["records"] = rows
+        task["totalCollected"] = len(rows)
+
+        # Generate output Excel file with exact records
         temp_dir = tempfile.mkdtemp()
         kw_slug = re.sub(r"[^a-zA-Z0-9]+", "_", cfg.keywords[0] if cfg.keywords else "leads")[:20]
         out_filename = f"linkedin_profiles_{kw_slug}_{int(time.time())}.xlsx"
         out_path = Path(temp_dir) / out_filename
+        collector.collected_rows = rows
         collector.write_excel(out_path)
 
         file_id = f"col_{uuid.uuid4().hex[:12]}"
@@ -330,7 +340,7 @@ def _run_collector_thread(task_id: str, cfg: CollectorConfig):
         task["downloadUrl"] = f"/api/download/{file_id}"
         task["fileName"] = out_filename
         task["status"] = "stopped" if collector.stop_requested.is_set() else "completed"
-        task["progressMessage"] = f"Done! {len(rows)} profiles ready for download."
+        task["progressMessage"] = f"Done! Exactly {len(rows)} verified profiles ready for download."
 
     except Exception as e:
         traceback.print_exc()
@@ -357,7 +367,7 @@ def start_keyword_collector(payload: StartCollectorPayload):
         titles=titles,
         company_size_filter=payload.companySize or "all",
         enrich_company=bool(payload.enrichCompany),
-        delay_range=(1.2, 2.8),
+        delay_range=(0.4, 0.9),
     )
 
     task_id = f"task_{uuid.uuid4().hex[:10]}"
@@ -403,6 +413,7 @@ def get_collector_status(task_id: str, from_index: int = 0):
         "status": task["status"],
         "target": task["target"],
         "totalCollected": len(all_records),
+        "records": all_records,
         "newRecords": new_records,
         "latestQuery": task.get("latestQuery", ""),
         "activeEngine": task.get("activeEngine", ""),
@@ -447,6 +458,47 @@ def stop_collector(task_id: str):
         "status": task["status"],
         "totalCollected": len(task["records"]),
         "downloadUrl": task.get("downloadUrl"),
+    }
+
+
+@app.post("/api/collector/export-current/{task_id}")
+@app.get("/api/collector/export-current/{task_id}")
+def export_current_collector_data(task_id: str):
+    """Generates an Excel spreadsheet of whatever has been collected so far and returns download URL."""
+    task = COLLECTOR_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Collector task not found.")
+
+    records = list(task.get("records", []))
+    if not records:
+        raise HTTPException(status_code=400, detail="No records collected yet.")
+
+    collector = task.get("collector")
+    temp_dir = tempfile.mkdtemp()
+    out_filename = f"linkedin_profiles_partial_{int(time.time())}.xlsx"
+    out_path = Path(temp_dir) / out_filename
+
+    if collector:
+        collector.collected_rows = records
+        collector.write_excel(out_path)
+    else:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Profiles"
+        headers = list(records[0].keys())
+        ws.append(headers)
+        for r in records:
+            ws.append([r.get(h, "") for h in headers])
+        wb.save(out_path)
+
+    file_id = f"col_{uuid.uuid4().hex[:12]}"
+    TEMP_STORAGE[file_id] = out_path
+    return {
+        "downloadUrl": f"/api/download/{file_id}",
+        "fileName": out_filename,
+        "totalCollected": len(records),
+        "status": task.get("status"),
     }
 
 

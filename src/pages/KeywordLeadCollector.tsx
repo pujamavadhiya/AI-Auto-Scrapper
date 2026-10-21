@@ -66,6 +66,29 @@ const TARGET_PRESETS = [10, 25, 50, 100, 250, 500, 1000];
 
 const DEFAULT_TITLES = ['CEO', 'Founder', 'Co-Founder', 'Owner', 'COO', 'VP'];
 
+export const cleanLinkedInUrl = (url: string, fullName: string = '', company: string = ''): string => {
+  if (!url) return '';
+  const base = url.includes('in.linkedin.com') || url.includes('/in/') ? 'https://in.linkedin.com/in/' : 'https://www.linkedin.com/in/';
+  const match = url.match(/linkedin\.com\/in\/([^/?#]+)/i);
+  if (!match) return url.split('?')[0].replace(/\/+$/, '');
+  const slug = match[1].trim();
+
+  if (fullName) {
+    const nameClean = fullName.replace(/[^a-zA-Z0-9]+/g, '').toLowerCase();
+    const slugClean = slug.replace(/[^a-zA-Z0-9]+/g, '').toLowerCase();
+    if (nameClean && (slugClean.startsWith(nameClean) || nameClean.includes(slugClean))) {
+      const rem = slugClean.slice(nameClean.length);
+      if (/^\d+$/.test(rem)) {
+        return `${base}${nameClean}${rem}`;
+      }
+      return `${base}${nameClean}`;
+    }
+  }
+
+  const cleanSlug = slug.replace(/[^a-zA-Z0-9]+/g, '');
+  return `${base}${cleanSlug}`;
+};
+
 export const KeywordLeadCollector: React.FC = () => {
   // Input Configuration State
   const [keywords, setKeywords] = useState<string[]>(['SaaS']);
@@ -182,12 +205,13 @@ export const KeywordLeadCollector: React.FC = () => {
         if (!res.ok) return;
 
         const data = await res.json();
-        if (data.newRecords && data.newRecords.length > 0) {
-          setRecords((prev) => {
-            const seen = new Set(prev.map((r) => r['Profile URL'].toLowerCase()));
-            const incoming = data.newRecords.filter((r: ScrapedProfile) => !seen.has(r['Profile URL'].toLowerCase()));
-            return [...prev, ...incoming];
-          });
+        // Live instantaneous records synchronization
+        if (data.records && data.records.length > 0) {
+          const cleaned = data.records.slice(0, targetCount).map((r: ScrapedProfile) => ({
+            ...r,
+            'Profile URL': cleanLinkedInUrl(r['Profile URL'], r['Full name'], r['Company name']),
+          }));
+          setRecords(cleaned);
         }
 
         if (data.latestQuery) setLatestQuery(data.latestQuery);
@@ -199,6 +223,13 @@ export const KeywordLeadCollector: React.FC = () => {
         if (data.status === 'completed' || data.status === 'stopped' || data.status === 'target_reached') {
           setIsRunning(false);
           setStatus(data.status);
+          if (data.records && data.records.length > 0) {
+            const cleaned = data.records.slice(0, targetCount).map((r: ScrapedProfile) => ({
+              ...r,
+              'Profile URL': cleanLinkedInUrl(r['Profile URL'], r['Full name'], r['Company name']),
+            }));
+            setRecords(cleaned);
+          }
           clearInterval(pollIntervalRef.current);
         } else if (data.status === 'error') {
           setIsRunning(false);
@@ -209,7 +240,7 @@ export const KeywordLeadCollector: React.FC = () => {
       } catch (err) {
         console.error('Polling error:', err);
       }
-    }, 1500);
+    }, 600);
   };
 
   // Stop Scraping
@@ -232,19 +263,40 @@ export const KeywordLeadCollector: React.FC = () => {
     }
   };
 
-  // Client-side fallback Excel download
-  const handleClientDownload = () => {
+  // Download Excel (works both during live scraping and after completion)
+  const handleClientDownload = async () => {
+    if (records.length === 0) {
+      alert('No records available to download yet.');
+      return;
+    }
+
+    // If scraper is running or stopped, try exporting current snapshot from backend first
+    if (taskId) {
+      try {
+        const expRes = await fetch(`http://127.0.0.1:8000/api/collector/export-current/${taskId}`);
+        if (expRes.ok) {
+          const expData = await expRes.json();
+          if (expData.downloadUrl) {
+            window.open(`http://127.0.0.1:8000${expData.downloadUrl}`, '_blank');
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn('Backend export snapshot failed, falling back to instant client XLSX generation:', err);
+      }
+    }
+
     if (downloadUrl) {
       window.open(`http://127.0.0.1:8000${downloadUrl}`, '_blank');
       return;
     }
 
-    if (records.length === 0) {
-      alert('No records available to download.');
-      return;
-    }
-
-    const ws = XLSX.utils.json_to_sheet(records);
+    // Instant client-side Excel file generation
+    const cleanRecords = records.map((r) => ({
+      ...r,
+      'Profile URL': cleanLinkedInUrl(r['Profile URL'], r['Full name'], r['Company name']),
+    }));
+    const ws = XLSX.utils.json_to_sheet(cleanRecords);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Profiles');
     const outName = fileName || `linkedin_profiles_${keywords[0] || 'leads'}_${Date.now()}.xlsx`;
@@ -305,7 +357,7 @@ export const KeywordLeadCollector: React.FC = () => {
               className="border-emerald-600 text-emerald-700 hover:bg-emerald-50 font-semibold flex items-center gap-2"
             >
               <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
-              Download Excel ({records.length})
+              {isRunning ? `Export Collected (${records.length})` : `Download Excel (${records.length})`}
             </Button>
           )}
 
@@ -568,8 +620,8 @@ export const KeywordLeadCollector: React.FC = () => {
                   isRunning
                     ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-400'
                     : status === 'completed' || status === 'target_reached'
-                    ? 'border-blue-500/50 bg-blue-500/10 text-blue-300'
-                    : 'border-slate-700 bg-slate-800 text-slate-400'
+                      ? 'border-blue-500/50 bg-blue-500/10 text-blue-300'
+                      : 'border-slate-700 bg-slate-800 text-slate-400'
                 )}
               >
                 {isRunning ? 'Scraping Live' : status.toUpperCase()}
@@ -637,7 +689,7 @@ export const KeywordLeadCollector: React.FC = () => {
                   className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold flex items-center justify-center gap-2 shadow-sm"
                 >
                   <Download className="w-4 h-4" />
-                  Download Excel Sheet ({records.length} Profiles)
+                  {isRunning ? `Export Current Progress (${records.length} Profiles)` : `Download Excel Sheet (${records.length} Profiles)`}
                 </Button>
               </div>
             )}
@@ -677,7 +729,7 @@ export const KeywordLeadCollector: React.FC = () => {
                 className="text-xs border-emerald-600 text-emerald-700 hover:bg-emerald-50 font-semibold flex items-center gap-1.5"
               >
                 <Download className="w-3.5 h-3.5 text-emerald-600" />
-                Export (.xlsx)
+                {isRunning ? `Export Partial (${records.length})` : 'Export (.xlsx)'}
               </Button>
             )}
           </div>
@@ -748,7 +800,7 @@ export const KeywordLeadCollector: React.FC = () => {
                     </td>
                     <td className="py-3 px-4 text-right">
                       <a
-                        href={r['Profile URL']}
+                        href={cleanLinkedInUrl(r['Profile URL'], r['Full name'], r['Company name'])}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-800 font-medium hover:underline text-xs"
