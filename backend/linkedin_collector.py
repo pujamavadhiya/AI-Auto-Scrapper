@@ -271,11 +271,20 @@ def size_ok(rng: Optional[Tuple[int, Optional[int]]], crit: Criteria) -> bool:
 def industry_ok(industry: str, crit: Criteria) -> bool:
     if not industry:
         return False
-    ind = " ".join(stem(t) for t in nt(industry).split())
+    ind_raw = nt(industry)
+    ind_stem = " ".join(stem(t) for t in ind_raw.split())
+
     for phrase in crit.industries:
-        toks = [stem(t) for t in nt(phrase).split() if t not in ("and", "of", "the", "in")]
-        if toks and all(has_phrase(ind, t) for t in toks):
+        phrase_raw = nt(phrase)
+        if phrase_raw and (phrase_raw in ind_raw or any(w in ind_raw for w in phrase_raw.split() if len(w) > 3)):
             return True
+        toks_raw = [t for t in phrase_raw.split() if t not in ("and", "of", "the", "in", "industry")]
+        toks_stem = [stem(t) for t in toks_raw]
+        if toks_stem and (all(has_phrase(ind_stem, t) for t in toks_stem) or any(has_phrase(ind_stem, t) for t in toks_stem)):
+            return True
+        if any(k in phrase_raw for k in ("saas", "software", "cloud", "tech", "app", "platform", "ai", "data", "it")):
+            if any(kw in ind_raw for kw in ("software", "technology", "it services", "consulting", "internet", "computer", "information", "telecom")):
+                return True
     return False
 
 
@@ -328,9 +337,12 @@ def evaluate_company(info: Dict[str, Any], crit: Criteria) -> Tuple[bool, str]:
     if not industry_ok(info["industry"], crit):
         return False, f"industry mismatch ({info['industry']})"
     rng = info.get("size_range")
-    if not rng:
-        return False, "company size not verified"
-    if not size_ok(rng, crit):
+    if crit.size_min > 1 or crit.size_max is not None:
+        if not rng:
+            return False, "company size not verified"
+        if not size_ok(rng, crit):
+            return False, f"size mismatch ({info.get('size_text')})"
+    elif rng and not size_ok(rng, crit):
         return False, f"size mismatch ({info.get('size_text')})"
     return location_ok(info, crit)
 
@@ -744,29 +756,29 @@ def build_jobs(crit: Criteria) -> List[Dict[str, Any]]:
     max_pages = 5 if crit.limit >= 20 else 3
     pages = list(range(1, max_pages + 1))
     jobs: List[Dict[str, Any]] = []
-    seen_q: Set[str] = set()
+    seen_q: Set[Tuple[str, int]] = set()
 
     for page in pages:
         for kw in crit.keywords:
             for loc in loc_variants:
                 q1 = f'site:linkedin.com/company "{kw}" "{loc}"'
-                if q1 not in seen_q:
-                    seen_q.add(q1)
+                if (q1, page) not in seen_q:
+                    seen_q.add((q1, page))
                     jobs.append({"kind": "company", "page": page, "key": f"co|{kw}|{loc}|p{page}", "q": q1})
 
                 q2 = f'site:linkedin.com/company {kw} {loc}'
-                if q2 not in seen_q:
-                    seen_q.add(q2)
+                if (q2, page) not in seen_q:
+                    seen_q.add((q2, page))
                     jobs.append({"kind": "company", "page": page, "key": f"co_u|{kw}|{loc}|p{page}", "q": q2})
 
-            # Leadership discovery queries to discover candidate companies
-            if page <= 3:
-                loc_main = loc_variants[0]
-                for role in ("Founder", "CEO", "Director", "President"):
-                    pq = f'site:linkedin.com/in "{loc_main}" "{kw}" "{role}"'
-                    if pq not in seen_q:
-                        seen_q.add(pq)
-                        jobs.append({"kind": "people", "page": page, "key": f"ppl|{kw}|{loc_main}|{role}|p{page}", "q": pq})
+        # Leadership discovery queries to discover candidate companies
+        if page <= 3:
+            loc_main = loc_variants[0]
+            for role in ("Founder", "CEO", "Director", "President"):
+                pq = f'site:linkedin.com/in "{loc_main}" "{kw}" "{role}"'
+                if (pq, page) not in seen_q:
+                    seen_q.add((pq, page))
+                    jobs.append({"kind": "people", "page": page, "key": f"ppl|{kw}|{loc_main}|{role}|p{page}", "q": pq})
 
     return jobs
 
