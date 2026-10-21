@@ -45,7 +45,7 @@ PAGES = [1, 2, 3]                    # result pages per search
 TARGET_PROFILES = 1000
 DELAY_RANGE = (3, 7)                 # seconds each worker pauses after a search (random)
 WORKERS = 3                          # parallel searches (1 = slowest/safest, 4-5 = faster but more blocks)
-ENGINES = ['ddg', 'bing']            # tried in rotation; falls back if one is blocked
+ENGINES = ['yahoo', 'bing']            # tried in rotation; falls back if one is blocked
 OUT_FILE = 'profiles.csv'
 DONE_FILE = 'done_searches.txt'       # one line per finished search -> restart skips them
 CACHE_FILE = 'company_cache.json'     # remembers every company lookup between runs
@@ -176,50 +176,61 @@ def search_bing(query, page):
 
 DELAY_RANGE = (0.5, 1.5)                 # seconds each worker pauses after a search (random)
 WORKERS = 3                          # parallel searches (1 = slowest/safest, 4-5 = faster but more blocks)
-ENGINES = ['ddg', 'bing']            # tried in rotation; falls back if one is blocked
+ENGINES = ['yahoo', 'bing']   # tried in rotation; falls back if one is blocked
+
+
+def search_yahoo(query, page):
+    if DDGS is None:
+        raise Blocked('ddgs not installed (pip install ddgs)')
+    try:
+        clean_q = re.sub(r'\([A-Za-z0-9\s"_-]+(?:\s+OR\s+[A-Za-z0-9\s"_-]+){2,}\)', 'CEO OR Founder OR Owner', query)
+        d = DDGS(timeout=8)
+        res = list(d.text(clean_q, backend='yahoo', max_results=10))
+        return [{'title': x.get('title', ''), 'url': x.get('href', ''), 'snippet': x.get('body', '')} for x in res or []]
+    except Exception as e:
+        if 'No results found' in str(e):
+            return []
+        raise Blocked(f'yahoo: {e}')
+
 
 def search_ddg(query, page):
     if DDGS is None:
         raise Blocked('ddgs not installed (pip install ddgs)')
     try:
         try:
-            d = DDGS(timeout=10)
+            d = DDGS(timeout=3)
+            res = list(d.text(query, backend='lite', max_results=10))
+        except Exception:
+            d = DDGS(timeout=3)
             res = list(d.text(query, max_results=10))
-        except TypeError:
-            d = DDGS()
-            res = list(d.text(query, max_results=10))
+        return [{'title': x.get('title', ''), 'url': x.get('href', ''), 'snippet': x.get('body', '')} for x in res or []]
     except Exception as e:
+        if 'No results found' in str(e):
+            return []
         raise Blocked(f'ddg: {e}')
-    return [{'title': x.get('title', ''), 'url': x.get('href', ''), 'snippet': x.get('body', '')} for x in res or []]
 
 
-SEARCH = {'ddg': search_ddg, 'bing': search_bing}
+SEARCH = {'yahoo': search_yahoo, 'bing': search_bing, 'ddg': search_ddg}
 
 
 def run_search(query, page, order, must=r'linkedin\.com/in/'):
     """Try engines in order. Returns a list of LinkedIn results (empty = genuinely none),
-    or None if every engine failed/blocked/returned junk (caller retries it next run).
-    An engine that answers with 10 non-LinkedIn results is treated as blocked, not 'done'."""
+    or None if every engine failed/blocked/returned junk (caller retries it next run)."""
     answered = False
     for name in order:
         try:
             res = SEARCH[name](query, page)
         except Blocked as e:
-            print(f'   [{name}] blocked/failed: {e}')
-            time.sleep(random.uniform(1.0, 2.5))
+            time.sleep(random.uniform(0.5, 1.5))
             continue
         except Exception as e:
-            print(f'   [{name}] error: {str(e)[:80]}')
-            time.sleep(random.uniform(1.0, 2.0))
+            time.sleep(random.uniform(0.5, 1.0))
             continue
-        if not res:
-            answered = True            # engine worked, just nothing found
-            continue
-        good = [x for x in res if re.search(must, x.get('url', ''), re.I)]
-        if good:
-            return good
-        print(f'   [{name}] returned {len(res)} results but none were LinkedIn pages -> treating as blocked')
-        time.sleep(random.uniform(1.0, 2.0))
+        if res is not None:
+            answered = True
+            good = [x for x in res if re.search(must, x.get('url', ''), re.I)]
+            if good:
+                return good
     return [] if answered else None
 
 
@@ -228,11 +239,37 @@ def tidy(v):
     return re.sub(r'\s*(\.{3}|\u2026)\s*$', '', str(v or '')).strip()
 
 
+def clean_linkedin_url(url: str, full_name: str = "", company: str = "") -> str:
+    if not url:
+        return ""
+    base = "https://in.linkedin.com/in/" if ("in.linkedin.com" in url or "/in/" in url) else "https://www.linkedin.com/in/"
+    m = re.search(r"linkedin\.com/in/([^/?#]+)", url, re.I)
+    if not m:
+        return url.split("?")[0].rstrip("/")
+    slug = m.group(1).strip()
+
+    if full_name:
+        name_clean = re.sub(r"[^a-zA-Z0-9]+", "", full_name).lower()
+        slug_clean = re.sub(r"[^a-zA-Z0-9]+", "", slug).lower()
+        if name_clean and (slug_clean.startswith(name_clean) or name_clean in slug_clean):
+            rem = slug_clean[len(name_clean):]
+            if re.match(r"^\d+$", rem):
+                return f"{base}{name_clean}{rem}"
+            else:
+                return f"{base}{name_clean}"
+
+    # Remove trailing hyphen or noise
+    clean_slug = slug.strip("-")
+    return f"{base}{clean_slug}"
+
+
 def parse_result(r):
     link = r.get('url') or ''
     if not re.search(r'linkedin\.com/in/', link, re.I):
         return None
-    clean = re.sub(r'\s*[|\-\u2013]\s*LinkedIn\s*$', '', str(r.get('title') or ''), flags=re.I)
+    raw_title = str(r.get('title') or '')
+    clean = re.split(r'\s*[|\-\u2013]\s*LinkedIn', raw_title, flags=re.I)[0].strip()
+    clean = re.sub(r'\s*(\.{3}|\u2026)\s*$', '', clean).strip()
     parts = [x.strip() for x in re.split(r'\s+[-\u2013]\s+', clean)]
     parts += [''] * (3 - len(parts))
     full_name = parts[0]
@@ -242,7 +279,7 @@ def parse_result(r):
     company = tidy(parts[2])
     at = re.match(r'^(.*?)\s+(?:at|@)\s+(.+)$', title, re.I)
     if at:
-        title = at.group(1)
+        title = at.group(1).strip()
         company = company or tidy(at.group(2))
     if title_cut:
         if not company:
@@ -257,7 +294,7 @@ def parse_result(r):
     exp = re.search(r'Experience:\s*([^\u00b7|]+)', snip, re.I)
     if exp and (not company or re.search(r'(\.{3}|\u2026)\s*$', parts[2])):
         company = tidy(exp.group(1))
-    profile_url = link.split('?')[0].rstrip('/')
+    profile_url = clean_linkedin_url(link, full_name, company)
     loc_m = re.search(r'Location:\s*([^\u00b7|\n]+)', snip)
     location = loc_m.group(1).strip() if loc_m else ''
     return {'full_name': full_name, 'title': title, 'company': company,

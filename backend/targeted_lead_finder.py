@@ -55,7 +55,9 @@ PEOPLE_SEARCH_PAGES = [1, 2]           # result pages per people search
 CACHE_FILE = 'targeted_cache.json'     # verified company facts + decision makers (criteria independent)
 FETCH_COMPANY_PAGE = True              # try the public LinkedIn company page
 DEFAULT_TITLES = ['Owner', 'Co-Owner', 'Proprietor', 'Founder', 'Co-Founder', 'CEO',
-                  'Chief Executive Officer', 'President', 'Managing Director', 'General Manager']
+                  'Chief Executive Officer', 'President', 'Managing Director', 'MD', 'Director',
+                  'Executive Director', 'General Manager', 'COO', 'Chief Operating Officer',
+                  'CTO', 'Chief Technology Officer', 'Partner', 'Managing Partner', 'VP', 'Vice President']
 # ================================================================
 
 COLUMNS = ['Company name', 'Company website', 'Company LinkedIn URL', 'Industry', 'Company size',
@@ -93,8 +95,13 @@ def company_phrase(name):
 
 
 def display_company(name):
-    return re.sub(r'[,\s]+(inc|llc|ltd|corp|co|corporation|company|incorporated)\.?$', '', str(name or '').strip(),
-                  flags=re.I).strip()
+    cleaned = re.sub(
+        r"[,\s]+(private\s+limited|pvt\.?\s*ltd\.?|pvt\.?|inc\.?|llc\.?|ltd\.?|corp\.?|co\.?|corporation|company|incorporated)\.?$",
+        "",
+        str(name or "").strip(),
+        flags=re.I,
+    ).strip()
+    return cleaned or str(name or "").strip()
 
 
 def same_company(a, b):
@@ -152,7 +159,26 @@ def resolve_country(raw):
     return n, {n}, ''
 
 
-# --------------------------------------------------------------------------- criteria
+INDUSTRY_EXPANSIONS = {
+    'saas': ['Software Development', 'IT Services and IT Consulting', 'Technology, Information and Internet', 'Computer Software', 'Information Technology & Services'],
+    'software': ['Software Development', 'IT Services and IT Consulting', 'Technology, Information and Internet', 'Computer Software'],
+    'cloud': ['Software Development', 'IT Services and IT Consulting', 'Technology, Information and Internet', 'Computer & Network Security', 'Information Technology & Services'],
+    'cloud infrastructure': ['Software Development', 'IT Services and IT Consulting', 'Technology, Information and Internet', 'Computer & Network Security', 'Information Technology & Services'],
+    'infrastructure': ['Software Development', 'IT Services and IT Consulting', 'Technology, Information and Internet', 'Civil Engineering', 'Construction'],
+    'ai': ['Software Development', 'IT Services and IT Consulting', 'Technology, Information and Internet', 'Research Services'],
+    'artificial intelligence': ['Software Development', 'IT Services and IT Consulting', 'Technology, Information and Internet', 'Research Services'],
+    'fintech': ['Financial Services', 'Software Development', 'Banking', 'IT Services and IT Consulting'],
+    'cybersecurity': ['Computer & Network Security', 'Software Development', 'IT Services and IT Consulting', 'Information Technology & Services'],
+    'e-commerce': ['Retail', 'Technology, Information and Internet', 'Software Development', 'Internet'],
+    'clean energy': ['Renewables & Environment', 'Oil & Energy', 'Utilities', 'Environmental Services'],
+    'digital marketing': ['Advertising Services', 'Marketing Services', 'Public Relations and Communications'],
+    'logistics': ['Logistics & Supply Chain', 'Transportation, Logistics and Storage', 'Freight and Package Transportation'],
+    'tobacco': ['Tobacco Manufacturing', 'Food and Beverage Manufacturing', 'Manufacturing'],
+    'manufacturing': ['Manufacturing', 'Machinery Manufacturing', 'Electrical Equipment Electric Parts Manufacturing'],
+    'healthcare': ['Hospitals and Health Care', 'Medical Equipment Manufacturing', 'Biotechnology'],
+}
+
+
 @dataclass
 class Criteria:
     industries: list                      # LinkedIn industry names / words to verify, e.g. ["Tobacco Manufacturing"]
@@ -180,6 +206,16 @@ class Criteria:
             raise ValueError('Give at least one of country / state / city')
         if not self.industries:
             raise ValueError('Give at least one industry')
+
+        # Map discovery keywords to official LinkedIn industry taxonomies
+        exp = []
+        for kw in self.keywords + self.industries:
+            k_low = nt(kw)
+            for map_k, map_vals in INDUSTRY_EXPANSIONS.items():
+                if map_k in k_low or k_low in map_k:
+                    exp.extend(map_vals)
+        if exp:
+            self.industries = list(dict.fromkeys(self.industries + exp))
 
     def signature(self):
         return {'industries': self.industries, 'keywords': self.keywords, 'country': self.country,
@@ -483,10 +519,17 @@ def apify_batch(infos):
 # --------------------------------------------------------------------------- decision makers
 def title_rank(text, titles):
     t = f' {nt(text)} '
+    t = re.sub(r'\bmd\b', 'managing director', t)
+    t = re.sub(r'\bceo\b', 'chief executive officer', t)
+    t = re.sub(r'\bcoo\b', 'chief operating officer', t)
+    t = re.sub(r'\bcto\b', 'chief technology officer', t)
     t = t.replace(' vice president ', ' vp ').replace(' assistant to the president ', ' ')
     best = None
     for i, ti in enumerate(titles):
-        if f' {nt(ti)} ' in t:
+        ti_norm = nt(ti)
+        if ti_norm in ('md', 'ceo', 'coo', 'cto'):
+            continue
+        if f' {ti_norm} ' in t:
             best = i if best is None else min(best, i)
     return best
 
@@ -521,7 +564,7 @@ def eval_dm(r, names, crit, generic):
         return None
     snippet = str(r.get('snippet') or '')
     exp = re.search(r'Experience:\s*([^\u00b7|]+)', snippet, re.I)
-    hay = nt(after + ' ' + (exp.group(1) if exp else ''))
+    hay = nt(after + ' ' + (exp.group(1) if exp else '') + ' ' + (parsed['company'] or ''))
     how = ''
     if parsed['company'] and any(same_company(parsed['company'], n) for n in names):
         how = 'field'
@@ -536,19 +579,33 @@ def eval_dm(r, names, crit, generic):
     if generic and loc != 'match':
         return None                       # generic company names need a matching location to be trusted
     conf = 'High' if how == 'field' and loc == 'match' else ('Medium' if loc != 'conflict' else 'Low (location differs)')
+    clean_url = lpc.clean_linkedin_url(parsed['profile_url'], parsed['full_name'], parsed['company'])
     return {'name': parsed['full_name'], 'title': parsed['title'] or after.split(' - ')[0],
-            'url': f'https://www.linkedin.com/in/{slug.group(1)}', 'rank': rank, 'conf': conf,
+            'url': clean_url, 'rank': rank, 'conf': conf,
             'loc': loc}
 
 
 def find_decision_makers(cand_name, info, crit, idx):
     """-> (list of DMs best-first, retry_later)"""
     names = [n for n in (cand_name, info.get('li_name')) if n]
+    disp = display_company(cand_name)
+    if disp not in names:
+        names.append(disp)
     generic = is_generic_name(cand_name)
-    tq = ' OR '.join(f'"{t}"' if ' ' in t or '-' in t else t for t in crit.titles)
     loc = crit.city or crit.state or crit.country
-    base = f'site:linkedin.com/in "{display_company(cand_name)}" ({tq})'
-    queries = ([f'{base} "{loc}"'] if loc else []) + [base]
+
+    queries = [
+        f'site:linkedin.com/in "{disp}" "Director"',
+        f'site:linkedin.com/in "{disp}" "CEO"',
+        f'site:linkedin.com/in "{disp}" "Founder"',
+        f'site:linkedin.com/in "{disp}" "MD"',
+        f'site:linkedin.com/in "{disp}" "{loc}"' if loc else None,
+        f'site:linkedin.com/in "{disp}"',
+    ]
+    if cand_name != disp:
+        queries.append(f'site:linkedin.com/in "{cand_name}"')
+    queries = [q for q in queries if q]
+
     order = lpc.ENGINES[idx % len(lpc.ENGINES):] + lpc.ENGINES[:idx % len(lpc.ENGINES)]
     failed = False
     for q in queries:
@@ -582,7 +639,7 @@ def build_jobs(crit):
                                  'q': f'site:linkedin.com/company "{kw}" "{loc}"'})
             if page in PEOPLE_SEARCH_PAGES:
                 jobs.append({'kind': 'people', 'page': page, 'key': f'people|{kw}|{locs[0]}|p{page}',
-                             'q': f'site:linkedin.com/in "{locs[0]}" "{kw}" ({tq})'})
+                             'q': f'site:linkedin.com/in "{locs[0]}" "{kw}"'})
     return jobs
 
 
