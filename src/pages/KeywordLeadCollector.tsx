@@ -32,21 +32,24 @@ import { Select } from '../components/ui/Select';
 import { cn } from '../lib/utils';
 
 export interface ScrapedProfile {
-  tab: string;
-  Region: string;
-  Segment: string;
   'Company name': string;
-  'Company size': string;
+  'Company website'?: string;
+  'Company LinkedIn URL'?: string;
   Industry: string;
-  'Industry source': string;
-  'Full name': string;
-  Title: string;
-  'Profile URL': string;
-  Location: string;
-  'Contact type': string;
-  'Search used': string;
-  'Date collected': string;
-  Approved: string;
+  'Company size': string;
+  Headquarters?: string;
+  'Decision maker name'?: string;
+  'Decision maker title'?: string;
+  'Decision maker LinkedIn URL'?: string;
+  'DM confidence'?: string;
+  'Other decision makers'?: string;
+  'Company data source'?: string;
+  'Date collected'?: string;
+  'Full name'?: string;
+  Title?: string;
+  'Profile URL'?: string;
+  Location?: string;
+  'Contact type'?: string;
 }
 
 const PRESET_KEYWORDS = [
@@ -209,7 +212,7 @@ export const KeywordLeadCollector: React.FC = () => {
         if (data.records && data.records.length > 0) {
           const cleaned = data.records.slice(0, targetCount).map((r: ScrapedProfile) => ({
             ...r,
-            'Profile URL': cleanLinkedInUrl(r['Profile URL'], r['Full name'], r['Company name']),
+            'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
           }));
           setRecords(cleaned);
         }
@@ -226,7 +229,7 @@ export const KeywordLeadCollector: React.FC = () => {
           if (data.records && data.records.length > 0) {
             const cleaned = data.records.slice(0, targetCount).map((r: ScrapedProfile) => ({
               ...r,
-              'Profile URL': cleanLinkedInUrl(r['Profile URL'], r['Full name'], r['Company name']),
+              'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
             }));
             setRecords(cleaned);
           }
@@ -294,7 +297,7 @@ export const KeywordLeadCollector: React.FC = () => {
     // Instant client-side Excel file generation
     const cleanRecords = records.map((r) => ({
       ...r,
-      'Profile URL': cleanLinkedInUrl(r['Profile URL'], r['Full name'], r['Company name']),
+      'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
     }));
     const ws = XLSX.utils.json_to_sheet(cleanRecords);
     const wb = XLSX.utils.book_new();
@@ -314,13 +317,12 @@ export const KeywordLeadCollector: React.FC = () => {
   const filteredRecords = records.filter((r) => {
     if (!tableSearch) return true;
     const s = tableSearch.toLowerCase();
-    return (
-      r['Full name'].toLowerCase().includes(s) ||
-      r.Title.toLowerCase().includes(s) ||
-      r['Company name'].toLowerCase().includes(s) ||
-      r.Location.toLowerCase().includes(s) ||
-      r.Industry.toLowerCase().includes(s)
-    );
+    const name = (r['Full name'] || r['Decision maker name'] || '').toLowerCase();
+    const title = (r.Title || r['Decision maker title'] || '').toLowerCase();
+    const comp = (r['Company name'] || '').toLowerCase();
+    const loc = (r.Location || r['Headquarters'] || '').toLowerCase();
+    const ind = (r.Industry || '').toLowerCase();
+    return name.includes(s) || title.includes(s) || comp.includes(s) || loc.includes(s) || ind.includes(s);
   });
 
   const progressPercent = Math.min(100, Math.round((records.length / targetCount) * 100));
@@ -771,20 +773,20 @@ export const KeywordLeadCollector: React.FC = () => {
                 </tr>
               ) : (
                 filteredRecords.map((r, i) => (
-                  <tr key={`${r['Profile URL']}-${i}`} className="hover:bg-slate-50/80 transition-colors">
+                  <tr key={`${r['Decision maker LinkedIn URL'] || r['Profile URL'] || r['Company LinkedIn URL']}-${i}`} className="hover:bg-slate-50/80 transition-colors">
                     <td className="py-3 px-4 font-mono text-slate-400 text-[11px]">{i + 1}</td>
                     <td className="py-3 px-4">
-                      <div className="font-semibold text-slate-900">{r['Full name']}</div>
-                      <div className="text-[11px] text-slate-400">{r['Contact type']}</div>
+                      <div className="font-semibold text-slate-900">{r['Decision maker name'] || r['Full name'] || r['Company name']}</div>
+                      <div className="text-[11px] text-slate-400">{r['DM confidence'] || r['Contact type'] || 'Verified'}</div>
                     </td>
-                    <td className="py-3 px-4 text-slate-700 font-medium max-w-[200px] truncate" title={r.Title}>
-                      {r.Title || '—'}
+                    <td className="py-3 px-4 text-slate-700 font-medium max-w-[200px] truncate" title={r['Decision maker title'] || r.Title}>
+                      {r['Decision maker title'] || r.Title || '—'}
                     </td>
                     <td className="py-3 px-4 text-slate-900 font-semibold max-w-[180px] truncate" title={r['Company name']}>
                       {r['Company name'] || '—'}
                     </td>
-                    <td className="py-3 px-4 text-slate-600 text-[11px] max-w-[150px] truncate" title={r.Location}>
-                      {r.Location || '—'}
+                    <td className="py-3 px-4 text-slate-600 text-[11px] max-w-[150px] truncate" title={r['Headquarters'] || r.Location}>
+                      {r['Headquarters'] || r.Location || '—'}
                     </td>
                     <td className="py-3 px-4">
                       {r.Industry ? (
@@ -800,7 +802,7 @@ export const KeywordLeadCollector: React.FC = () => {
                     </td>
                     <td className="py-3 px-4 text-right">
                       <a
-                        href={cleanLinkedInUrl(r['Profile URL'], r['Full name'], r['Company name'])}
+                        href={r['Decision maker LinkedIn URL'] || r['Profile URL'] || r['Company LinkedIn URL']}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-800 font-medium hover:underline text-xs"

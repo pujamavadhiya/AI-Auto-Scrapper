@@ -1,30 +1,33 @@
+#!/usr/bin/env python3
 """
-Keyword-Driven LinkedIn Profile Collector Engine (DuckDuckGo & Bing).
-No SerpApi or paid API required.
-
-Converts search dorks on DuckDuckGo (via duckduckgo_search) and Bing (plain HTML)
-into public LinkedIn profile records.
-Custom keywords, locations (country, state, city), titles, and target data size limit.
-Features live event streaming for real-time UI updates, verification of company/industry,
-and automatic stopping once target profile count is reached.
+Targeted Lead Finder & LinkedIn Profile Collector Engine.
+Strictly implements the user's authentic 4-step LinkedIn verification algorithm:
+  1. DISCOVER: Candidate companies via search engines (DuckDuckGo + Bing)
+  2. VERIFY: Company's own LinkedIn data (Industry, Size, Headquarters, Website)
+             Verified strictly against criteria. Nothing is guessed.
+  3. DECISION MAKER: Discovered and verified only for companies that passed Step 2.
+  4. STOP: Immediately once target limit is reached, or report exact verified count.
+Zero synthetic, dummy, or catalog data.
 """
 from __future__ import annotations
 
-import base64
+import argparse
+import csv
 import json
 import logging
 import os
 import random
 import re
 import sys
+import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import unicodedata
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
-from urllib.parse import parse_qs, quote_plus, urlparse
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -32,679 +35,931 @@ import requests
 from bs4 import BeautifulSoup
 
 try:
-    from ddgs import DDGS
+    import backend.linkedin_profile_collector as lpc
 except ImportError:
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        DDGS = None
+    import linkedin_profile_collector as lpc
 
 logger = logging.getLogger("linkedin_collector")
 logger.setLevel(logging.INFO)
 
-BAD_TITLE = re.compile(r"student|\bintern\b|trainee|freelanc|open to work|job seeker", re.I)
-BAD_INDUSTRY = re.compile(r"education|fashion|real estate|casino|hotel|staffing", re.I)
-
-UA = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+# ============================ CONFIG ============================
+COMPANY_SEARCH_PAGES = [1, 2, 3]       # result pages per company search
+PEOPLE_SEARCH_PAGES = [1, 2]           # result pages per people search
+CACHE_FILE = "targeted_cache.json"     # verified company facts + decision makers (criteria independent)
+FETCH_COMPANY_PAGE = True              # try the public LinkedIn company page
+DEFAULT_TITLES = [
+    "Owner", "Co-Owner", "Proprietor", "Founder", "Co-Founder", "CEO",
+    "Chief Executive Officer", "President", "Managing Director", "General Manager"
 ]
+# ================================================================
 
 COLUMNS = [
-    "tab",
-    "Region",
-    "Segment",
     "Company name",
-    "Company size",
+    "Company website",
+    "Company LinkedIn URL",
     "Industry",
-    "Industry source",
-    "Full name",
-    "Title",
-    "Profile URL",
-    "Location",
-    "Contact type",
-    "Search used",
+    "Company size",
+    "Headquarters",
+    "Decision maker name",
+    "Decision maker title",
+    "Decision maker LinkedIn URL",
+    "DM confidence",
+    "Other decision makers",
+    "Company data source",
     "Date collected",
-    "Approved",
 ]
 
-IND_RE = re.compile(
-    r"Industry:?\s*([A-Z][A-Za-z,&/\- ]{2,70}?)(?=\s*(?:[.\u00b7|\n]|Company size|Headquarters|Founded|Type:|Specialties|Website|$))"
-)
-SIZE_RE = re.compile(r"Company size:?\s*([\d,]+(?:\s*[-\u2013]\s*[\d,]+|\+)?\s*employees)", re.I)
+
+# --------------------------------------------------------------------------- text helpers
+def nt(s: Any) -> str:
+    s = "".join(c for c in unicodedata.normalize("NFKD", str(s or "")) if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", s.lower().replace("&", " and "))).strip()
 
 
-class Blocked(Exception):
-    pass
+def stem(t: str) -> str:
+    return t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t
 
 
-def unwrap_bing(href: str) -> str:
-    """Bing wraps result links in bing.com/ck/a?...&u=a1<base64url>. Decode them."""
-    if "bing.com/ck/a" in href:
-        u = parse_qs(urlparse(href).query).get("u", [""])[0]
-        if u.startswith("a1"):
-            b = u[2:]
-            b += "=" * (-len(b) % 4)
-            try:
-                return base64.urlsafe_b64decode(b).decode("utf-8", "ignore")
-            except Exception:
-                pass
-    return href
+def has_phrase(hay_norm: str, phrase_norm: str) -> bool:
+    return bool(phrase_norm) and re.search(rf"(?<![a-z0-9]){re.escape(phrase_norm)}(?![a-z0-9])", hay_norm) is not None
 
 
-def parse_bing_html(html: str) -> List[Dict[str, str]]:
+def split_list(s: Any) -> List[str]:
+    if isinstance(s, list):
+        return [str(x).strip() for x in s if str(x).strip()]
+    return [x.strip() for x in re.split(r"[,;\n]+", str(s or "")) if x.strip()]
+
+
+SUFFIX = {
+    "inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation",
+    "co", "company", "llp", "lp", "plc", "pllc", "pc", "the", "dba"
+}
+
+GENERIC_WORDS = {
+    "smoke", "shop", "shops", "store", "stores", "vape", "vapes", "tobacco", "cigar", "cigars",
+    "hookah", "market", "mini", "mart", "convenience", "wholesale", "supply", "supplies", "discount",
+    "liquor", "deli", "grocery", "gas", "station", "food", "foods", "and", "usa", "us", "new", "best",
+    "smoking", "mobile", "express", "plus", "city", "town", "super", "one", "first", "general"
+}
+
+
+def company_phrase(name: str) -> str:
+    return " ".join(t for t in nt(name).split() if t not in SUFFIX)
+
+
+def display_company(name: str) -> str:
+    return re.sub(
+        r"[,\s]+(inc|llc|ltd|corp|co|corporation|company|incorporated)\.?$",
+        "",
+        str(name or "").strip(),
+        flags=re.I,
+    ).strip()
+
+
+def same_company(a: str, b: str) -> bool:
+    na, nb = lpc.norm_company(a), lpc.norm_company(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    s, l = sorted((na, nb), key=len)
+    return len(s) >= 5 and s in l and len(s) / len(l) >= 0.75
+
+
+def is_generic_name(name: str) -> bool:
+    toks = company_phrase(name).split()
+    return bool(toks) and (all(t in GENERIC_WORDS for t in toks) or (len(toks) == 1 and len(toks[0]) < 4))
+
+
+# --------------------------------------------------------------------------- geography
+US_STATES = {
+    "AL": "alabama", "AK": "alaska", "AZ": "arizona", "AR": "arkansas", "CA": "california", "CO": "colorado",
+    "CT": "connecticut", "DE": "delaware", "FL": "florida", "GA": "georgia", "HI": "hawaii", "ID": "idaho",
+    "IL": "illinois", "IN": "indiana", "IA": "iowa", "KS": "kansas", "KY": "kentucky", "LA": "louisiana",
+    "ME": "maine", "MD": "maryland", "MA": "massachusetts", "MI": "michigan", "MN": "minnesota",
+    "MS": "mississippi", "MO": "missouri", "MT": "montana", "NE": "nebraska", "NV": "nevada",
+    "NH": "new hampshire", "NJ": "new jersey", "NM": "new mexico", "NY": "new york", "NC": "north carolina",
+    "ND": "north dakota", "OH": "ohio", "OK": "oklahoma", "OR": "oregon", "PA": "pennsylvania",
+    "RI": "rhode island", "SC": "south carolina", "SD": "south dakota", "TN": "tennessee", "TX": "texas",
+    "UT": "utah", "VT": "vermont", "VA": "virginia", "WA": "washington", "WV": "west virginia",
+    "WI": "wisconsin", "WY": "wyoming", "DC": "district of columbia",
+}
+STATE_BY_NAME = {v: k for k, v in US_STATES.items()}
+
+COUNTRIES = {
+    "united states": ({"united states", "united states of america", "usa", "america"}, "US"),
+    "united kingdom": ({"united kingdom", "great britain", "england", "scotland", "wales", "uk"}, "GB"),
+    "canada": ({"canada"}, "CA"),
+    "india": ({"india"}, "IN"),
+    "australia": ({"australia"}, "AU"),
+    "germany": ({"germany", "deutschland"}, "DE"),
+    "france": ({"france"}, "FR"),
+    "italy": ({"italy"}, "IT"),
+    "spain": ({"spain"}, "ES"),
+    "netherlands": ({"netherlands", "holland"}, "NL"),
+    "ireland": ({"ireland"}, "IE"),
+    "mexico": ({"mexico"}, "MX"),
+    "brazil": ({"brazil"}, "BR"),
+    "united arab emirates": ({"united arab emirates", "uae"}, "AE"),
+    "singapore": ({"singapore"}, "SG"),
+    "pakistan": ({"pakistan"}, "PK"),
+    "new zealand": ({"new zealand"}, "NZ"),
+    "south africa": ({"south africa"}, "ZA"),
+}
+
+
+def resolve_country(raw: str) -> Tuple[str, Set[str], str]:
+    n = nt(raw)
+    if not n:
+        return "", set(), ""
+    if n in ("us", "usa", "u s", "u s a"):
+        n = "united states"
+    if n in ("uk", "gb"):
+        n = "united kingdom"
+    for canon, (names, code) in COUNTRIES.items():
+        if n == canon or n in names:
+            return canon, names | {canon}, code
+    return n, {n}, ""
+
+
+# --------------------------------------------------------------------------- criteria
+@dataclass
+class Criteria:
+    industries: list                      # LinkedIn industry names / words to verify, e.g. ["Tobacco Manufacturing"]
+    keywords: list = field(default_factory=list)   # discovery search terms (default = industries)
+    country: str = ""
+    state: str = ""
+    city: str = ""
+    size_min: int = 1
+    size_max: Optional[int] = None        # None = no upper bound
+    limit: int = 100
+    size_mode: str = "contained"          # 'contained' = LinkedIn size band must lie fully inside range
+    require_dm: bool = True               # only count companies where a decision maker was verified
+    titles: list = field(default_factory=lambda: list(DEFAULT_TITLES))
+
+    def __post_init__(self):
+        self.keywords = self.keywords or list(self.industries)
+        self.city_n = nt(self.city)
+        r = self.state.strip()
+        if r.upper() in US_STATES:
+            self.st_abbr, self.st_full = r.upper(), US_STATES[r.upper()]
+        else:
+            self.st_abbr, self.st_full = STATE_BY_NAME.get(nt(r), ""), nt(r)
+        self.country_canon, self.country_names, self.country_code = resolve_country(self.country)
+        if not (self.city or self.state or self.country):
+            # Default to worldwide/US if completely blank
+            self.country = "United States"
+            self.country_canon, self.country_names, self.country_code = resolve_country(self.country)
+        if not self.industries:
+            self.industries = list(self.keywords) if self.keywords else ["Technology"]
+
+    def signature(self) -> Dict[str, Any]:
+        return {
+            "industries": self.industries,
+            "keywords": self.keywords,
+            "country": self.country,
+            "state": self.state,
+            "city": self.city,
+            "size": [self.size_min, self.size_max],
+            "size_mode": self.size_mode,
+            "titles": self.titles,
+        }
+
+
+def parse_size_arg(s: Any) -> Tuple[int, Optional[int]]:
+    """'11-50' | '50+' | '<=50' | 'up to 50' | '10 to 100' | '11-50, 51-200' -> (min, max|None)."""
+    if not s or str(s).lower() == "all":
+        return 1, None
+    t = re.sub(r"(\d),(\d{3})", r"\1\2", str(s or "").lower())
+    ranges = [(int(x), int(y)) for x, y in re.findall(r"(\d+)\s*(?:-|\u2013|to)\s*(\d+)", t)]
+    if ranges:
+        return min(r[0] for r in ranges), max(r[1] for r in ranges)
+    m = re.search(r"(\d+)\s*\+", t) or re.search(r"(?:at least|minimum|min|over|>=|>)\s*(\d+)", t)
+    if m:
+        return int(m.group(1)), None
+    m = re.search(r"(?:up to|maximum|max|under|<=|<)\s*(\d+)", t)
+    if m:
+        return 1, int(m.group(1))
+    return 1, None
+
+
+def parse_size_text(text: str, need_word: bool = True) -> Optional[Tuple[int, Optional[int]]]:
+    """LinkedIn size text -> (lo, hi|None) or None.  '11-50 employees', '10,001+ employees'."""
+    t = re.sub(r"(\d),(\d{3})", r"\1\2", str(text or ""))
+    w = r"\s*employees" if need_word else ""
+    m = re.search(rf"(\d+)\s*(?:-|\u2013|to)\s*(\d+){w}", t, re.I)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(rf"(\d+)\s*\+{w}", t, re.I)
+    if m:
+        return int(m.group(1)), None
+    return None
+
+
+def size_ok(rng: Optional[Tuple[int, Optional[int]]], crit: Criteria) -> bool:
+    if not rng:
+        return False
+    lo, hi = rng
+    cmax = crit.size_max
+    if crit.size_mode == "overlap":
+        return (hi is None or hi >= crit.size_min) and (cmax is None or lo <= cmax)
+    return lo >= crit.size_min and (cmax is None or (hi is not None and hi <= cmax))
+
+
+def industry_ok(industry: str, crit: Criteria) -> bool:
+    if not industry:
+        return False
+    ind = " ".join(stem(t) for t in nt(industry).split())
+    for phrase in crit.industries:
+        toks = [stem(t) for t in nt(phrase).split() if t not in ("and", "of", "the", "in")]
+        if toks and all(has_phrase(ind, t) for t in toks):
+            return True
+    return False
+
+
+def location_ok(info: Dict[str, Any], crit: Criteria) -> Tuple[bool, str]:
+    hq = info.get("hq") or ""
+    if not hq:
+        return False, "headquarters not verified"
+    hq_n = nt(hq)
+    if crit.city and not has_phrase(hq_n, crit.city_n):
+        return False, f"HQ city differs ({hq})"
+    state_hit = False
+    if crit.state:
+        state_hit = bool(
+            (crit.st_full and has_phrase(hq_n, crit.st_full))
+            or (crit.st_abbr and re.search(rf"\b{crit.st_abbr}\b", hq))
+        )
+        if not state_hit:
+            return False, f"HQ state differs ({hq})"
+    if crit.country:
+        confirmed = any(has_phrase(hq_n, n) for n in crit.country_names) or (
+            crit.country_code and info.get("country_code", "").upper() == crit.country_code
+        )
+        if not confirmed and crit.country_canon == "united states":
+            confirmed = (
+                state_hit
+                or any(has_phrase(hq_n, v) for v in US_STATES.values())
+                or bool(re.search(r"\b(" + "|".join(US_STATES) + r")\b", hq))
+            )
+        if not confirmed:  # infer from city/state only if no OTHER country is named
+            other = any(
+                has_phrase(hq_n, n)
+                for c, (names, _) in COUNTRIES.items()
+                if c != crit.country_canon
+                for n in names
+            )
+            code_other = (
+                info.get("country_code")
+                and crit.country_code
+                and info["country_code"].upper() != crit.country_code
+            )
+            confirmed = (state_hit or bool(crit.city)) and not other and not code_other
+        if not confirmed:
+            return False, f"HQ country not confirmed ({hq})"
+    return True, ""
+
+
+def evaluate_company(info: Dict[str, Any], crit: Criteria) -> Tuple[bool, str]:
+    if not info or not info.get("industry"):
+        return False, "industry not verified"
+    if not industry_ok(info["industry"], crit):
+        return False, f"industry mismatch ({info['industry']})"
+    rng = info.get("size_range")
+    if not rng:
+        return False, "company size not verified"
+    if not size_ok(rng, crit):
+        return False, f"size mismatch ({info.get('size_text')})"
+    return location_ok(info, crit)
+
+
+# --------------------------------------------------------------------------- LinkedIn company data
+_fail = 0
+_lock = threading.Lock()
+
+
+def new_info() -> Dict[str, Any]:
+    return {
+        "slug": "",
+        "li_name": "",
+        "url": "",
+        "industry": "",
+        "size_text": "",
+        "size_range": None,
+        "hq": "",
+        "country_code": "",
+        "website": "",
+        "source": "",
+        "page_tried": False,
+        "apify_tried": False,
+        "ambiguous": False,
+    }
+
+
+def clean_website(u: Any) -> str:
+    u = str(u or "").strip()
+    if not u:
+        return ""
+    if not re.match(r"https?://", u, re.I):
+        u = "http://" + u
+    host = re.sub(r"^www\.", "", (re.match(r"https?://([^/?#]+)", u, re.I) or [None, ""])[1].lower())
+    if not host or "." not in host or any(x in host for x in ("linkedin.com", "facebook.com", "instagram.com")):
+        return ""
+    return re.split(r"[?#]", u)[0].rstrip("/")
+
+
+def parse_company_page(html: str) -> Dict[str, str]:
     soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for li in soup.select("li.b_algo"):
-        a = li.select_one("h2 a")
-        if not a:
+    out = {"industry": "", "size_text": "", "hq": "", "website": "", "country_code": ""}
+    labels = {"industry": "industry", "company size": "size_text", "headquarters": "hq", "website": "website"}
+    for dt in soup.find_all("dt"):
+        key = labels.get(dt.get_text(" ", strip=True).lower())
+        dd = dt.find_next("dd")
+        if key and dd and not out[key]:
+            a = dd.find("a", href=True) if key == "website" else None
+            out[key] = (a["href"] if a else dd.get_text(" ", strip=True)).strip()
+    for sel, key in (
+        ('[data-test-id="about-us__industry"] dd', "industry"),
+        ('[data-test-id="about-us__size"] dd', "size_text"),
+        ('[data-test-id="about-us__headquarters"] dd', "hq"),
+    ):
+        el = soup.select_one(sel)
+        if el and not out[key]:
+            out[key] = el.get_text(" ", strip=True)
+    for sc in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(sc.string or "")
+        except Exception:
             continue
-        cap = li.select_one(".b_caption p") or li.select_one(".b_lineclamp2") or li.select_one("p")
-        url = unwrap_bing(a.get("href", ""))
-        if "linkedin.com" not in url:
-            cite = li.select_one("cite")
-            if cite:
-                url = "https://" + cite.get_text(" ", strip=True).replace(" › ", "/").replace("https://", "")
-        out.append({
-            "title": a.get_text(" ", strip=True),
-            "url": url,
-            "snippet": cap.get_text(" ", strip=True) if cap else "",
-        })
+        items = data.get("@graph", [data]) if isinstance(data, dict) else data
+        for it in items if isinstance(items, list) else []:
+            addr = it.get("address") if isinstance(it, dict) else None
+            if isinstance(addr, dict):
+                ctry = str(addr.get("addressCountry") or "")
+                if len(ctry) == 2 and not out["country_code"]:
+                    out["country_code"] = ctry.upper()
+                if not out["hq"]:
+                    out["hq"] = ", ".join(
+                        str(addr.get(k)) for k in ("addressLocality", "addressRegion", "addressCountry") if addr.get(k)
+                    )
+    out["website"] = clean_website(out["website"])
     return out
 
 
-_bing_session = requests.Session()
-
-
-def search_bing(query: str, page: int = 1) -> List[Dict[str, str]]:
-    first = (page - 1) * 10 + 1
-    url = f"https://www.bing.com/search?q={quote_plus(query)}&first={first}&count=10&setlang=en-US&cc=US&mkt=en-US"
-    headers = {
-        "User-Agent": random.choice(UA),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.bing.com/",
-    }
-    last_err = None
-    for attempt in range(2):
-        try:
-            r = _bing_session.get(url, headers=headers, timeout=25)
-            break
-        except requests.exceptions.RequestException as e:
-            last_err = e
-            time.sleep(random.uniform(2, 4))
-    else:
-        raise Blocked(f"bing connection reset ({str(last_err)[:40]})")
-
-    if r.status_code in (403, 429) or "captcha" in r.text.lower()[:5000]:
-        raise Blocked(f"bing {r.status_code}")
-    r.raise_for_status()
-    return parse_bing_html(r.text)
-
-
-_ddgs_instance = None
-
-
-def get_ddgs():
-    global _ddgs_instance
-    if _ddgs_instance is None:
-        try:
-            from ddgs import DDGS
-            _ddgs_instance = DDGS()
-        except Exception:
-            try:
-                from duckduckgo_search import DDGS
-                _ddgs_instance = DDGS()
-            except Exception:
-                _ddgs_instance = None
-    return _ddgs_instance
-
-
-def search_ddg(query: str, page: int = 1) -> List[Dict[str, str]]:
-    d = get_ddgs()
-    if not d:
-        return []
+def fetch_page(slug: str) -> Optional[Dict[str, str]]:
+    global _fail
+    with _lock:
+        if _fail >= 5:
+            return None
     try:
-        results = list(d.text(query, max_results=10))
-        out = []
-        for r in results:
-            url = r.get("href") or ""
-            if "linkedin.com/in/" in url:
-                out.append({
-                    "title": r.get("title") or "",
-                    "url": url,
-                    "snippet": r.get("body") or "",
-                })
-        return out
-    except Exception as e:
-        logger.warning(f"DDGS search error: {e}")
-        return []
+        r = requests.get(
+            f"https://www.linkedin.com/company/{slug}/",
+            timeout=25,
+            headers={"User-Agent": random.choice(lpc.UA), "Accept-Language": "en-US,en;q=0.9"},
+        )
+        ok = r.status_code == 200 and "authwall" not in r.url
+    except Exception:
+        ok, r = False, None
+    parsed = parse_company_page(r.text) if (ok and r is not None) else None
+    with _lock:
+        _fail = 0 if parsed and (parsed["industry"] or parsed["hq"]) else _fail + 1
+    return parsed
 
 
-SEARCH_ENGINES = {"ddg": search_ddg, "bing": search_bing}
+def apply_fields(info: Dict[str, Any], d: Dict[str, Any], source: str):
+    """Fill ONLY empty fields; remember where the data came from."""
+    changed = False
+    for k in ("industry", "hq", "website", "country_code"):
+        if d.get(k) and not info[k]:
+            info[k] = d[k]
+            changed = True
+    if d.get("size_text") and not info["size_range"]:
+        rng = parse_size_text(d["size_text"], need_word=False)
+        if rng:
+            info["size_text"], info["size_range"] = d["size_text"], list(rng)
+            changed = True
+    if changed and source not in info["source"]:
+        info["source"] = (info["source"] + " + " if info["source"] else "") + source
 
 
-def run_search_engine(
-    query: str, page: int, engine_order: List[str], must: str = r"linkedin\.com/in/"
-) -> Optional[List[Dict[str, str]]]:
-    answered = False
-    for name in engine_order:
-        fn = SEARCH_ENGINES.get(name)
-        if not fn:
-            continue
-        try:
-            res = fn(query, page)
-        except Blocked as e:
-            logger.warning(f"[{name}] search blocked/fallback: {e}")
-            time.sleep(1.5)
-            continue
-        except Exception as e:
-            logger.warning(f"[{name}] error: {str(e)[:80]}")
-            time.sleep(1)
-            continue
-
-        if not res:
-            answered = True
-            continue
-
-        good = [x for x in res if re.search(must, x.get("url", ""), re.I)]
-        if good:
-            return good
-        answered = True
-
-    return [] if answered else None
+def snippet_fields(text: str) -> Dict[str, str]:
+    ind, size = lpc.parse_company_text(text)
+    hq = re.search(
+        r"Headquarters:?\s*([A-Z][^\u00b7|\n]{2,60}?)(?=\s*(?:[.\u00b7|\n]|Founded|Company size|Industry|$))",
+        text or "",
+    )
+    return {"industry": ind, "size_text": size, "hq": hq.group(1).strip() if hq else ""}
 
 
-TITLE_WORDS = re.compile(
-    r"\b(CEO|CTO|COO|CFO|CMO|CIO|CRO|CCO|Founder|Co-Founder|Co-founder|Owner|Co-Owner|President|VP|Vice President|Director|Head|Lead|Partner|Managing Director|Officer|Executive)\b",
-    re.I,
-)
-
-ROLE_WORDS = re.compile(
-    r"\b(architect|consultant|analyst|developer|engineer|specialist|manager|director|officer|executive|president|founder|owner|partner|head|lead|leader|leadership|strategist|advisor|entrepreneur|technologist|operator|member|innovator|evangelist|enthusiast|mentor|decision maker|decision-maker)\b",
-    re.I,
-)
-
-GENERIC_COMPANY_TERMS = re.compile(
-    r"^(helping|services|it services|software|technology|consulting|incubator|building|experienced|seasoned|passionate|professional|specialist|business|commercialization|co|self-employed|freelance|stealth|ex-|award-winning|growth-driven|results-driven|visionary|champion|expert)$",
-    re.I,
-)
-
-ING_WORDS = re.compile(
-    r"^(helping|scaling|building|driving|growing|empowering|leading|managing|innovating|transforming|accelerating|creating|enabling|providing|delivering|advising|consulting|investing|ex-)\b",
-    re.I,
-)
-
-DISCIPLINE_TERMS = re.compile(
-    r"\b(decision maker|business decision|decision-maker|project management|construction management|product management|business development|operations management|marketing strategy|digital marketing|full stack|software development|it services|sales management|account management|management|execution)\b",
-    re.I,
-)
+def li_title_name(title: str) -> str:
+    t = re.sub(r"\s*[|\-\u2013]\s*LinkedIn.*$", "", str(title or ""), flags=re.I)
+    return re.split(r"\s+\|\s+|\s+[-\u2013]\s+", t)[0].strip()
 
 
-def clean_title(title: str) -> str:
-    title = re.sub(r"^[↳\s*•·]+", "", title).strip()
-    title = re.sub(r"\s*\((?:he/him|she/her|they/them)\)", "", title, flags=re.I).strip()
-    if "•" in title or "·" in title or "|" in title:
-        subparts = [p.strip() for p in re.split(r"[•·|]+", title) if p.strip()]
-        for sp in subparts:
-            if TITLE_WORDS.search(sp):
-                title = sp
-                break
-    m_broken = re.search(r"^(.*?)\s*&\s*[A-Za-z]{1,4}$", title)
-    if m_broken:
-        title = m_broken.group(1).strip()
-    return title
-
-NON_LOCATION_WORDS = re.compile(
-    r"\b(is|are|was|were|has|have|had|been|alone|doesn|incubator|technologist|entrepreneur|helping|scale|growth|platform|solution|solutions|team|services|companies|firm|global|author|consultant|mentor|speaker|enthusiast|leader|engineer|developer|developers|group|organiser|organizer|driving|delivering|commercialization|innovations|products|engineering|community|builder|member|volunteer)\b",
-    re.I,
-)
-
-LOCATION_INDICATORS = re.compile(
-    r"\b(Area|City|State|Region|District|Province|India|United States|USA|UK|United Kingdom|Canada|Australia|Germany|France|Netherlands|Singapore|UAE|Dubai|Gujarat|Maharashtra|Karnataka|Delhi|Texas|California|New York|Florida|Illinois|London|San Francisco|Austin|Ahmedabad|Mumbai|Bangalore|Bengaluru|Pune|Hyderabad|Chennai|Kolkata|Europe|Asia|Americas|Middle East|Worldwide|Global|APAC|EMEA|North America|South America|Africa)\b",
-    re.I,
-)
-
-FOREIGN_LOCATIONS = re.compile(
-    r"\b(United States|USA|U\.S\.A\.|United Kingdom|UK|U\.K\.|London|UAE|Dubai|Abu Dhabi|United Arab Emirates|Canada|Toronto|Vancouver|Australia|Sydney|Melbourne|Germany|Berlin|Munich|France|Paris|Singapore|Netherlands|Amsterdam|Switzerland|Sweden|Ireland|Dublin|Philippines|Pakistan|Karachi|Lahore|Bangladesh|Dhaka|Nigeria|Lagos|South Africa|Europe|Asia|Americas|Middle East|North America|South America|Africa|EMEA|APAC)\b",
-    re.I,
-)
-
-FOREIGN_SUBDOMAINS_FOR_INDIA = {
-    "ae", "uk", "ca", "au", "de", "fr", "sg", "nl", "ch", "se", "ie", "nz",
-    "ph", "pk", "bd", "ng", "za", "br", "mx", "es", "it", "at", "be", "dk"
-}
-
-
-def tidy(v: Any) -> str:
-    return re.sub(r"\s*(\.{3}|\u2026)\s*$", "", str(v or "")).strip()
+def find_company_page(name: str, crit: Criteria, order: List[str]) -> Tuple[str, str, str, bool, bool]:
+    """-> (slug, li_name, snippet_text, ambiguous, failed)"""
+    loc = crit.city or crit.state or ""
+    res = lpc.run_search(
+        f'site:linkedin.com/company "{display_company(name)}" {loc}'.strip(),
+        1,
+        order,
+        must=r"linkedin\.com/company/",
+    )
+    if res is None:
+        return "", "", "", False, True
+    hits = {}
+    for x in res:
+        m = re.search(r"linkedin\.com/company/([^/?#]+)", x.get("url", ""), re.I)
+        nm = li_title_name(x.get("title", ""))
+        if m and same_company(nm, name):
+            hits.setdefault(m.group(1).lower(), (nm, f"{x.get('title', '')} . {x.get('snippet', '')}"))
+    if not hits:
+        return "", "", "", False, False
+    if len(hits) > 1:
+        pref = [
+            s
+            for s, (_, t) in hits.items()
+            if (crit.city_n and has_phrase(nt(t), crit.city_n))
+            or (crit.st_full and has_phrase(nt(t), crit.st_full))
+        ]
+        if len(pref) == 1:
+            hits = {pref[0]: hits[pref[0]]}
+        else:
+            return "", "", "", True, False
+    slug, (nm, text) = next(iter(hits.items()))
+    return slug, nm, text, False, False
 
 
-def extract_location_from_snippet(snip: str, default_location: str = "") -> str:
-    # 1. Explicit "Location: X"
-    m_loc = re.search(r"Location:\s*([A-Za-z0-9\s,.-]+?)(?=\s*(?:[|·•\n]|\bconnections\b|Experience:|$))", snip, re.I)
-    if m_loc:
-        cand = m_loc.group(1).strip()
-        if (
-            len(cand) >= 2
-            and not NON_LOCATION_WORDS.search(cand)
-            and not ROLE_WORDS.search(cand)
-            and not TITLE_WORDS.search(cand)
-            and (LOCATION_INDICATORS.search(cand) or "," in cand)
-        ):
-            return cand
+def get_company_info(cand: Dict[str, Any], cache: Dict[str, Any], crit: Criteria, idx: int) -> Tuple[Dict[str, Any], bool]:
+    """Runs in a worker thread. Returns (info, retry_later)."""
+    ent = cache.get(lpc.norm_company(cand["name"]), {})
+    info = ent.get("info") or new_info()
+    done = lambda: info["industry"] and info["size_range"] and info["hq"]
+    if done():
+        return info, False
+    order = lpc.ENGINES[idx % len(lpc.ENGINES):] + lpc.ENGINES[:idx % len(lpc.ENGINES)]
+    if not info["slug"] and not info["ambiguous"]:
+        if cand.get("slug"):
+            info["slug"], info["li_name"] = cand["slug"], cand.get("li_name", "")
+            apply_fields(info, snippet_fields(cand.get("snippet", "")), "LinkedIn (search result)")
+        else:
+            slug, nm, text, amb, failed = find_company_page(cand["name"], crit, order)
+            if failed:
+                return info, True
+            info.update(slug=slug, li_name=nm, ambiguous=amb)
+            if slug:
+                apply_fields(info, snippet_fields(text), "LinkedIn (search result)")
+            time.sleep(random.uniform(*lpc.DELAY_RANGE))
+    if info["slug"]:
+        info["url"] = f"https://www.linkedin.com/company/{info['slug']}"
+        if not done() and FETCH_COMPANY_PAGE and not info["page_tried"]:
+            d = fetch_page(info["slug"])
+            if d is not None:
+                info["page_tried"] = True
+                apply_fields(info, d, "LinkedIn (company page)")
+            time.sleep(random.uniform(*lpc.DELAY_RANGE))
+    return info, False
 
-    # 2. Look for middots with geographic keywords: · Greater Ahmedabad Area ·
-    m_mid = re.findall(r"[·•]\s*([A-Z][A-Za-z\s,.-]{2,45}?)\s*[·•]", snip)
-    for cand in m_mid:
-        cand = cand.strip()
-        if (
-            not NON_LOCATION_WORDS.search(cand)
-            and not ROLE_WORDS.search(cand)
-            and not TITLE_WORDS.search(cand)
-            and LOCATION_INDICATORS.search(cand)
-        ):
-            return cand
 
-    # 3. Look for City, State / Country in snippet (must match known geographic indicator)
-    m_geo = re.search(r"\b([A-Z][a-zA-Z\s]+,\s*[A-Z][a-zA-Z\s]+(?:Area|India|United States|USA|UK|Canada|Australia|Germany)?)\b", snip)
-    if m_geo:
-        cand = m_geo.group(1).strip()
-        if (
-            len(cand.split()) <= 5
-            and not NON_LOCATION_WORDS.search(cand)
-            and not ROLE_WORDS.search(cand)
-            and not TITLE_WORDS.search(cand)
-            and LOCATION_INDICATORS.search(cand)
-        ):
-            return cand
-
-    # 4. If search location is mentioned in snippet, use default_location
-    if default_location:
-        for part in [p.strip() for p in re.split(r"[,/]+", default_location) if len(p.strip()) > 2]:
-            if re.search(r"\b" + re.escape(part) + r"\b", snip, re.I):
-                return default_location
-
+def _first(o: Dict[str, Any], keys: List[str]) -> Any:
+    for k in keys:
+        v = o.get(k)
+        if v:
+            return v
     return ""
 
 
-def parse_experience_from_snippet(snip: str) -> tuple[str, str]:
-    """
-    Parses the Experience/Current section in LinkedIn search snippets:
-    - Experience: <Title> · <Company> (e.g. Experience: COO & Director · SlashEasy)
-    - Experience: <Company> · <Title>
-    - Experience: <Title> @ <Company> / at <Company>
-    - Current: <Title> at <Company>
-    Returns (title, company)
-    """
-    if not snip:
-        return "", ""
+def apify_batch(infos: List[Dict[str, Any]]):
+    """Optional Apify enrichment if configured."""
+    todo = [
+        i
+        for i in infos
+        if i["slug"] and not (i["industry"] and i["size_range"] and i["hq"]) and not i["apify_tried"]
+    ]
+    if not lpc.APIFY_TOKEN or not todo:
+        return
+    for k in range(0, len(todo), 25):
+        batch = todo[k:k + 25]
+        urls = [f"https://www.linkedin.com/company/{i['slug']}" for i in batch]
+        try:
+            r = requests.post(
+                f"https://api.apify.com/v2/acts/{lpc.APIFY_ACTOR}/run-sync-get-dataset-items",
+                params={"token": lpc.APIFY_TOKEN},
+                json={"companyUrls": urls, "maxCompanies": len(urls)},
+                timeout=320,
+            )
+            items = r.json() if r.ok else []
+        except Exception as e:
+            print("  apify error:", e)
+            items = []
+        by = {}
+        for o in items if isinstance(items, list) else []:
+            m = re.search(
+                r"company/([^/?#]+)",
+                str(
+                    o.get("linkedinUrl")
+                    or o.get("canonicalUrl")
+                    or o.get("url")
+                    or o.get("inputUrl")
+                    or ""
+                ),
+                re.I,
+            )
+            if m:
+                by[m.group(1).lower()] = o
+        for i in batch:
+            i["apify_tried"] = True
+            o = by.get(i["slug"])
+            if not o:
+                continue
+            hq = _first(o, ["headquarters", "headquarter", "hq", "location"])
+            if isinstance(hq, dict):
+                hq = ", ".join(
+                    str(hq.get(k)) for k in ("city", "geographicArea", "state", "country") if hq.get(k)
+                )
+            elif isinstance(hq, list):
+                hq = str(hq[0]) if hq else ""
+            apply_fields(
+                i,
+                {
+                    "industry": lpc._apify_industry(o),
+                    "size_text": lpc._apify_size(o),
+                    "hq": str(hq or ""),
+                    "website": clean_website(_first(o, ["website", "websiteUrl", "companyWebsite"])),
+                },
+                "LinkedIn (Apify)",
+            )
 
-    m_exp = re.search(r"(?:Experience|Current|Present):\s*(.*?)(?=\s*(?:\bLocation:|\bEducation:|\bPast:|\bconnections\b|\bfollowers\b|$))", snip, re.I)
-    if not m_exp:
-        return "", ""
 
-    exp_text = m_exp.group(1).strip()
-    segs = [s.strip() for s in re.split(r"[\u00b7\u2022|\n]|(?<=\s)[-\u2013](?=\s)", exp_text) if s.strip()]
-    if not segs:
-        return "", ""
-
-    first = segs[0]
-    # Check "Title @ Company" or "Title at Company"
-    m_at = re.search(r"^(.*?)\s*(?:@|\bat\b)\s+([A-Za-z0-9&.,'’ -]{2,45})$", first, re.I)
-    if m_at:
-        cand_t = m_at.group(1).strip()
-        cand_c = m_at.group(2).strip()
-        if not GENERIC_COMPANY_TERMS.match(cand_c) and not ING_WORDS.match(cand_c):
-            return cand_t, cand_c
-
-    if len(segs) >= 2:
-        second = segs[1]
-        # Seg 0 is Title, Seg 1 is Company (e.g. "COO & Director" · "SlashEasy")
-        if TITLE_WORDS.search(first) and not TITLE_WORDS.search(second):
-            if not GENERIC_COMPANY_TERMS.match(second) and not ING_WORDS.match(second):
-                return first, second
-        # Seg 0 is Company, Seg 1 is Title (e.g. "SlashEasy" · "COO & Director")
-        if not TITLE_WORDS.search(first) and TITLE_WORDS.search(second):
-            if not GENERIC_COMPANY_TERMS.match(first) and not ING_WORDS.match(first):
-                return second, first
-
-    # Single segment that has company
-    if not TITLE_WORDS.search(first) and not GENERIC_COMPANY_TERMS.match(first) and len(first) > 2:
-        return "", first
-
-    return "", ""
+# --------------------------------------------------------------------------- decision makers
+def title_rank(text: str, titles: List[str]) -> Optional[int]:
+    t = f" {nt(text)} "
+    t = t.replace(" vice president ", " vp ").replace(" assistant to the president ", " ")
+    best = None
+    for i, ti in enumerate(titles):
+        if f" {nt(ti)} " in t:
+            best = i if best is None else min(best, i)
+    return best
 
 
-def parse_result(r: Dict[str, str], default_location: str = "") -> Optional[Dict[str, str]]:
-    link = r.get("url") or ""
-    if not re.search(r"linkedin\.com/in/", link, re.I):
+def person_location_status(snippet: str, crit: Criteria) -> str:
+    m = re.search(r"Location:\s*([^\u00b7|]+)", snippet or "")
+    if not m or not (crit.city or crit.state):
+        return "unknown"
+    loc_n = nt(m.group(1))
+    if crit.city_n and has_phrase(loc_n, crit.city_n):
+        return "match"
+    if crit.st_full and has_phrase(loc_n, crit.st_full):
+        return "match"
+    if crit.st_abbr and re.search(rf"\b{crit.st_abbr}\b", m.group(1)):
+        return "match"
+    return "conflict"
+
+
+def eval_dm(r: Dict[str, str], names: List[str], crit: Criteria, generic: bool) -> Optional[Dict[str, Any]]:
+    parsed = lpc.parse_result(r)
+    if not parsed:
         return None
-    raw_title = str(r.get("title") or "")
-    # If search engines glued multiple profiles with ... or …, take the first profile segment
-    if "..." in raw_title or "…" in raw_title:
-        raw_title = re.split(r"(?:\.{2,3}|\u2026)", raw_title)[0].strip()
-    clean = re.sub(r"\s*[|\-\u2013]\s*LinkedIn.*$", "", raw_title, flags=re.I).strip()
-    
-    parts = [x.strip() for x in re.split(r"\s+[-\u2013|]\s+", clean) if x.strip()]
-    if not parts:
+    toks = nt(parsed["full_name"]).split()
+    if len(toks) < 2 or {"linkedin", "profile", "profiles"} & set(toks):
         return None
-
-    full_name = parts[0]
-    full_name = re.sub(r"^[↳\s*•·]+", "", full_name).strip()
-    full_name = re.sub(r"\s*\((?:he/him|she/her|they/them)\)", "", full_name, flags=re.I).strip()
-    snip = str(r.get("snippet") or "")
-
-    title = ""
-    company = ""
-
-    # 0. Check Experience section in snippet first (highest fidelity for current position & company)
-    exp_title, exp_comp = parse_experience_from_snippet(snip)
-    if exp_comp:
-        company = exp_comp
-        if exp_title:
-            title = exp_title
-
-    rem_parts = parts[1:]
-    
-    # 1. Check if any part in rem_parts contains @ or at Company
-    if not company:
-        for p in rem_parts:
-            m_at = re.search(r"^(.*?)\s*(?:@|\bat\b)\s+([A-Za-z0-9&.,'’ -]{2,45})$", p, re.I)
-            if m_at:
-                cand_title = m_at.group(1).strip()
-                cand_comp = m_at.group(2).strip()
-                if not GENERIC_COMPANY_TERMS.match(cand_comp) and not ING_WORDS.match(cand_comp):
-                    title = cand_title
-                    company = cand_comp
-                    break
-
-    # 2. Check "Role, Company" (e.g., "CEO, Ajmera Infotech")
-    if not company:
-        for p in rem_parts:
-            m_comma = re.match(r"^(CEO|CTO|COO|CFO|CMO|CIO|CRO|CCO|Founder|Co-Founder|Co-founder|Owner|President|VP|Vice President|Director|Managing Director),\s+([A-Za-z0-9&.,'’ -]{2,45})$", p, re.I)
-            if m_comma:
-                cand_title = m_comma.group(1).strip()
-                cand_comp = m_comma.group(2).strip()
-                if not GENERIC_COMPANY_TERMS.match(cand_comp) and not ING_WORDS.match(cand_comp):
-                    title = cand_title
-                    company = cand_comp
-                    break
-
-    # 3. Check Experience: in snippet
-    if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
-        m_exp = re.search(r"Experience:\s*([A-Za-z0-9&.,'’ -]{2,40}?)(?=\s*(?:[·•|\n]|--|\bLocation:|\bEducation:|\bconnections\b|$))", snip, re.I)
-        if m_exp:
-            c_cand = m_exp.group(1).strip()
-            if not GENERIC_COMPANY_TERMS.match(c_cand) and not ING_WORDS.match(c_cand) and len(c_cand) > 2:
-                company = c_cand
-
-    # 4. Check "Founder of Company" / "CEO of Company" in snippet
-    if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
-        m_of = re.search(r"\b(?:CEO|Founder|Owner|President|Director|VP|COO|CTO)\s+of\s+([A-Za-z0-9&.,'’ -]{2,40}?)(?=\s*(?:[|·•\n,]|\(|\ba\b|\ban\b|\bthe\b|\bwhich\b|\bwhere\b|$))", snip, re.I)
-        if m_of:
-            c_cand = m_of.group(1).strip()
-            if not GENERIC_COMPANY_TERMS.match(c_cand) and not ING_WORDS.match(c_cand) and len(c_cand) > 2:
-                company = c_cand
-
-    # 5. Check "at Company" in snippet
-    if not company or GENERIC_COMPANY_TERMS.match(company) or len(company) <= 2:
-        m_at_snip = re.search(r"\b(?:CEO|Founder|Owner|President|Director|VP|COO|CTO|Lead)\b[^\n|·•]*?\bat\s+([A-Za-z0-9&.,'’ -]{2,40}?)(?=\s*(?:[|·•\n,]|\(|\bwith\b|\bhelping\b|\bdelivering\b|\bdriving\b|$))", snip, re.I)
-        if m_at_snip:
-            c_cand = m_at_snip.group(1).strip()
-            if not GENERIC_COMPANY_TERMS.match(c_cand) and not ING_WORDS.match(c_cand) and len(c_cand) > 2:
-                company = c_cand
-
-    # 6. Fallback across remaining parts
-    if not title and rem_parts:
-        title = rem_parts[0]
-    if not company and len(rem_parts) >= 2:
-        c_cand = rem_parts[1]
-        if not GENERIC_COMPANY_TERMS.match(c_cand) and not ING_WORDS.match(c_cand) and not TITLE_WORDS.search(c_cand):
-            company = c_cand
-
-    # Clean company name
-    company = re.split(r"\s*[|·•]+\s*", company)[0].strip()
-    if "..." in company or "…" in company:
-        company = re.split(r"(?:\.{2,3}|\u2026)\s*", company)[-1].strip()
-    company = re.sub(r"[\s.]*(?:\.{2,3}|\u2026).*$", "", company).strip()
-    company = re.sub(r"^(?:at|@)\s*", "", company, flags=re.I).strip()
-    company = re.sub(r"\s+(?:LinkedIn.*|Area|Region)$", "", company, flags=re.I).strip()
-
-    # Clean title
-    title = re.sub(r"\s*(?:@|\bat\b)\s*.*$", "", title).strip()
-    title = clean_title(title)
-
-    # Validate company is not a role or slogan
-    has_company_suffix = bool(re.search(r"\b(Technologies|Software|Pvt|Ltd|Inc|LLC|Corp|Group|Labs|Media|Holdings|Ventures|Enterprises|Studio|Agency|Network)\b|\bSolutions\s+(?:Pvt|Ltd|LLC|Inc|Private|Company)", company, re.I))
-    if (ROLE_WORDS.search(company) or DISCIPLINE_TERMS.search(company) or TITLE_WORDS.search(company)) and not has_company_suffix:
-        company = ""
-
-    if LOCATION_INDICATORS.search(company) and not has_company_suffix:
-        company = ""
-
-    profile_url = clean_linkedin_url(link, full_name, company)
-    location = extract_location_from_snippet(snip, default_location)
-    if DISCIPLINE_TERMS.search(location):
-        location = default_location
-
-    title = clean_title(title)
-
+    slug = re.search(r"linkedin\.com/in/([^/?#]+)", parsed["profile_url"], re.I)
+    if not slug:
+        return None
+    head = re.sub(r"\s*[|\-\u2013]\s*LinkedIn\s*$", "", str(r.get("title") or ""), flags=re.I)
+    after = " - ".join(re.split(r"\s+[-\u2013]\s+", head)[1:])
+    if lpc.BAD_TITLE.search(head) or re.search(r"\b(former|ex)\b", after, re.I):
+        return None
+    snippet = str(r.get("snippet") or "")
+    exp = re.search(r"Experience:\s*([^\u00b7|]+)", snippet, re.I)
+    hay = nt(after + " " + (exp.group(1) if exp else ""))
+    how = ""
+    if parsed["company"] and any(same_company(parsed["company"], n) for n in names):
+        how = "field"
+    elif any(has_phrase(hay, company_phrase(n)) for n in names if company_phrase(n)):
+        how = "text"
+    if not how:
+        return None
+    rank = title_rank(parsed["title"] or after, crit.titles)
+    if rank is None:
+        return None
+    loc = person_location_status(snippet, crit)
+    if generic and loc != "match":
+        return None
+    conf = (
+        "High"
+        if how == "field" and loc == "match"
+        else ("Medium" if loc != "conflict" else "Low (location differs)")
+    )
     return {
-        "full_name": full_name,
-        "title": title,
-        "company": company,
-        "profile_url": profile_url,
-        "location": location,
-        "raw_title": raw_title,
-        "snippet": snip,
+        "name": parsed["full_name"],
+        "title": parsed["title"] or after.split(" - ")[0],
+        "url": f"https://www.linkedin.com/in/{slug.group(1)}",
+        "rank": rank,
+        "conf": conf,
+        "loc": loc,
     }
 
 
-def norm_company(v: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", re.sub(r"\b(llc|inc|corp|co|ltd|the)\b", "", str(v or "").lower()))
+def find_decision_makers(cand_name: str, info: Dict[str, Any], crit: Criteria, idx: int) -> Tuple[List[Dict[str, Any]], bool]:
+    """-> (list of DMs best-first, retry_later)"""
+    names = [n for n in (cand_name, info.get("li_name")) if n]
+    generic = is_generic_name(cand_name)
+    tq = " OR ".join(f'"{t}"' if " " in t or "-" in t else t for t in crit.titles)
+    loc = crit.city or crit.state or crit.country
+    base = f'site:linkedin.com/in "{display_company(cand_name)}" ({tq})'
+    queries = ([f'{base} "{loc}"'] if loc else []) + [base]
+    order = lpc.ENGINES[idx % len(lpc.ENGINES):] + lpc.ENGINES[:idx % len(lpc.ENGINES)]
+    failed = False
+    for q in queries:
+        res = lpc.run_search(q, 1, order)
+        time.sleep(random.uniform(*lpc.DELAY_RANGE))
+        if res is None:
+            failed = True
+            continue
+        found = {}
+        for pos, r in enumerate(res):
+            d = eval_dm(r, names, crit, generic)
+            if d and (d["url"] not in found or d["rank"] < found[d["url"]]["rank"]):
+                d["pos"] = pos
+                found[d["url"]] = d
+        if found:
+            conf_order = {"High": 0, "Medium": 1}
+            return (
+                sorted(found.values(), key=lambda d: (conf_order.get(d["conf"], 2), d["rank"], d["pos"])),
+                False,
+            )
+    return [], failed
 
 
-def parse_company_text(text: str) -> tuple[str, str]:
-    ind = IND_RE.search(text or "")
-    size = SIZE_RE.search(text or "")
-    return (ind.group(1).strip() if ind else ""), (size.group(1).strip() if size else "")
+# --------------------------------------------------------------------------- discovery
+def build_jobs(crit: Criteria) -> List[Dict[str, Any]]:
+    locs = [x for x in (crit.city, crit.state) if x] or [crit.country]
+    tq = " OR ".join(f'"{t}"' if " " in t or "-" in t else t for t in crit.titles)
+    jobs = []
+    for page in sorted(set(COMPANY_SEARCH_PAGES + PEOPLE_SEARCH_PAGES)):
+        for kw in crit.keywords:
+            if page in COMPANY_SEARCH_PAGES:
+                for loc in locs:
+                    jobs.append({
+                        "kind": "company",
+                        "page": page,
+                        "key": f"company|{kw}|{loc}|p{page}",
+                        "q": f'site:linkedin.com/company "{kw}" "{loc}"',
+                    })
+            if page in PEOPLE_SEARCH_PAGES:
+                jobs.append({
+                    "kind": "people",
+                    "page": page,
+                    "key": f"people|{kw}|{locs[0]}|p{page}",
+                    "q": f'site:linkedin.com/in "{locs[0]}" "{kw}" ({tq})',
+                })
+    return jobs
 
 
-def parse_company_html(html: str) -> tuple[str, str]:
-    soup = BeautifulSoup(html, "html.parser")
-    industry = size = ""
-    el = soup.select_one('[data-test-id="about-us__industry"] dd')
-    if el:
-        industry = el.get_text(" ", strip=True)
-    el = soup.select_one('[data-test-id="about-us__size"] dd')
-    if el:
-        size = el.get_text(" ", strip=True)
-    if not industry or not size:
-        meta = soup.find("meta", attrs={"property": "og:description"}) or soup.find(
-            "meta", attrs={"name": "description"}
+def candidates_from(job: Dict[str, Any], results: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    out = []
+    for x in results:
+        if job["kind"] == "company":
+            m = re.search(r"linkedin\.com/company/([^/?#]+)", x.get("url", ""), re.I)
+            nm = li_title_name(x.get("title", ""))
+            if m and nm:
+                out.append({
+                    "name": nm,
+                    "slug": m.group(1).lower(),
+                    "li_name": nm,
+                    "snippet": f"{x.get('title', '')} . {x.get('snippet', '')}",
+                })
+        else:
+            p = lpc.parse_result(x)
+            if p and p["company"]:
+                out.append({"name": p["company"], "slug": "", "snippet": ""})
+    return [c for c in out if len(lpc.norm_company(c["name"])) >= 3]
+
+
+# --------------------------------------------------------------------------- Collector wrapper class for Web App
+@dataclass
+class CollectorConfig:
+    keywords: List[str]
+    country: str = ""
+    state: str = ""
+    city: str = ""
+    target_count: int = 50
+    titles: List[str] = field(default_factory=lambda: list(DEFAULT_TITLES))
+    company_size_filter: str = "all"
+    enrich_company: bool = True
+    delay_range: Tuple[float, float] = (0.5, 1.2)
+
+
+class KeywordLinkedInCollector:
+    """
+    Web API wrapper around targeted lead finder algorithm.
+    Provides live real-time event streaming and cleanly formats Excel export.
+    """
+
+    def __init__(self, config: CollectorConfig, on_event: Optional[Callable[[Dict[str, Any]], None]] = None):
+        self.config = config
+        self.on_event = on_event
+        self.stop_requested = threading.Event()
+        self.collected_rows: List[Dict[str, Any]] = []
+
+        # Parse criteria from config
+        lo, hi = parse_size_arg(config.company_size_filter)
+        clean_kws = split_list(config.keywords)
+        self.criteria = Criteria(
+            industries=clean_kws,
+            keywords=clean_kws,
+            country=config.country or "",
+            state=config.state or "",
+            city=config.city or "",
+            size_min=lo,
+            size_max=hi,
+            limit=config.target_count,
+            size_mode="contained" if config.company_size_filter != "all" else "overlap",
+            require_dm=True,
+            titles=config.titles if config.titles else list(DEFAULT_TITLES),
         )
-        i2, s2 = parse_company_text(meta.get("content", "") if meta else "")
-        industry, size = industry or i2, size or s2
-        for dt in soup.find_all("dt"):
-            label, dd = dt.get_text(strip=True).lower(), dt.find_next("dd")
-            if dd and label == "industry" and not industry:
-                industry = dd.get_text(" ", strip=True)
-            if dd and label == "company size" and not size:
-                size = dd.get_text(" ", strip=True)
-    return industry, size
 
+    def emit(self, event_type: str, data: Dict[str, Any]):
+        if self.on_event:
+            self.on_event({"type": event_type, **data})
 
-def parse_size_range(size_str: str) -> tuple[Optional[int], Optional[int]]:
-    if not size_str:
-        return None, None
-    s = str(size_str).lower().replace(",", "").strip()
-    m_k = re.search(r"(\d+)\s*k\+?", s)
-    if m_k:
-        val = int(m_k.group(1)) * 1000
-        return val, val * 2
-    m_plus = re.search(r"(\d+)\s*\+", s)
-    if m_plus:
-        val = int(m_plus.group(1))
-        return val, 10000000
-    m_range = re.search(r"(\d+)\s*[-–]\s*(\d+)", s)
-    if m_range:
-        return int(m_range.group(1)), int(m_range.group(2))
-    m_single = re.search(r"(\d+)", s)
-    if m_single:
-        val = int(m_single.group(1))
-        return val, val
-    return None, None
+    def stop(self):
+        self.stop_requested.set()
 
+    def run(self) -> List[Dict[str, Any]]:
+        crit = self.criteria
+        cache = lpc._load_json(CACHE_FILE) if os.path.exists(CACHE_FILE) else {}
+        seen = set()
+        total = 0
+        rejects = Counter()
 
-def matches_company_size(size_str: str, filter_val: str) -> bool:
-    if not filter_val or filter_val == "all":
-        return True
-    if not size_str:
-        return False
-    low, high = parse_size_range(size_str)
-    if low is None:
-        return False
-    target_ranges = {
-        "1-10": (1, 10),
-        "11-50": (11, 50),
-        "51-200": (51, 200),
-        "201-500": (201, 500),
-        "501-1000": (501, 1000),
-        "1000+": (1001, 100000000),
-    }
-    if filter_val not in target_ranges:
-        return True
-    req_low, req_high = target_ranges[filter_val]
-    # Check overlap
-    return not (high < req_low or low > req_high)
+        jobs = build_jobs(crit)
+        self.emit("query_start", {
+            "query": f"Building {len(jobs)} discovery jobs for {', '.join(crit.keywords)}",
+            "engine": "ddg",
+        })
 
+        ex = ThreadPoolExecutor(max_workers=lpc.WORKERS)
 
-KNOWN_ENTERPRISE_COMPANIES = {
-    "tcs", "tata consultancy services", "infosys", "wipro", "cognizant",
-    "accenture", "hcltech", "hcl technologies", "tech mahindra", "capgemini",
-    "ibm", "microsoft", "google", "amazon", "oracle", "deloitte", "pwc",
-    "ey", "kpmg", "l&t", "larsen & toubro", "reliance", "adani", "cisco",
-    "intel", "sap", "meta", "facebook", "apple", "adobe", "salesforce",
-    "genpact", "mindtree", "l&t infotech", "lti", "ltimindtree", "hexaware",
-    "mphasis", "zensar", "persistent systems", "cyient", "birlasoft",
-    "kpit", "sonata software", "sasken", "tata elxsi", "ericsson", "nokia",
-    "siemens", "bosch", "samsung", "hp", "hewlett packard", "dell",
-    "jpmorgan", "goldman sachs", "morgan stanley", "wells fargo", "barclays",
-    "hsbc", "citi", "citigroup", "bank of america", "standard chartered"
-}
+        def search_job(args):
+            i, job = args
+            order = lpc.ENGINES[i % len(lpc.ENGINES):] + lpc.ENGINES[:i % len(lpc.ENGINES)]
+            self.emit("query_start", {
+                "query": job["q"],
+                "engine": order[0],
+            })
+            res = lpc.run_search(job["q"], job["page"], order, must=r"linkedin\.com/(company|in)/")
+            time.sleep(random.uniform(*crit.signature().get("delay", (0.5, 1.2))))
+            return res
 
+        try:
+            for start in range(0, len(jobs), lpc.WORKERS * 2):
+                if total >= crit.limit or self.stop_requested.is_set():
+                    break
+                batch = jobs[start:start + lpc.WORKERS * 2]
+                results = list(ex.map(search_job, list(enumerate(batch))))
+                cands = []
+                for job, res in zip(batch, results):
+                    if not res:
+                        continue
+                    for c in candidates_from(job, res):
+                        k = lpc.norm_company(c["name"])
+                        if k not in seen:
+                            seen.add(k)
+                            cands.append(c)
 
-def get_company_slug_candidates(name: str) -> List[str]:
-    norm = re.sub(r"\b(pvt|ltd|private|limited|technologies|technology|solutions|solution|services|service|software|systems|system|llp|inc|llc|corp|co|group|labs|studio|agency|network)\b", "", name, flags=re.I)
-    norm_slug = re.sub(r"[^a-zA-Z0-9]+", "-", norm).strip("-").lower()
-    full_slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower()
-    first_word = re.sub(r"[^a-zA-Z0-9]+", "", name.split()[0]).lower() if name.split() else ""
+                for s in range(0, len(cands), lpc.WORKERS * 4):
+                    if total >= crit.limit or self.stop_requested.is_set():
+                        break
+                    chunk = cands[s:s + lpc.WORKERS * 4]
 
-    candidates = []
-    for c in [norm_slug, first_word, full_slug]:
-        if c and len(c) >= 3 and c not in candidates:
-            candidates.append(c)
-    return candidates
+                    # 1. Company verification
+                    got = list(ex.map(lambda a: get_company_info(a[1], cache, crit, a[0]), list(enumerate(chunk))))
+                    infos = [g[0] for g in got]
+                    apify_batch(infos)
 
+                    passed = []
+                    for c, (info, retry) in zip(chunk, got):
+                        k = lpc.norm_company(c["name"])
+                        if retry:
+                            seen.discard(k)
+                            continue
+                        cache.setdefault(k, {})["info"] = info
+                        ok, why = evaluate_company(info, crit)
+                        if not ok:
+                            rejects[why.split(" (")[0]] += 1
+                            continue
+                        passed.append((c, info))
 
-COMPANY_OVERRIDES = {
-    "slasheasy": {
-        "name": "SlashEasy",
-        "slug": "slasheasy",
-        "industry": "Software Development",
-        "size": "11-50 employees",
-        "source": "LinkedIn (company page)",
-    },
-    "scaleapps": {
-        "name": "ScaleApps Technologies",
-        "slug": "scaleapps",
-        "industry": "IT Services and IT Consulting",
-        "size": "11-50 employees",
-        "source": "LinkedIn (company page)",
-    },
-    "softcolon": {
-        "name": "Softcolon Technologies",
-        "slug": "softcolon",
-        "industry": "Information Technology & Services",
-        "size": "11-50 employees",
-        "source": "LinkedIn (company page)",
-    },
-    "logicwind": {
-        "name": "Logicwind Solutions",
-        "slug": "logicwind",
-        "industry": "Computer Software",
-        "size": "11-50 employees",
-        "source": "LinkedIn (company page)",
-    },
-    "envitics": {
-        "name": "Envitics Information Systems",
-        "slug": "envitics",
-        "industry": "IT Services and IT Consulting",
-        "size": "11-50 employees",
-        "source": "LinkedIn (company page)",
-    },
-    "xproai": {
-        "name": "XPRO.Ai",
-        "slug": "xproai",
-        "industry": "Computer Software",
-        "size": "11-50 employees",
-        "source": "LinkedIn (company page)",
-    },
-    "tibicle": {
-        "name": "Tibicle LLP",
-        "slug": "tibicle",
-        "industry": "IT Services and IT Consulting",
-        "size": "11-50 employees",
-        "source": "LinkedIn (company page)",
-    },
-}
+                    # 2. Decision Maker search for companies that passed
+                    def dm_task(a):
+                        i, (c, info) = a
+                        ent = cache.get(lpc.norm_company(c["name"]), {})
+                        if ent.get("dm") is not None:
+                            return ent["dm"], False
+                        return find_decision_makers(c["name"], info, crit, i)
 
+                    dms = list(ex.map(dm_task, list(enumerate(passed))))
+                    for (c, info), (dm, retry) in zip(passed, dms):
+                        k = lpc.norm_company(c["name"])
+                        if retry and not dm:
+                            seen.discard(k)
+                            continue
+                        cache[k]["dm"] = dm
+                        if not dm and crit.require_dm:
+                            rejects["no verified decision maker"] += 1
+                            continue
+                        if total >= crit.limit or self.stop_requested.is_set():
+                            break
 
-def lookup_company(name: str, engines: List[str] = ["bing"]) -> Dict[str, Any]:
-    info = {"name": name, "slug": "", "industry": "", "size": "", "source": ""}
-    if not name or len(name.strip()) < 2:
-        return info
+                        top = dm[0] if dm else {}
+                        others = "; ".join(f"{d['name']} ({d['title']}) {d['url']}" for d in dm[1:3])
+                        row_data = {
+                            "Company name": info.get("li_name") or c["name"],
+                            "Company website": info["website"],
+                            "Company LinkedIn URL": info["url"],
+                            "Industry": info["industry"],
+                            "Company size": info["size_text"],
+                            "Headquarters": info["hq"],
+                            "Decision maker name": top.get("name", ""),
+                            "Decision maker title": top.get("title", ""),
+                            "Decision maker LinkedIn URL": top.get("url", ""),
+                            "DM confidence": top.get("conf", ""),
+                            "Other decision makers": others,
+                            "Company data source": info["source"],
+                            "Date collected": time.strftime("%Y-%m-%d"),
+                            # Compatibility keys for frontend table display:
+                            "Full name": top.get("name") or info.get("li_name") or c["name"],
+                            "Title": top.get("title") or "Executive",
+                            "Location": info["hq"],
+                            "Profile URL": top.get("url") or info["url"],
+                            "Contact type": top.get("conf") or "Verified Lead",
+                        }
 
-    norm = norm_company(name)
-    if norm in COMPANY_OVERRIDES:
-        return dict(COMPANY_OVERRIDES[norm])
+                        self.collected_rows.append(row_data)
+                        total += 1
 
-    if norm in KNOWN_ENTERPRISE_COMPANIES:
-        return {
-            "name": name,
-            "slug": norm.replace(" ", "-"),
-            "industry": "IT Services and IT Consulting",
-            "size": "10,001+ employees",
-            "source": "Enterprise Registry",
+                        self.emit("profile_found", {
+                            "profile": row_data,
+                            "collectedCount": total,
+                            "target": crit.limit,
+                        })
+
+            self.emit("completed", {
+                "message": f"Scraping completed. Found {total} strictly verified leads matching all criteria.",
+                "totalCollected": total,
+                "target": crit.limit,
+            })
+
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+        return self.collected_rows
+
+    def write_excel(self, out_path: Path | str):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Verified Leads"
+
+        ws.append(COLUMNS)
+        for c in ws[1]:
+            c.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+            c.fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        url_cols = {
+            COLUMNS.index(c) + 1
+            for c in ("Company website", "Company LinkedIn URL", "Decision maker LinkedIn URL")
+            if c in COLUMNS
         }
 
-    # Direct LinkedIn public company page lookup via candidate slugs (fast & 100% reliable)
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-    for slug in get_company_slug_candidates(name)[:2]:
-        try:
-            resp = requests.get(f"https://www.linkedin.com/company/{slug}", headers=headers, timeout=2.0)
-            if resp.status_code == 200:
-                ind, sz = parse_company_html(resp.text)
-                if sz or ind:
-                    info["slug"] = slug
-                    info["industry"] = ind
-                    info["size"] = sz
-                    info["source"] = "LinkedIn (company page)"
-                    return info
-        except Exception:
-            pass
+        for row_idx, r in enumerate(self.collected_rows, start=2):
+            row_data = [r.get(c, "") for c in COLUMNS]
+            ws.append(row_data)
+            ws.row_dimensions[row_idx].height = 20
 
-    return info
+            for col_idx in url_cols:
+                cell = ws.cell(row=row_idx, column=col_idx)
+                if cell.value and str(cell.value).startswith("http"):
+                    cell.hyperlink = cell.value
+                    cell.font = Font(name="Arial", size=9, color="0563C1", underline="single")
+
+        for col_idx, col_name in enumerate(COLUMNS, start=1):
+            letter = openpyxl.utils.get_column_letter(col_idx)
+            ws.column_dimensions[letter].width = min(max(len(col_name) + 4, 18), 45)
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        wb.save(str(out_path))
 
 
 def clean_linkedin_url(url: str, full_name: str = "", company: str = "") -> str:
     """
     Cleans LinkedIn profile URLs:
     - Removes tracking parameters (?.*) and trailing slashes
-    - Removes hyphens and unnecessary suffixes (e.g. -logicwind, -envitics, keywords)
-    - If full_name matches slug, standardizes to clean slug (e.g. manojbhuva, bhaviljain)
+    - Removes hyphens and unnecessary suffixes
+    - If full_name matches slug, standardizes to clean slug (e.g. manojbhuva)
     """
     if not url:
         return ""
@@ -728,833 +983,3 @@ def clean_linkedin_url(url: str, full_name: str = "", company: str = "") -> str:
     clean_slug = re.sub(r"[^a-zA-Z0-9]+", "", slug)
     return f"{base}{clean_slug}"
 
-
-COMMON_TYPOS = {
-    r"\binfratrcture\b": "infrastructure",
-    r"\binfrastructre\b": "infrastructure",
-    r"\binfrastrcture\b": "infrastructure",
-    r"\bsoftare\b": "software",
-    r"\bsoftwre\b": "software",
-    r"\benginering\b": "engineering",
-    r"\bdevelopmnt\b": "development",
-    r"\bartifical\b": "artificial",
-    r"\binteligence\b": "intelligence",
-    r"\bcybersecurty\b": "cybersecurity",
-    r"\bfintech\b": "fintech",
-}
-
-
-def normalize_keyword(kw: str) -> str:
-    cleaned = kw.strip()
-    for pat, rep in COMMON_TYPOS.items():
-        cleaned = re.sub(pat, rep, cleaned, flags=re.I)
-    return cleaned
-
-
-CLOUD_INFRASTRUCTURE_PROFILES = [
-    {"name": "Sujeet Deshpande", "title": "Co-Founder & CEO", "company": "Lumina CloudInfra", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "sujeetdeshpande"},
-    {"name": "Deepak Agrawal", "title": "Founder & CEO", "company": "Infra360 Systems", "size": "11-50 employees", "industry": "Computer Software", "slug": "deepakagrawal"},
-    {"name": "Syed Bilal Chand", "title": "Founder & CEO", "company": "HostUpCloud Technologies", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "syedbilalchand"},
-    {"name": "Clay Magouyrk", "title": "CEO & President", "company": "Cloud Infrastructure Systems", "size": "11-50 employees", "industry": "Computer Software", "slug": "claymagouyrk"},
-    {"name": "Edijs Drezovs", "title": "Founder & CEO", "company": "GOStack Cloud", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "edijsdrezovs"},
-    {"name": "Steve Suarez", "title": "Founder & Director", "company": "Wagner Cloud Infrastructure", "size": "11-50 employees", "industry": "Computer Software", "slug": "stevesuarez"},
-    {"name": "Gary Martin", "title": "Founder & Lead Architect", "company": "SkyScale Systems", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "garymartin"},
-    {"name": "Nitzan Gindi", "title": "Founder & CTO", "company": "NeuroCloud Systems", "size": "11-50 employees", "industry": "Computer Software", "slug": "nitzangindi"},
-    {"name": "Ankush Madaan", "title": "Co-Founder & CEO", "company": "SquareOps Technologies", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "ankushmadaan"},
-    {"name": "Sreedhara Venugopala", "title": "Director of Cloud Architecture", "company": "CloudMatrix Solutions", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "sreedharavenugopala"},
-    {"name": "Snehal R Chauhan", "title": "Director of Cloud & DevOps", "company": "CloudZest Technologies", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "snehalrchauhan"},
-    {"name": "Nitesh Jain", "title": "Managing Director", "company": "CoreStack Cloud", "size": "11-50 employees", "industry": "Computer Software", "slug": "niteshjain"},
-    {"name": "Devanshi Jariwala", "title": "VP of Cloud Infrastructure", "company": "OpsCruise Innovations", "size": "11-50 employees", "industry": "Computer Software", "slug": "devanshijariwala"},
-    {"name": "Prasanna Kulkarni", "title": "Head of Cloud Platforms", "company": "InfraGrid Systems", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "prasannakulkarni"},
-    {"name": "Adalberto Neri", "title": "Director of Cloud Engineering", "company": "SkyNet Cloud Labs", "size": "11-50 employees", "industry": "Computer Software", "slug": "adalbertoneri"},
-    {"name": "Robert van Molken", "title": "VP of Cloud Infrastructure", "company": "CloudCraft Technologies", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "robertvanmolken"},
-    {"name": "Ketan Dave", "title": "COO & Director", "company": "CloudSphere Innovations", "size": "11-50 employees", "industry": "Computer Software", "slug": "ketandave"},
-    {"name": "Bhavil Jain", "title": "Founder & Lead Cloud Architect", "company": "Softcolon Cloud", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "bhaviljain"},
-    {"name": "Hardik Patel", "title": "Founder & CEO", "company": "Envitics Cloud Systems", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "hardikpatel"},
-    {"name": "Nilay Khandhar", "title": "Founder & CEO", "company": "XPRO Cloud", "size": "11-50 employees", "industry": "Computer Software", "slug": "nkhandhar"},
-    {"name": "Manoj Bhuva", "title": "Founder & CEO", "company": "Logicwind Cloud Unit", "size": "11-50 employees", "industry": "Computer Software", "slug": "manojbhuva"},
-    {"name": "Jitendra Singh Chavda", "title": "COO & Director", "company": "SlashEasy", "size": "11-50 employees", "industry": "Software Development", "slug": "jitendrasinghchavda"},
-    {"name": "Boni Satani", "title": "Founder & Director", "company": "Growffic Cloud", "size": "11-50 employees", "industry": "Marketing Services", "slug": "bonisatani"},
-    {"name": "Abhishek Jani", "title": "Co-Founder & Director", "company": "Incrola Cloud Solutions", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "abhishekdjani"},
-    {"name": "Mehul Patel", "title": "Managing Director", "company": "Crest Infotech Cloud", "size": "11-50 employees", "industry": "Computer Software", "slug": "mehulpatel"},
-    {"name": "Ravi Varma", "title": "Founder & COO", "company": "Knovator Cloud", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "ravivarma"},
-    {"name": "Ankit Shah", "title": "Co-Founder & VP", "company": "Codaemon Cloud", "size": "11-50 employees", "industry": "Computer Software", "slug": "ankitshah"},
-    {"name": "Dhaval Shah", "title": "Director & Founder", "company": "WebCodeGenie Cloud", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "dhavalshah"},
-    {"name": "Ashish Patel", "title": "Chief Executive Officer", "company": "AddWeb Cloud Solutions", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "ashishpatel"},
-    {"name": "Pratik Shah", "title": "Founder & Director", "company": "Tibicle Cloud Systems", "size": "11-50 employees", "industry": "Computer Software", "slug": "pratikshah"},
-    {"name": "Chirag Trivedi", "title": "Head of Cloud Engineering", "company": "NineHertz Cloud", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "chiragtrivedi"},
-    {"name": "Hiren Patel", "title": "Managing Director", "company": "Devstree Cloud Unit", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "hirenpatel"},
-    {"name": "Snehal Patel", "title": "Founder & CTO", "company": "AppAspect Cloud", "size": "11-50 employees", "industry": "Computer Software", "slug": "snehalpatel"},
-    {"name": "Kandarp Patel", "title": "CEO & Director", "company": "ZealousWeb Cloud", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "kandarppatel"},
-    {"name": "Harnil Oza", "title": "Director & Founder", "company": "Hyperlink Cloud Lab", "size": "11-50 employees", "industry": "Computer Software", "slug": "harniloza"},
-    {"name": "Manish Patel", "title": "Director of Cloud Solutions", "company": "TatvaSoft Cloud", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "manishpatel"},
-    {"name": "Jaymin Bhuptani", "title": "Founder & Director", "company": "WebClues Cloud", "size": "11-50 employees", "industry": "Computer Software", "slug": "jayminbhuptani"},
-    {"name": "Jay Patel", "title": "VP of Cloud Engineering", "company": "OpenXcell Cloud Studio", "size": "11-50 employees", "industry": "Computer Software", "slug": "jaypatel"},
-    {"name": "Samit Shah", "title": "Head of Cloud Alliances", "company": "Brainvire Cloud", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "samitshah"},
-    {"name": "Mohit Agrawal", "title": "Co-Founder & COO", "company": "OneClick Cloud", "size": "11-50 employees", "industry": "Computer Software", "slug": "mohitagrawal"},
-]
-
-CYBERSECURITY_PROFILES = [
-    {"name": "Vikram Sethi", "title": "Founder & CEO", "company": "ShieldVault Cybersecurity", "size": "11-50 employees", "industry": "Computer & Network Security", "slug": "vikramsethi"},
-    {"name": "Aman Verma", "title": "Chief Information Security Officer", "company": "CyberDefend Systems", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "amanverma"},
-    {"name": "Pooja Malhotra", "title": "Co-Founder & CTO", "company": "SecurIQ Labs", "size": "11-50 employees", "industry": "Computer & Network Security", "slug": "poojamalhotra"},
-    {"name": "Rajesh Nambiar", "title": "Managing Director", "company": "ZeroTrust Systems", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "rajeshnambiar"},
-    {"name": "Siddharth Joshi", "title": "Director of Threat Intelligence", "company": "ThreatMatrix Innovations", "size": "11-50 employees", "industry": "Computer Software", "slug": "siddharthjoshi"},
-    {"name": "Kavita Rao", "title": "Founder & President", "company": "DefendCore Cybersecurity", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "kavitarao"},
-    {"name": "Gaurav Mehta", "title": "VP of Security Engineering", "company": "SentinelPoint Labs", "size": "11-50 employees", "industry": "Computer Software", "slug": "gauravmehta"},
-    {"name": "Rohit Bhatt", "title": "Founder & Managing Director", "company": "SafeByte Information Systems", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "rohitbhatt"},
-    {"name": "Ananya Sen", "title": "Head of InfoSec Alliances", "company": "ArmorStack Security", "size": "11-50 employees", "industry": "Computer & Network Security", "slug": "ananyasen"},
-    {"name": "Naveen Chhabra", "title": "Co-Founder & COO", "company": "CipherWave Technologies", "size": "11-50 employees", "industry": "Computer Software", "slug": "naveenchhabra"},
-]
-
-FINTECH_PROFILES = [
-    {"name": "Sanjay Gupta", "title": "Founder & CEO", "company": "PaySprint Technologies", "size": "11-50 employees", "industry": "Financial Services", "slug": "sanjaygupta"},
-    {"name": "Neha Sharma", "title": "Co-Founder & COO", "company": "FinGrow Digital Banking", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "nehasharma"},
-    {"name": "Rohan Deshmukh", "title": "Managing Director", "company": "CashFlow Financial Labs", "size": "11-50 employees", "industry": "Financial Services", "slug": "rohandeshmukh"},
-    {"name": "Alok Singhal", "title": "Chief Technology Officer", "company": "NeoBank Systems", "size": "11-50 employees", "industry": "Computer Software", "slug": "aloksinghal"},
-    {"name": "Priyanka Saxena", "title": "Founder & Director", "company": "LendTech Capital Systems", "size": "11-50 employees", "industry": "Financial Services", "slug": "priyankasaxena"},
-    {"name": "Deepak Khurana", "title": "VP of Fintech Engineering", "company": "WealthMatrix Solutions", "size": "11-50 employees", "industry": "Computer Software", "slug": "deepakkhurana"},
-    {"name": "Vikas Agarwal", "title": "Managing Director & CEO", "company": "CreditPulse Technologies", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "vikasagarwal"},
-    {"name": "Sunita Menon", "title": "Co-Founder & VP Product", "company": "PayShield Solutions", "size": "11-50 employees", "industry": "Financial Services", "slug": "sunitamenon"},
-    {"name": "Arjun Nair", "title": "Founder & CEO", "company": "FinCore Innovations", "size": "11-50 employees", "industry": "Computer Software", "slug": "arjunnair"},
-    {"name": "Tarun Kapoor", "title": "Director of Quantitative Systems", "company": "QuantPulse Labs", "size": "11-50 employees", "industry": "Financial Services", "slug": "tarunkapoor"},
-]
-
-AI_DATA_PROFILES = [
-    {"name": "Nilay Khandhar", "title": "Founder & CEO", "company": "XPRO.Ai", "size": "11-50 employees", "industry": "Computer Software", "slug": "nkhandhar"},
-    {"name": "Dr. Sameer Roy", "title": "Chief AI Scientist & Founder", "company": "DeepPulse Innovations", "size": "11-50 employees", "industry": "Artificial Intelligence", "slug": "sameerroy"},
-    {"name": "Meera Iyer", "title": "Co-Founder & Head of AI", "company": "NeuroData Systems", "size": "11-50 employees", "industry": "Computer Software", "slug": "meeraiyer"},
-    {"name": "Aditya Varma", "title": "Founder & CEO", "company": "CognitiveScale Analytics", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "adityavarma"},
-    {"name": "Shweta Kulkarni", "title": "VP of Machine Learning", "company": "SynapseAI Labs", "size": "11-50 employees", "industry": "Artificial Intelligence", "slug": "shwetakulkarni"},
-    {"name": "Rahul Pandey", "title": "Director of GenAI Solutions", "company": "MindCraft AI Studio", "size": "11-50 employees", "industry": "Computer Software", "slug": "rahulpandey"},
-    {"name": "Ananya Joshi", "title": "Co-Founder & CTO", "company": "VisionaryAI Systems", "size": "11-50 employees", "industry": "Artificial Intelligence", "slug": "ananyajoshi"},
-    {"name": "Devendra Singhania", "title": "Managing Director", "company": "Algoritmica Solutions", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "devendrasinghania"},
-    {"name": "Karan Chawla", "title": "Founder & Director", "company": "VectorSpace Technologies", "size": "11-50 employees", "industry": "Computer Software", "slug": "karanchawla"},
-    {"name": "Geeta Raman", "title": "VP of Data Engineering", "company": "DataSphere AI", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "geetaraman"},
-]
-
-VERIFIED_AHMEDABAD_SAAS_PROFILES = [
-    {"name": "Bhavil Jain", "title": "Founder & Lead Software Architect", "company": "Softcolon Technologies", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "bhaviljain"},
-    {"name": "Hardik Patel", "title": "Founder & CEO", "company": "Envitics Information Systems", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "hardikpatel"},
-    {"name": "Nilay Khandhar", "title": "Founder & CEO", "company": "XPRO.Ai", "size": "11-50 employees", "industry": "Computer Software", "slug": "nkhandhar"},
-    {"name": "Manoj Bhuva", "title": "Founder & CEO", "company": "Logicwind Solutions", "size": "11-50 employees", "industry": "Computer Software", "slug": "manojbhuva"},
-    {"name": "Jitendra Singh Chavda", "title": "COO & Director", "company": "SlashEasy", "size": "11-50 employees", "industry": "Software Development", "slug": "jitendrasinghchavda"},
-    {"name": "Boni Satani", "title": "Founder & Director", "company": "Growffic Digital", "size": "11-50 employees", "industry": "Marketing Services", "slug": "bonisatani"},
-    {"name": "Abhishek Jani", "title": "Co-Founder & Director", "company": "Incrola Solutions", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "abhishekdjani"},
-    {"name": "Mehul Patel", "title": "Managing Director & CEO", "company": "Crest Infotech Pvt. Ltd.", "size": "11-50 employees", "industry": "Computer Software", "slug": "mehulpatel"},
-    {"name": "Ravi Varma", "title": "Founder & COO", "company": "Knovator Technologies", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "ravivarma"},
-    {"name": "Ankit Shah", "title": "Co-Founder & VP", "company": "Codaemon Softwares", "size": "11-50 employees", "industry": "Computer Software", "slug": "ankitshah"},
-    {"name": "Dhaval Shah", "title": "Director & Founder", "company": "WebCodeGenie Technology", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "dhavalshah"},
-    {"name": "Ketan Dave", "title": "VP of Operations", "company": "EComStreet Inc.", "size": "11-50 employees", "industry": "Computer Software", "slug": "ketandave"},
-    {"name": "Ashish Patel", "title": "Chief Executive Officer", "company": "AddWeb Solution Pvt. Ltd.", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "ashishpatel"},
-    {"name": "Pratik Shah", "title": "Founder & Director", "company": "Tibicle Technologies", "size": "11-50 employees", "industry": "Computer Software", "slug": "pratikshah"},
-    {"name": "Chirag Trivedi", "title": "Head of SaaS Engineering", "company": "NineHertz Solutions", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "chiragtrivedi"},
-    {"name": "Hiren Patel", "title": "Managing Director", "company": "Devstree IT Services", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "hirenpatel"},
-    {"name": "Snehal Patel", "title": "Founder & CTO", "company": "AppAspect Technologies", "size": "11-50 employees", "industry": "Computer Software", "slug": "snehalpatel"},
-    {"name": "Kandarp Patel", "title": "CEO & Director", "company": "ZealousWeb Technologies", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "kandarppatel"},
-    {"name": "Harnil Oza", "title": "Director & Founder", "company": "Hyperlink InfoSystem Lab", "size": "11-50 employees", "industry": "Computer Software", "slug": "harniloza"},
-    {"name": "Manish Patel", "title": "Director of SaaS Products", "company": "TatvaSoft Cloud Innovations", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "manishpatel"},
-    {"name": "Jaymin Bhuptani", "title": "Founder & Director", "company": "WebClues Infotech", "size": "11-50 employees", "industry": "Computer Software", "slug": "jayminbhuptani"},
-    {"name": "Jay Patel", "title": "VP of SaaS Engineering", "company": "OpenXcell SaaS Studio", "size": "11-50 employees", "industry": "Computer Software", "slug": "jaypatel"},
-    {"name": "Samit Shah", "title": "Head of SaaS Alliances", "company": "Brainvire SaaS Innovations", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "samitshah"},
-    {"name": "Mohit Agrawal", "title": "Co-Founder & COO", "company": "OneClick Technologies", "size": "11-50 employees", "industry": "Computer Software", "slug": "mohitagrawal"},
-    {"name": "Rakesh Patel", "title": "Director & Co-Founder", "company": "Space-O SaaS Lab", "size": "11-50 employees", "industry": "Computer Software", "slug": "rakeshpatel"},
-    {"name": "Shahid Mansuri", "title": "Co-Founder & CEO", "company": "Peerbits Innovations", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "shahidmansuri"},
-    {"name": "Mehul Rajput", "title": "CEO & Co-Founder", "company": "MindInventory Labs", "size": "11-50 employees", "industry": "Computer Software", "slug": "mehulrajput"},
-    {"name": "Chandresh Patel", "title": "Managing Director & CEO", "company": "Bacancy SaaS Unit", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "chandreshpatel"},
-    {"name": "Dharmesh Acharya", "title": "COO & Co-Founder", "company": "Radixweb SaaS Wing", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "dharmeshacharya"},
-    {"name": "Kunal Gandhi", "title": "Director of Cloud Solutions", "company": "Synoptek SaaS Division", "size": "11-50 employees", "industry": "Information Technology & Services", "slug": "kunalgandhi"},
-    {"name": "Vipul Thakkar", "title": "Managing Director", "company": "Silver Touch Cloud Labs", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "vipulthakkar"},
-    {"name": "Prashant Vaghasiya", "title": "CEO & Founder", "company": "MultiQoS Technologies", "size": "11-50 employees", "industry": "Computer Software", "slug": "prashantvaghasiya"},
-    {"name": "Dharmendra Patel", "title": "CEO & Director", "company": "AgileInfoways Cloud Unit", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "dharmendrapatel"},
-    {"name": "Bhavin Shah", "title": "Founder & Technical Lead", "company": "TechnoMark Solutions", "size": "11-50 employees", "industry": "Computer Software", "slug": "bhavinshah"},
-    {"name": "Harshal Shah", "title": "CEO & Founder", "company": "Elsner Cloud Solutions", "size": "11-50 employees", "industry": "Computer Software", "slug": "harshalshah"},
-    {"name": "Laduram Vishnoi", "title": "Founder & CEO", "company": "Acquire.io Engineering", "size": "11-50 employees", "industry": "Computer Software", "slug": "laduramvishnoi"},
-    {"name": "Chirag Thummar", "title": "Principal SaaS Architect", "company": "Hubstaff India Center", "size": "11-50 employees", "industry": "Computer Software", "slug": "chiragthummar"},
-    {"name": "Amit Patel", "title": "CEO & Co-Founder", "company": "Alluvium IoT & SaaS", "size": "11-50 employees", "industry": "Computer Software", "slug": "amitpatel"},
-    {"name": "Maulik Shah", "title": "Lead Cloud Architect", "company": "Zuru Tech SaaS Lab", "size": "11-50 employees", "industry": "Computer Software", "slug": "maulikshah"},
-    {"name": "Paresh Vora", "title": "Founder & Managing Director", "company": "Amitech Solutions", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "pareshvora"},
-    {"name": "Sandeep Shah", "title": "VP of Product Management", "company": "QMetry Quality Engineering", "size": "11-50 employees", "industry": "Computer Software", "slug": "sandeepshah"},
-    {"name": "Manan Patel", "title": "CEO & Founder", "company": "Volansys SaaS Group", "size": "11-50 employees", "industry": "Computer Software", "slug": "mananpatel"},
-    {"name": "Niraj Gemawat", "title": "Group CEO & Managing Director", "company": "Gateway SaaS Innovations", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "nirajgemawat"},
-    {"name": "Pratul Shroff", "title": "Founder & Executive", "company": "eInfochips Cloud Division", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "pratulshroff"},
-    {"name": "Amit Patel", "title": "CEO & Product Head", "company": "Motadata Operations Unit", "size": "11-50 employees", "industry": "Computer Software", "slug": "amitpatel"},
-    {"name": "Pulkit Gaur", "title": "Founder & Director", "company": "Gridbots Robotics & SaaS", "size": "11-50 employees", "industry": "Computer Software", "slug": "pulkitgaur"},
-    {"name": "Harshil Patel", "title": "Founder & CEO", "company": "Intuz Solutions", "size": "11-50 employees", "industry": "Computer Software", "slug": "harshilpatel"},
-    {"name": "Abhishek Desai", "title": "Co-Founder & Director", "company": "Digicorp SaaS Studio", "size": "11-50 employees", "industry": "Computer Software", "slug": "abhishekdesai"},
-    {"name": "Ritesh Sutaria", "title": "Co-Founder & Director", "company": "Prompt Softech SaaS", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "riteshsutaria"},
-    {"name": "Ripal Vyas", "title": "President & Founder", "company": "Softweb SaaS Innovations", "size": "11-50 employees", "industry": "Computer Software", "slug": "ripalvyas"},
-    {"name": "Sunil Agrawal", "title": "Co-Founder & VP Technology", "company": "Inexture SaaS Solutions", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "sunilagrawal"},
-    {"name": "Darshan Shah", "title": "CEO & Managing Director", "company": "Simform Cloud Core", "size": "11-50 employees", "industry": "Computer Software", "slug": "darshanshah"},
-    {"name": "Jatin Patel", "title": "Founder & Lead Architect", "company": "Clarion Technologies SaaS", "size": "11-50 employees", "industry": "IT Services and IT Consulting", "slug": "jatinpatel"},
-    {"name": "Nirav Dave", "title": "Founder & VP Engineering", "company": "RadicalX Solutions", "size": "11-50 employees", "industry": "Computer Software", "slug": "niravdave"},
-    {"name": "Tushar Trivedi", "title": "CEO & Product Director", "company": "TechAhead SaaS Ahmedabad", "size": "11-50 employees", "industry": "Computer Software", "slug": "tushartrivedi"},
-]
-
-
-@dataclass
-class CollectorConfig:
-    keywords: List[str]
-    country: str = ""
-    state: str = ""
-    city: str = ""
-    target_count: int = 100
-    titles: List[str] = field(default_factory=lambda: ["CEO", "Founder", "COO", "Owner", "Director", "VP"])
-    company_size_filter: str = "all"
-    enrich_company: bool = True
-    delay_range: tuple[float, float] = (1.5, 3.5)
-    pages_per_query: int = 3
-
-
-class KeywordLinkedInCollector:
-    """
-    Scrapes LinkedIn profiles based on user-supplied keywords, location, and target cap.
-    Stops gracefully once target count is reached.
-    """
-
-    def __init__(
-        self,
-        config: CollectorConfig,
-        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
-    ):
-        self.config = config
-        self.on_event = on_event
-        self.stop_requested = threading.Event()
-        self.seen_urls: Set[str] = set()
-        self.company_cache: Dict[str, Dict[str, Any]] = {}
-        self.collected_rows: List[Dict[str, Any]] = []
-
-    def emit(self, event_type: str, data: Dict[str, Any]):
-        if self.on_event:
-            try:
-                self.on_event({"type": event_type, "timestamp": time.time(), **data})
-            except Exception as e:
-                logger.error(f"Event callback error: {e}")
-
-    def stop(self):
-        self.stop_requested.set()
-
-    def build_location_term(self) -> str:
-        parts = []
-        if self.config.city:
-            parts.append(self.config.city.strip())
-        if self.config.state:
-            parts.append(self.config.state.strip())
-        if self.config.country:
-            parts.append(self.config.country.strip())
-        return " ".join(parts)
-
-    def is_india_target(self) -> bool:
-        c = (self.config.country or "").lower().strip()
-        s = (self.config.state or "").lower().strip()
-        ci = (self.config.city or "").lower().strip()
-        if c in ("india", "in"):
-            return True
-        indian_states = {"gujarat", "maharashtra", "karnataka", "delhi", "tamil nadu", "telangana", "haryana", "uttar pradesh", "rajasthan", "punjab", "kerala", "west bengal", "madhya pradesh"}
-        indian_cities = {"ahmedabad", "surat", "vadodara", "rajkot", "gandhinagar", "mumbai", "pune", "bangalore", "bengaluru", "delhi", "new delhi", "noida", "gurgaon", "gurugram", "hyderabad", "chennai", "kolkata", "jaipur", "indore"}
-        return s in indian_states or ci in indian_cities
-
-    def matches_location_preference(self, parsed: Dict[str, str], query_meta: Optional[Dict[str, Any]] = None) -> bool:
-        user_city = (self.config.city or "").strip().lower()
-        user_state = (self.config.state or "").strip().lower()
-        user_country = (self.config.country or "").strip().lower()
-
-        if not user_city and not user_state and not user_country:
-            return True
-
-        url = (parsed.get("profile_url") or "").lower()
-        loc = (parsed.get("location") or "").lower()
-        snip = (parsed.get("snippet") or "").lower()
-        title = (parsed.get("title") or "").lower()
-        raw_title = (parsed.get("raw_title") or "").lower()
-        full_text = f"{loc} {snip} {title} {raw_title}"
-
-        is_target_india = self.is_india_target()
-
-        # 1. Foreign country subdomain rejection
-        m_sub = re.search(r"https?://([a-z]{2})\.linkedin\.com/in/", url)
-        if m_sub:
-            sub = m_sub.group(1)
-            if is_target_india:
-                if sub in FOREIGN_SUBDOMAINS_FOR_INDIA and sub != "in":
-                    # Must have explicit evidence of target city in actual snippet or title, otherwise REJECT
-                    if not (user_city and re.search(r"\b" + re.escape(user_city) + r"\b", f"{snip} {title} {raw_title}")):
-                        return False
-            elif user_country in ("united states", "usa", "us"):
-                if sub in ("in", "uk", "ae", "ca", "au", "de", "fr", "sg", "nl"):
-                    return False
-            elif user_country in ("united kingdom", "uk"):
-                if sub not in ("uk", "www"):
-                    return False
-            elif user_country in ("united arab emirates", "uae"):
-                if sub not in ("ae", "www"):
-                    return False
-
-        # 2. Rejection of conflicting foreign countries in snippet location or extracted location
-        if is_target_india:
-            m_exp_loc = re.search(r"Location:\s*([A-Za-z0-9\s,.-]+?)(?=\s*(?:[|·•\n]|\bconnections\b|$))", snip, re.I)
-            if m_exp_loc:
-                cand_loc = m_exp_loc.group(1).strip()
-                if FOREIGN_LOCATIONS.search(cand_loc) and not re.search(r"\b(India|Gujarat|" + re.escape(user_city) + r")\b", cand_loc, re.I):
-                    return False
-            if loc and FOREIGN_LOCATIONS.search(loc) and not re.search(r"\b(india|gujarat|" + re.escape(user_city) + r")\b", loc):
-                return False
-        elif user_country in ("united states", "usa", "us"):
-            if loc and re.search(r"\b(India|UK|United Kingdom|UAE|Dubai|Canada|Australia|Germany)\b", loc, re.I):
-                return False
-
-        # 3. Strict City Filter
-        if user_city:
-            city_in_loc = bool(re.search(r"\b" + re.escape(user_city) + r"\b", loc))
-            city_in_text = bool(re.search(r"\b" + re.escape(user_city) + r"\b", full_text))
-
-            other_major_cities = re.compile(
-                r"\b(Mumbai|Pune|Bangalore|Bengaluru|Delhi|New Delhi|Hyderabad|Chennai|Kolkata|Jaipur|Indore|London|Dubai|New York|San Francisco|Chicago|Austin|Los Angeles|Seattle)\b",
-                re.I
-            )
-            # If text explicitly mentions another major city and NOT user city, reject!
-            if other_major_cities.search(full_text) and not city_in_text:
-                return False
-
-            query_str = (query_meta.get("query", "") or "").lower() if query_meta else ""
-            query_had_city = user_city in query_str
-            if not city_in_text and not query_had_city:
-                return False
-
-        # 4. Strict State Filter (if city not specified)
-        elif user_state:
-            state_in_text = bool(re.search(r"\b" + re.escape(user_state) + r"\b", full_text))
-            if not state_in_text:
-                return False
-
-        # 5. Strict Country Filter
-        elif user_country:
-            country_in_text = bool(re.search(r"\b" + re.escape(user_country) + r"\b", full_text))
-            if not country_in_text and not is_target_india:
-                return False
-
-        return True
-
-    def get_formatted_location(self) -> str:
-        parts = []
-        if self.config.city:
-            parts.append(self.config.city.strip())
-        if self.config.state:
-            parts.append(self.config.state.strip())
-        if self.config.country:
-            parts.append(self.config.country.strip())
-        return ", ".join(parts) if parts else "Global"
-
-    def get_or_lookup_company(self, name: str) -> Dict[str, Any]:
-        if not name or len(name.strip()) < 2:
-            return {"name": name, "slug": "", "industry": "", "size": "", "source": ""}
-        norm = norm_company(name)
-        if norm in self.company_cache:
-            return self.company_cache[norm]
-        info = lookup_company(name, ["bing", "ddg"]) or {"name": name, "slug": "", "industry": "", "size": "", "source": ""}
-        self.company_cache[norm] = info
-        return info
-
-    def build_search_queries(self) -> List[Dict[str, Any]]:
-        loc_term = self.build_location_term()
-        city_term = self.config.city.strip() if self.config.city else loc_term
-        is_india = self.is_india_target()
-        domain = "in.linkedin.com/in" if is_india else "linkedin.com/in"
-
-        all_titles = list(dict.fromkeys(
-            (self.config.titles or []) + [
-                "CEO", "Founder", "Co-Founder", "Owner", "Managing Director",
-                "Director", "President", "COO", "CTO", "Partner", "VP",
-                "Vice President", "Promoter", "Head of Engineering", "Product Head", "Lead"
-            ]
-        ))
-
-        queries: List[Dict[str, Any]] = []
-        seen_queries: Set[str] = set()
-
-        def add_q(kw: str, q_str: str, page: int, q_type: str):
-            q_clean = q_str.strip()
-            key = f"{q_clean}|p{page}"
-            if key not in seen_queries:
-                seen_queries.add(key)
-                queries.append({
-                    "keyword": kw,
-                    "query": q_clean,
-                    "page": page,
-                    "search_id": f"{kw}|{q_type}|p{page}",
-                })
-
-        for kw in self.config.keywords:
-            kw_clean = normalize_keyword(kw.strip())
-            if not kw_clean:
-                continue
-
-            phrases = [
-                kw_clean,
-                f'"{kw_clean}"',
-                f"B2B {kw_clean}",
-                f"{kw_clean} startup",
-                f"{kw_clean} tech",
-                f"{kw_clean} software",
-                f"{kw_clean} platform",
-                f"{kw_clean} cloud",
-                f"{kw_clean} AI",
-                f"{kw_clean} solutions",
-                f"{kw_clean} enterprise",
-                f"{kw_clean} product",
-                f"{kw_clean} IT",
-            ]
-
-            # Primary Title x Phrase matrix
-            for phrase in phrases:
-                for t in all_titles:
-                    t_quoted = f'"{t}"' if " " in t else t
-                    add_q(kw_clean, f"site:{domain} {city_term} {phrase} {t_quoted}", 1, f"q_{t[:6]}")
-                    if is_india and domain != "linkedin.com/in":
-                        add_q(kw_clean, f"site:linkedin.com/in {city_term} {phrase} {t_quoted}", 1, f"q_glob_{t[:6]}")
-
-            # State / Region variations
-            if self.config.state and self.config.state.lower() != city_term.lower():
-                st_term = self.config.state.strip()
-                for phrase in [kw_clean, f"B2B {kw_clean}", f"{kw_clean} software", f"{kw_clean} tech"]:
-                    for t in ["Founder", "CEO", "Co-Founder", "Director", "Owner", "CTO"]:
-                        add_q(kw_clean, f'site:{domain} "{city_term}, {st_term}" {phrase} {t}', 1, "city_state")
-
-        return queries
-
-    def accept_profile(self, parsed: Dict[str, str], query_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not parsed or not parsed.get("profile_url") or not parsed.get("full_name"):
-            return None
-
-        full_name = parsed.get("full_name", "").strip()
-        # Filter directory / list pages or invalid person names
-        if (
-            LOCATION_INDICATORS.search(full_name)
-            or re.search(r"\b(Top|Best|Profiles|Founders|Companies|Community|Members|Directory|List)\b", full_name, re.I)
-            or len(full_name.split()) > 4
-            or len(full_name) <= 2
-        ):
-            return None
-
-        url_key = parsed["profile_url"].lower().rstrip("/")
-        if url_key in self.seen_urls:
-            return None
-
-        title = parsed.get("title", "").strip()
-        company = parsed.get("company", "").strip()
-        loc = parsed.get("location", "").strip()
-
-        if BAD_TITLE.search(title):
-            return None
-
-        # Ensure title is actually a decision-maker title
-        if not TITLE_WORDS.search(title) and not any(k in title.lower() for k in ("chief", "head", "lead", "principal", "manager")):
-            return None
-
-        # Do not accept generic terms, slogans, or role keywords as company name
-        has_company_suffix = bool(re.search(r"\b(Technologies|Software|Pvt|Ltd|Inc|LLC|Corp|Group|Labs|Media|Holdings|Ventures|Enterprises|Studio|Agency|Network)\b|\bSolutions\s+(?:Pvt|Ltd|LLC|Inc|Private|Company)", company, re.I))
-        if (
-            not company
-            or GENERIC_COMPANY_TERMS.match(company)
-            or len(company) <= 2
-            or ING_WORDS.match(company)
-            or company.lower() in ("owner", "founder", "co-founder", "ceo", "cto", "coo", "cfo", "director", "president", "managing director", "partner", "executive")
-            or ((ROLE_WORDS.search(company) or DISCIPLINE_TERMS.search(company)) and not has_company_suffix)
-        ):
-            return None
-
-        # Reject generic buzzwords/skills lists in company name
-        if "," in company and not re.search(r",\s*(?:Inc|LLC|Ltd|Pvt|Private|Co|Corp)\.?\b", company, re.I):
-            return None
-        if re.search(r"\b(SaaS|Web|AI|Cloud|B2B|SEO|Marketing|Development|Design|App|Mobile|Stack)\s*[,/|&]\s*(?:SaaS|Web|AI|Cloud|B2B|SEO|Marketing|Development|Design|App|Mobile|Stack)\b", company, re.I):
-            return None
-        if company.lower().strip() in ("saas", "software", "tech", "technology", "startup", "stealth", "freelance", "self-employed", "ion", "it"):
-            return None
-
-        # 1. Strict user-specified location preference check
-        if not self.matches_location_preference(parsed, query_meta):
-            return None
-
-        # 2. Company lookup & Strict Company Size / Enterprise Verification
-        c_info = self.get_or_lookup_company(company) or {}
-        c_size = (c_info.get("size") or "").strip()
-        c_ind = (c_info.get("industry") or "").strip()
-        c_source = c_info.get("source", "LinkedIn")
-
-        # Reject enterprise corporations if small/mid-size filter is active
-        comp_norm = norm_company(company)
-        if comp_norm in KNOWN_ENTERPRISE_COMPANIES:
-            c_size = "10,001+ employees"
-            if not c_ind:
-                c_ind = "IT Services and IT Consulting"
-
-        # Check company size against user filter
-        filter_size = self.config.company_size_filter
-        if filter_size and filter_size != "all":
-            # Strictly reject if size is not found or does not match selected filter
-            if not c_size or not matches_company_size(c_size, filter_size):
-                return None
-
-        # 3. Industry check: Reject conflicting non-tech industries when tech/SaaS is requested
-        if c_ind:
-            conflicting_industries = re.compile(
-                r"\b(Hospital|Medical Practice|Real Estate|Apparel|Fashion|Restaurants|Food & Beverages|Civil Engineering|Construction|Mining|Oil & Energy)\b",
-                re.I
-            )
-            kw_joined = " ".join(self.config.keywords).lower()
-            if any(k in kw_joined for k in ("saas", "software", "tech", "it", "internet", "cloud")):
-                if conflicting_industries.search(c_ind):
-                    return None
-        else:
-            c_ind = query_meta.get("keyword", "")
-
-        # Clean and canonicalize profile URL
-        profile_url = clean_linkedin_url(parsed.get("profile_url") or "", parsed.get("full_name") or "", company)
-        if self.is_india_target() and re.search(r"https?://[a-z]{2}\.linkedin\.com/in/", profile_url):
-            profile_url = re.sub(r"https?://[a-z]{2}\.linkedin\.com/in/", "https://in.linkedin.com/in/", profile_url)
-
-        # Cleanly format verified location strictly matching user preference
-        fmt_loc = self.get_formatted_location()
-        loc = fmt_loc
-
-        self.seen_urls.add(url_key)
-
-        return {
-            "tab": "Collected",
-            "Region": self.config.state or self.config.city or self.config.country or "Global",
-            "Segment": query_meta.get("keyword", "General"),
-            "Company name": company,
-            "Company size": c_size,
-            "Industry": c_ind,
-            "Industry source": c_source if c_size or c_ind else "Verified",
-            "Full name": parsed["full_name"],
-            "Title": title or "Executive",
-            "Profile URL": profile_url,
-            "Location": loc,
-            "Contact type": "Decision Maker",
-            "Search used": query_meta.get("query", ""),
-            "Date collected": datetime.now().strftime("%Y-%m-%d"),
-            "Approved": "Yes",
-        }
-
-    def get_domain_tailored_supplement_records(self, needed: int) -> List[Dict[str, Any]]:
-        fmt_loc = self.get_formatted_location()
-        raw_kw = self.config.keywords[0] if self.config.keywords else "SaaS"
-        norm_kw = normalize_keyword(raw_kw).lower()
-        filter_size = self.config.company_size_filter or "11-50"
-        supplements = []
-
-        # Domain Selection
-        if any(w in norm_kw for w in ("cloud", "infra", "devops", "aws", "azure", "kubernetes", "network", "server", "sre", "datacenter")):
-            catalog = CLOUD_INFRASTRUCTURE_PROFILES
-            default_industry = "IT Services and IT Consulting"
-        elif any(w in norm_kw for w in ("cyber", "security", "infosec", "threat", "soc", "shield", "protect")):
-            catalog = CYBERSECURITY_PROFILES
-            default_industry = "Computer & Network Security"
-        elif any(w in norm_kw for w in ("fintech", "pay", "bank", "wealth", "invest", "lending", "credit", "finance")):
-            catalog = FINTECH_PROFILES
-            default_industry = "Financial Services"
-        elif any(w in norm_kw for w in ("ai", "artificial", "machine learning", "ml", "deep learning", "data", "nlp", "genai")):
-            catalog = AI_DATA_PROFILES
-            default_industry = "Artificial Intelligence"
-        else:
-            catalog = VERIFIED_AHMEDABAD_SAAS_PROFILES
-            default_industry = "Information Technology & Services"
-
-        # 1. Use matching profiles from catalog
-        for p in catalog:
-            if len(supplements) >= needed:
-                break
-            clean_slug = re.sub(r"[^a-zA-Z0-9]+", "", p["slug"])
-            domain_base = "https://in.linkedin.com/in/" if self.is_india_target() else "https://www.linkedin.com/in/"
-            url = f"{domain_base}{clean_slug}"
-            if url.lower() in self.seen_urls:
-                continue
-
-            p_size = p["size"]
-            if filter_size != "all":
-                p_size = f"{filter_size} employees" if filter_size != "1000+" else "10,001+ employees"
-
-            self.seen_urls.add(url.lower())
-            supplements.append({
-                "tab": "Collected",
-                "Region": self.config.state or self.config.city or self.config.country or "Global",
-                "Segment": raw_kw,
-                "Company name": p["company"],
-                "Company size": p_size,
-                "Industry": p.get("industry") or default_industry,
-                "Industry source": "Verified Company Page",
-                "Full name": p["name"],
-                "Title": p["title"],
-                "Profile URL": url,
-                "Location": fmt_loc,
-                "Contact type": "Decision Maker",
-                "Search used": f"site:linkedin.com/in {fmt_loc} \"{raw_kw}\" {p['title'].split()[0]}",
-                "Date collected": datetime.now().strftime("%Y-%m-%d"),
-                "Approved": "Yes",
-            })
-
-        # 2. Dynamic generation if more needed to strictly fulfill exact target count
-        if len(supplements) < needed:
-            kw_title = raw_kw.title()
-            first_names = [
-                "Aarav", "Kabir", "Arjun", "Rohan", "Vivaan", "Aditya", "Dev", "Reyansh",
-                "Ishaan", "Krishna", "Kunal", "Gaurav", "Siddharth", "Manav", "Tanmay",
-                "Alex", "David", "Michael", "James", "Robert", "Marcus", "Thomas", "Daniel"
-            ]
-            last_names = [
-                "Shah", "Patel", "Mehta", "Desai", "Joshi", "Bhatt", "Trivedi", "Pandya",
-                "Sharma", "Verma", "Kapoor", "Malhotra", "Nair", "Iyer", "Rao", "Jain",
-                "Miller", "Smith", "Johnson", "Davis", "Anderson", "Taylor", "Wilson"
-            ]
-            titles_pool = self.config.titles if self.config.titles else ["Founder & CEO", "Co-Founder & CTO", "Managing Director", "Director of Engineering", "VP"]
-            comp_suffixes = ["Technologies", "Innovations", "Cloud Systems", "Solutions", "Labs", "Tech Studio", "Software", "Networks"]
-
-            idx = 0
-            while len(supplements) < needed and idx < 100:
-                fn = first_names[idx % len(first_names)]
-                ln = last_names[(idx * 3 + 1) % len(last_names)]
-                full_name = f"{fn} {ln}"
-                domain_base = "https://in.linkedin.com/in/" if self.is_india_target() else "https://www.linkedin.com/in/"
-                clean_url = f"{domain_base}{fn.lower()}{ln.lower()}"
-                if clean_url.lower() in self.seen_urls:
-                    idx += 1
-                    continue
-
-                c_suff = comp_suffixes[idx % len(comp_suffixes)]
-                comp_name = f"{kw_title.split()[0]} {c_suff}" if len(kw_title.split()) > 0 else f"CloudSphere {c_suff}"
-                t_role = titles_pool[idx % len(titles_pool)]
-                size_str = f"{filter_size} employees" if filter_size != "all" else "11-50 employees"
-
-                self.seen_urls.add(clean_url.lower())
-
-                supplements.append({
-                    "tab": "Collected",
-                    "Region": self.config.state or self.config.city or self.config.country or "Global",
-                    "Segment": raw_kw,
-                    "Company name": comp_name,
-                    "Company size": size_str,
-                    "Industry": default_industry,
-                    "Industry source": "Verified Company Page",
-                    "Full name": full_name,
-                    "Title": t_role,
-                    "Profile URL": clean_url,
-                    "Location": fmt_loc,
-                    "Contact type": "Decision Maker",
-                    "Search used": f"site:linkedin.com/in {fmt_loc} \"{raw_kw}\" {t_role.split()[0]}",
-                    "Date collected": datetime.now().strftime("%Y-%m-%d"),
-                    "Approved": "Yes",
-                })
-                idx += 1
-
-        return supplements
-
-    def run(self) -> List[Dict[str, Any]]:
-        queries = self.build_search_queries()
-        target = self.config.target_count
-        engine_order = ["ddg", "bing"]
-
-        self.emit("start", {
-            "message": f"Starting keyword scraper. Target: {target} profiles.",
-            "total_queries": len(queries),
-            "target": target,
-        })
-
-        query_idx = 0
-        consecutive_empty = 0
-        max_queries = min(len(queries), 6)
-        for q_item in queries[:max_queries]:
-            if self.stop_requested.is_set():
-                self.emit("stopped", {"message": "Scraper halted by user request."})
-                break
-
-            if len(self.collected_rows) >= target:
-                self.emit("target_reached", {
-                    "message": f"Target count of {target} profiles reached! Halting search.",
-                    "total": len(self.collected_rows),
-                })
-                break
-
-            query_idx += 1
-            query = q_item["query"]
-            page = q_item["page"]
-
-            self.emit("query_start", {
-                "queryIndex": query_idx,
-                "totalQueries": len(queries),
-                "query": query,
-                "page": page,
-                "engine": "ddg",
-                "collectedCount": len(self.collected_rows),
-                "target": target,
-            })
-
-            results = run_search_engine(query, page, engine_order)
-            if not results:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-                time.sleep(random.uniform(0.2, 0.4))
-                continue
-
-            before_count = len(self.collected_rows)
-            for r in results:
-                if len(self.collected_rows) >= target or self.stop_requested.is_set():
-                    break
-
-                parsed = parse_result(r, default_location="")
-                row = self.accept_profile(parsed, q_item)
-                if not row:
-                    continue
-
-                self.collected_rows.append(row)
-
-                # Real-time event for the new profile row!
-                self.emit("profile_found", {
-                    "profile": row,
-                    "collectedCount": len(self.collected_rows),
-                    "target": target,
-                })
-                time.sleep(0.18)
-
-            if len(self.collected_rows) > before_count:
-                consecutive_empty = 0
-            else:
-                consecutive_empty += 1
-
-            if consecutive_empty >= 3:
-                break
-
-            time.sleep(random.uniform(0.3, 0.6))
-
-        # Phase 2: Enrichment for any row that still has empty industry or size
-        if self.config.enrich_company and not self.stop_requested.is_set():
-            missing_enrich = [r for r in self.collected_rows if not r.get("Company size") or not r.get("Industry")]
-            if missing_enrich:
-                self.emit("enrich_start", {
-                    "message": "Enriching company industry & size data (Industry is NEVER guessed)...",
-                    "totalProfiles": len(missing_enrich),
-                })
-
-                companies = sorted({r["Company name"] for r in missing_enrich if r.get("Company name")})
-                for i, comp in enumerate(companies, 1):
-                    if self.stop_requested.is_set():
-                        break
-
-                    c_info = self.get_or_lookup_company(comp)
-                    if c_info.get("industry") or c_info.get("size"):
-                        for r in self.collected_rows:
-                            if norm_company(r.get("Company name")) == norm_company(comp):
-                                if c_info.get("industry") and not r.get("Industry"):
-                                    r["Industry"] = c_info["industry"]
-                                    r["Industry source"] = c_info.get("source", "LinkedIn")
-                                if c_info.get("size") and not r.get("Company size"):
-                                    r["Company size"] = c_info["size"]
-
-                        self.emit("company_enriched", {
-                            "company": comp,
-                            "industry": c_info.get("industry", ""),
-                            "size": c_info.get("size", ""),
-                            "progress": f"{i}/{len(companies)}",
-                        })
-
-        # Post-check: ensure all collected rows strictly match the selected company size filter
-        filter_size = self.config.company_size_filter
-        if filter_size and filter_size != "all":
-            self.collected_rows = [
-                r for r in self.collected_rows
-                if r.get("Company size") and matches_company_size(r.get("Company size"), filter_size)
-            ]
-
-        # Ensure exact target count: if shortfall remains, supplement with domain-tailored records
-        if len(self.collected_rows) < target and not self.stop_requested.is_set():
-            needed = target - len(self.collected_rows)
-            supplements = self.get_domain_tailored_supplement_records(needed)
-            for sup in supplements:
-                if len(self.collected_rows) >= target or self.stop_requested.is_set():
-                    break
-                self.collected_rows.append(sup)
-                self.emit("profile_found", {
-                    "profile": sup,
-                    "collectedCount": len(self.collected_rows),
-                    "target": target,
-                })
-                # Smooth live streaming delay so the user watches rows entering the table in real time!
-                time.sleep(0.18)
-
-        # STRICTLY enforce exact target count: NEVER more, NEVER less!
-        if len(self.collected_rows) > target:
-            self.collected_rows = self.collected_rows[:target]
-
-        self.emit("completed", {
-            "message": f"Scraping completed. Exactly {len(self.collected_rows)} verified profiles collected.",
-            "totalCollected": len(self.collected_rows),
-            "target": target,
-        })
-
-        return self.collected_rows
-
-    def write_excel(self, output_path: str | Path) -> str:
-        """Write professional styled Excel spreadsheet with results."""
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Profiles"
-
-        # Theme Colors
-        navy_header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
-        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-        regular_font = Font(name="Calibri", size=10, color="0F172A")
-        link_font = Font(name="Calibri", size=10, color="2563EB", underline="single")
-        zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
-        thin_border = Border(
-            left=Side(style="thin", color="E2E8F0"),
-            right=Side(style="thin", color="E2E8F0"),
-            top=Side(style="thin", color="E2E8F0"),
-            bottom=Side(style="thin", color="E2E8F0"),
-        )
-
-        # Header Row
-        ws.append(COLUMNS)
-        for col_idx in range(1, len(COLUMNS) + 1):
-            cell = ws.cell(row=1, column=col_idx)
-            cell.fill = navy_header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-        ws.row_dimensions[1].height = 28
-
-        # Data Rows
-        for row_idx, r in enumerate(self.collected_rows, start=2):
-            raw_url = r.get("Profile URL", "")
-            clean_u = clean_linkedin_url(raw_url, r.get("Full name", ""), r.get("Company name", ""))
-            r["Profile URL"] = clean_u
-            row_data = [r.get(c, "") for c in COLUMNS]
-            ws.append(row_data)
-            ws.row_dimensions[row_idx].height = 20
-
-            is_even = row_idx % 2 == 0
-            for col_idx in range(1, len(COLUMNS) + 1):
-                cell = ws.cell(row=row_idx, column=col_idx)
-                cell.font = regular_font
-                cell.border = thin_border
-                if is_even:
-                    cell.fill = zebra_fill
-
-                col_name = COLUMNS[col_idx - 1]
-                if col_name == "Profile URL" and cell.value and str(cell.value).startswith("http"):
-                    cell.font = link_font
-                    cell.hyperlink = str(cell.value)
-
-        # Auto-adjust column widths
-        for col in ws.columns:
-            max_len = 0
-            col_letter = col[0].column_letter
-            for cell in col:
-                val = str(cell.value or "")
-                if len(val) > max_len:
-                    max_len = len(val)
-            ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 45)
-
-        ws.freeze_panes = "A2"
-        wb.save(output_path)
-        return str(output_path)
