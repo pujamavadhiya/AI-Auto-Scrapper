@@ -26,7 +26,7 @@ export class DecisionMakerAdapter implements IResearchAdapter {
       // Pick a decision maker respecting seniority if possible
       let dm = matched.decisionMakers[0];
       if (config.seniorityLevels && config.seniorityLevels.length > 0 && !config.seniorityLevels.includes('All')) {
-        const found = matched.decisionMakers.find((d) =>
+        const found = matched.decisionMakers.find((d: any) =>
           config.seniorityLevels?.some((lvl) => d.title.toLowerCase().includes(lvl.toLowerCase()))
         );
         if (found) dm = found;

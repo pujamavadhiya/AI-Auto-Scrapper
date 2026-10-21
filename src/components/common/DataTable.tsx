@@ -17,6 +17,8 @@ import {
   Play,
   RotateCcw,
   Sparkles,
+  Facebook,
+  Instagram,
 } from 'lucide-react';
 import { EnrichmentRecord } from '../../types';
 import { Button } from '../ui/Button';
@@ -593,10 +595,34 @@ export const DataTable: React.FC<DataTableProps> = ({
                               href={record.companyLinkedinUrl}
                               target="_blank"
                               rel="noopener noreferrer"
-                              className="p-1 rounded bg-slate-100 text-slate-600 hover:bg-blue-50 hover:text-blue-600 transition-colors text-[10px] font-semibold"
+                              className="p-1 rounded bg-blue-50 text-blue-700 hover:bg-blue-100 transition-colors text-[10px] font-bold"
                               title={`Company LinkedIn: ${record.companyLinkedinUrl}`}
                             >
                               Co.
+                            </a>
+                          ) : null}
+
+                          {record.facebookUrl ? (
+                            <a
+                              href={record.facebookUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="p-1 rounded bg-blue-50 text-blue-600 hover:bg-blue-100 transition-colors"
+                              title={`Facebook: ${record.facebookUrl}`}
+                            >
+                              <Facebook className="w-3.5 h-3.5" />
+                            </a>
+                          ) : null}
+
+                          {record.instagramUrl ? (
+                            <a
+                              href={record.instagramUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="p-1 rounded bg-pink-50 text-pink-600 hover:bg-pink-100 transition-colors"
+                              title={`Instagram: ${record.instagramUrl}`}
+                            >
+                              <Instagram className="w-3.5 h-3.5" />
                             </a>
                           ) : null}
 
@@ -605,15 +631,15 @@ export const DataTable: React.FC<DataTableProps> = ({
                               href={record.twitterUrl}
                               target="_blank"
                               rel="noopener noreferrer"
-                              className="p-1 rounded bg-sky-50 text-sky-600 hover:bg-sky-100 transition-colors"
+                              className="p-1 rounded bg-slate-900 text-white hover:bg-black transition-colors"
                               title={`Twitter/X: ${record.twitterUrl}`}
                             >
-                              <span className="text-[10px] font-bold">𝕏</span>
+                              <span className="text-[10px] font-bold px-0.5">𝕏</span>
                             </a>
                           ) : null}
 
-                          {!record.companyWebsite && !record.linkedinUrl && !record.matchStatus && !record.twitterUrl && (
-                            <span className="text-slate-400 italic">None</span>
+                          {!record.companyWebsite && !record.linkedinUrl && !record.matchStatus && !record.twitterUrl && !record.facebookUrl && !record.instagramUrl && (
+                            <span className="text-slate-400 italic text-[11px]">None</span>
                           )}
                         </div>
                       </td>

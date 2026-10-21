@@ -45,6 +45,7 @@ from linkedin_finder import (
     FatalSerpError,
 )
 from linkedin_collector import CollectorConfig, KeywordLinkedInCollector, clean_linkedin_url
+from social_media_scraper import SocialMediaScraper
 
 app = FastAPI(title="AI Auto Scrapper API", version="1.0.0")
 
@@ -58,11 +59,27 @@ app.add_middleware(
 
 TEMP_STORAGE: Dict[str, Path] = {}
 COLLECTOR_TASKS: Dict[str, Dict[str, Any]] = {}
+SOCIAL_TASKS: Dict[str, Dict[str, Any]] = {}
 
 
 class EnrichRowsPayload(BaseModel):
     records: List[Dict[str, Any]]
     config: Optional[Dict[str, Any]] = None
+
+
+class SocialEnrichPayload(BaseModel):
+    records: List[Dict[str, Any]]
+    mode: Optional[str] = "website"
+    batchSize: Optional[int] = 5
+    delay: Optional[float] = 1.0
+
+
+class SocialStartPayload(BaseModel):
+    records: Optional[List[Dict[str, Any]]] = None
+    websites: Optional[List[str]] = None
+    mode: Optional[str] = "website"
+    batchSize: Optional[int] = 5
+    delay: Optional[float] = 1.0
 
 
 @app.get("/api/health")
@@ -527,6 +544,190 @@ async def stream_collector_events(task_id: str):
             await asyncio.sleep(0.5)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# --------------------------------------------------------------------------- #
+# Social Media Links Scraper Endpoints
+# --------------------------------------------------------------------------- #
+@app.post("/api/enrich/social-media")
+def enrich_social_media(payload: SocialEnrichPayload):
+    """
+    Synchronous batch social media URL scraper.
+    Extracts Facebook, Instagram, LinkedIn, and X/Twitter from company websites.
+    """
+    records = payload.records
+    if not records:
+        return {"records": [], "count": 0}
+
+    mode = payload.mode or "website"
+    batch_size = payload.batchSize or 5
+    delay = payload.delay if payload.delay is not None else 1.0
+
+    scraper = SocialMediaScraper(mode=mode, batch_size=batch_size, delay=delay)
+    enriched = scraper.scrape_batch(records)
+
+    return {
+        "status": "ok",
+        "mode": mode,
+        "count": len(enriched),
+        "records": enriched,
+    }
+
+
+@app.post("/api/social-media/start")
+def start_social_media_task(payload: SocialStartPayload):
+    """
+    Starts asynchronous background social media scraping task with live streaming.
+    """
+    input_records = payload.records or []
+    if not input_records and payload.websites:
+        input_records = [{"Website": w, "Company": w.split("//")[-1].split("/")[0]} for w in payload.websites]
+
+    if not input_records:
+        raise HTTPException(status_code=400, detail="At least one record or website is required.")
+
+    task_id = f"soc_{uuid.uuid4().hex[:10]}"
+    mode = payload.mode or "website"
+    batch_size = payload.batchSize or 5
+    delay = payload.delay if payload.delay is not None else 1.0
+
+    scraper = SocialMediaScraper(mode=mode, batch_size=batch_size, delay=delay)
+
+    task_info: Dict[str, Any] = {
+        "taskId": task_id,
+        "status": "running",
+        "target": len(input_records),
+        "mode": mode,
+        "records": [],
+        "events": [],
+        "scraper": scraper,
+        "downloadUrl": None,
+        "fileName": None,
+        "error": None,
+        "progressMessage": f"Starting social media scraper ({mode} mode) for {len(input_records)} targets...",
+    }
+    SOCIAL_TASKS[task_id] = task_info
+
+    def run_worker():
+        try:
+            def on_progress(p: Dict[str, Any]):
+                task_info["events"].append(p)
+                task_info["progressMessage"] = p.get("stageMessage", "")
+                if "record" in p:
+                    task_info["records"].append(p["record"])
+                elif "records" in p:
+                    task_info["records"].extend(p["records"])
+
+            enriched_results = scraper.scrape_batch(input_records, on_progress=on_progress)
+            task_info["records"] = enriched_results
+
+            temp_dir = tempfile.mkdtemp()
+            out_filename = f"social_links_{mode}_{int(time.time())}.xlsx"
+            out_path = Path(temp_dir) / out_filename
+            scraper.write_excel(enriched_results, out_path)
+
+            file_id = f"soc_{uuid.uuid4().hex[:12]}"
+            TEMP_STORAGE[file_id] = out_path
+            task_info["downloadUrl"] = f"/api/download/{file_id}"
+            task_info["fileName"] = out_filename
+            task_info["status"] = "completed"
+            task_info["progressMessage"] = f"Done! Enriched social links for {len(enriched_results)} companies."
+        except Exception as e:
+            logger.error(f"Error in social media task: {e}\n{traceback.format_exc()}")
+            task_info["status"] = "error"
+            task_info["error"] = str(e)
+            task_info["progressMessage"] = f"Failed: {str(e)}"
+
+    thread = threading.Thread(target=run_worker, daemon=True)
+    thread.start()
+
+    return {
+        "taskId": task_id,
+        "status": "running",
+        "target": len(input_records),
+        "mode": mode,
+    }
+
+
+@app.get("/api/social-media/status/{task_id}")
+def get_social_media_status(task_id: str, from_index: int = 0):
+    task = SOCIAL_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Social media task not found.")
+
+    all_records = task["records"]
+    new_records = all_records[from_index:] if from_index < len(all_records) else []
+
+    return {
+        "taskId": task_id,
+        "status": task["status"],
+        "target": task["target"],
+        "mode": task["mode"],
+        "totalCollected": len(all_records),
+        "records": all_records,
+        "newRecords": new_records,
+        "progressMessage": task.get("progressMessage", ""),
+        "downloadUrl": task.get("downloadUrl"),
+        "fileName": task.get("fileName"),
+        "error": task.get("error"),
+    }
+
+
+@app.post("/api/social-media/stop/{task_id}")
+def stop_social_media_task(task_id: str):
+    task = SOCIAL_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Social media task not found.")
+
+    scraper = task.get("scraper")
+    if scraper:
+        scraper.stop()
+
+    task["status"] = "stopped"
+    task["progressMessage"] = "Stopped by user."
+
+    if not task.get("downloadUrl") and task.get("records"):
+        temp_dir = tempfile.mkdtemp()
+        out_filename = f"social_links_partial_{int(time.time())}.xlsx"
+        out_path = Path(temp_dir) / out_filename
+        scraper.write_excel(task["records"], out_path)
+        file_id = f"soc_{uuid.uuid4().hex[:12]}"
+        TEMP_STORAGE[file_id] = out_path
+        task["downloadUrl"] = f"/api/download/{file_id}"
+        task["fileName"] = out_filename
+
+    return {
+        "taskId": task_id,
+        "status": task["status"],
+        "totalCollected": len(task["records"]),
+        "downloadUrl": task.get("downloadUrl"),
+    }
+
+
+@app.post("/api/social-media/export/{task_id}")
+def export_social_media_data(task_id: str):
+    task = SOCIAL_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Social media task not found.")
+
+    records = task.get("records", [])
+    if not records:
+        raise HTTPException(status_code=400, detail="No records to export.")
+
+    scraper = task.get("scraper") or SocialMediaScraper()
+    temp_dir = tempfile.mkdtemp()
+    out_filename = f"social_links_export_{int(time.time())}.xlsx"
+    out_path = Path(temp_dir) / out_filename
+    scraper.write_excel(records, out_path)
+
+    file_id = f"soc_{uuid.uuid4().hex[:12]}"
+    TEMP_STORAGE[file_id] = out_path
+
+    return {
+        "downloadUrl": f"/api/download/{file_id}",
+        "fileName": out_filename,
+        "totalCollected": len(records),
+    }
 
 
 if __name__ == "__main__":

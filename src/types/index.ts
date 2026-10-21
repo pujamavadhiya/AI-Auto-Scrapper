@@ -32,6 +32,7 @@ export interface EnrichmentRecord {
   companyLinkedinUrl?: string;
   twitterUrl?: string;
   facebookUrl?: string;
+  instagramUrl?: string;
   githubUrl?: string;
   crunchbaseUrl?: string;
 
@@ -137,5 +138,5 @@ export interface AppSettings {
   includeConfidenceScore: boolean;
   includeTimestampInExport: boolean;
   customScraperEndpoint?: string;
-  adapterMode: 'mock' | 'custom_api';
+  adapterMode: 'mock' | 'custom_api' | 'real';
 }

@@ -53,7 +53,7 @@ What would you like to explore today?`,
       if (matchedCompany) {
         const leaders = matchedCompany.decisionMakers
           .map(
-            (dm) =>
+            (dm: any) =>
               `- **${dm.name}** — *${dm.title}* (${dm.department})\n  📧 Email: \`${dm.email}\` (${dm.emailStatus})\n  📞 Phone: \`${dm.phone}\`\n  🔗 LinkedIn: [Profile](${dm.linkedin})`
           )
           .join('\n\n');

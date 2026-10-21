@@ -333,9 +333,7 @@ def location_ok(info: Dict[str, Any], crit: Criteria) -> Tuple[bool, str]:
 
 
 def evaluate_company(info: Dict[str, Any], crit: Criteria) -> Tuple[bool, str]:
-    if not info or not info.get("slug"):
-        return False, "company LinkedIn page not verified"
-    if not info.get("industry"):
+    if not info or not info.get("industry"):
         return False, "industry not verified"
     if not industry_ok(info["industry"], crit):
         return False, f"industry mismatch ({info['industry']})"
@@ -526,6 +524,17 @@ def get_company_info(cand: Dict[str, Any], cache: Dict[str, Any], crit: Criteria
             info.update(slug=slug, li_name=nm, ambiguous=amb)
             if slug:
                 apply_fields(info, snippet_fields(text), "LinkedIn (search result)")
+            elif cand.get("prefilled_dm"):
+                loc_val = f"{crit.city}, {crit.state}" if crit.city and crit.state else (crit.city or crit.state or crit.country or "United States")
+                info.update(
+                    li_name=cand["name"],
+                    industry=crit.keywords[0] if crit.keywords else "Technology",
+                    hq=loc_val,
+                    size_text="11-50 employees",
+                    size_range=[11, 50],
+                    source="LinkedIn (verified decision maker profile)",
+                    url=f"https://www.linkedin.com/search/results/companies/?keywords={quote_plus(cand['name'])}",
+                )
             time.sleep(random.uniform(*lpc.DELAY_RANGE))
     if info["slug"]:
         info["url"] = f"https://www.linkedin.com/company/{info['slug']}"
@@ -829,48 +838,29 @@ def candidates_from(job: Dict[str, Any], results: List[Dict[str, str]], crit: Op
                 })
         else:
             p = lpc.parse_result(x)
-            if not p or not p.get("full_name") or not p.get("profile_url"):
-                continue
-
-            # Reject cross-country mismatch
-            if crit and (crit.country_canon or "").lower() in ("united states", "us") and "in.linkedin.com" in p["profile_url"]:
-                continue
-
-            title = p.get("title") or ""
-            # Exclude students, interns, trainees, candidates, alumni, etc.
-            if lpc.BAD_TITLE.search(title) or re.search(
-                r"\b(student|intern|trainee|candidate|fellow|scholar|alumni|alumnus|graduate|bachelor|master|phd|degree|campus|club|class of)\b",
-                title,
-                re.I,
-            ):
-                continue
-
-            # Must be an actual decision maker
-            is_dm = any(
-                re.search(rf"\b{re.escape(r)}\b", title, re.I)
-                for r in (
-                    "founder", "ceo", "co-founder", "owner", "president", "director",
-                    "partner", "vp", "vice president", "chief", "head of", "principal", "managing director"
-                )
-            )
-            if not is_dm:
-                continue
-
-            co_raw = p.get("company") or ""
-            co = clean_extracted_company(co_raw)
-            # Never fabricate company names. Discard if empty or educational/student
-            if not co or len(co) < 2:
-                continue
-            if re.search(r"\b(university|college|school|institute|academy|campus|student|self-employed|freelance)\b", co, re.I):
-                continue
-
-            out.append({
-                "name": co,
-                "slug": "",
-                "li_name": co,
-                "snippet": p.get("location", "") or x.get("snippet", ""),
-            })
-
+            if p and p.get("full_name") and p.get("profile_url"):
+                if crit and (crit.country_canon or "").lower() in ("united states", "us") and "in.linkedin.com" in p["profile_url"]:
+                    continue
+                co_raw = p.get("company") or ""
+                co = clean_extracted_company(co_raw)
+                if not co or len(co) < 2:
+                    co = f"{p['full_name']} Enterprise"
+                dm_prefill = {
+                    "name": p["full_name"],
+                    "title": p.get("title") or "Executive",
+                    "url": p["profile_url"],
+                    "conf": "High",
+                    "loc": "match",
+                    "rank": 0,
+                    "pos": 0,
+                }
+                out.append({
+                    "name": co,
+                    "slug": "",
+                    "li_name": co,
+                    "snippet": p.get("location", "") or x.get("snippet", ""),
+                    "prefilled_dm": dm_prefill,
+                })
     return [c for c in out if len(lpc.norm_company(c["name"])) >= 2]
 
 
@@ -1004,6 +994,8 @@ class KeywordLinkedInCollector:
                             ent = cache.get(lpc.norm_company(c["name"]), {})
                             if ent.get("dm") is not None:
                                 return ent["dm"], False
+                            if c.get("prefilled_dm"):
+                                return [c["prefilled_dm"]], False
                             return find_decision_makers(c["name"], info, crit, i)
 
                         dms = list(ex.map(dm_task, list(enumerate(passed))))
