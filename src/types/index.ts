@@ -76,6 +76,8 @@ export interface ResearchConfig {
   socialPlatforms?: string[];
   confidenceThreshold?: number; // e.g. 70%
   simulationSpeedMs?: number; // Mock processing delay
+  geminiApiKey?: string;
+  geminiModel?: string;
   openAiApiKey?: string;
   openAiModel?: string;
 }
@@ -141,6 +143,8 @@ export interface AppSettings {
   includeTimestampInExport: boolean;
   customScraperEndpoint?: string;
   adapterMode: 'mock' | 'custom_api' | 'real';
+  geminiApiKey?: string;
+  geminiModel?: string;
   openAiApiKey?: string;
   openAiModel?: string;
 }

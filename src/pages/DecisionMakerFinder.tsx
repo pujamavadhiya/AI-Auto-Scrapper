@@ -61,26 +61,30 @@ export const DecisionMakerFinder: React.FC = () => {
   // Bulk paste text state
   const [bulkPasteText, setBulkPasteText] = useState('');
 
-  // OpenAI Key & Engine Config State
+  // AI Key & Engine Config State (Gemini Primary Free Tier + OpenAI)
   const [serverConfig, setServerConfig] = useState<{
+    hasGeminiKey: boolean;
+    geminiKeyPreview: string;
     hasOpenAiKey: boolean;
-    keyPreview: string;
     engine: string;
   }>({
+    hasGeminiKey: false,
+    geminiKeyPreview: 'checking...',
     hasOpenAiKey: false,
-    keyPreview: 'checking...',
-    engine: 'OpenAI Multi-Engine Decision Maker Finder',
+    engine: 'Google Gemini Free AI Engine',
   });
 
+  const [geminiKeyInput, setGeminiKeyInput] = useState<string>(() => storageService.getSettings().geminiApiKey || '');
+  const [geminiModel, setGeminiModel] = useState<string>(() => storageService.getSettings().geminiModel || 'gemini-1.5-flash');
   const [openAiKeyInput, setOpenAiKeyInput] = useState<string>(() => storageService.getSettings().openAiApiKey || '');
-  const [openAiModel, setOpenAiModel] = useState<string>(() => storageService.getSettings().openAiModel || 'gpt-4o-mini');
   const [showKeyConfig, setShowKeyConfig] = useState(false);
   const [saveKeySuccess, setSaveKeySuccess] = useState(false);
 
   const [config, setConfig] = useState<ResearchConfig>({
     seniorityLevels: ['CEO', 'Founder', 'Co-Founder', 'Owner', 'Managing Director'],
+    geminiApiKey: storageService.getSettings().geminiApiKey || '',
+    geminiModel: storageService.getSettings().geminiModel || 'gemini-1.5-flash',
     openAiApiKey: storageService.getSettings().openAiApiKey || '',
-    openAiModel: storageService.getSettings().openAiModel || 'gpt-4o-mini',
   });
 
   const [progress, setProgress] = useState<ResearchProgress>({
@@ -108,7 +112,7 @@ export const DecisionMakerFinder: React.FC = () => {
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Check backend server OpenAI config on mount
+  // Check backend server AI config on mount
   useEffect(() => {
     const checkServerConfig = async () => {
       const apiBase = getApiBaseUrl();
@@ -118,9 +122,10 @@ export const DecisionMakerFinder: React.FC = () => {
         if (res.ok) {
           const data = await res.json();
           setServerConfig({
+            hasGeminiKey: !!data.hasGeminiKey,
+            geminiKeyPreview: data.geminiKeyPreview || 'missing',
             hasOpenAiKey: !!data.hasOpenAiKey,
-            keyPreview: data.keyPreview || 'missing',
-            engine: data.engine || 'OpenAI Decision Maker Finder',
+            engine: data.engine || 'Google Gemini Free AI Engine',
           });
         }
       } catch (e) {
@@ -130,15 +135,17 @@ export const DecisionMakerFinder: React.FC = () => {
     checkServerConfig();
   }, []);
 
-  const handleSaveOpenAiKey = () => {
+  const handleSaveAiKeys = () => {
     storageService.saveSettings({
+      geminiApiKey: geminiKeyInput.trim(),
+      geminiModel,
       openAiApiKey: openAiKeyInput.trim(),
-      openAiModel,
     });
     setConfig((prev) => ({
       ...prev,
+      geminiApiKey: geminiKeyInput.trim(),
+      geminiModel,
       openAiApiKey: openAiKeyInput.trim(),
-      openAiModel,
     }));
     setSaveKeySuccess(true);
     setTimeout(() => setSaveKeySuccess(false), 2500);
@@ -251,9 +258,6 @@ export const DecisionMakerFinder: React.FC = () => {
     }
 
     const newItems: EnrichmentRecord[] = lines.map((line, idx) => {
-      // Formats supported:
-      // Tab separated (from Excel/Sheets): Company \t Website \t LinkedIn
-      // Comma separated: Company, Website, LinkedIn
       let parts: string[] = [];
       if (line.includes('\t')) {
         parts = line.split('\t').map((p) => p.trim());
@@ -267,7 +271,6 @@ export const DecisionMakerFinder: React.FC = () => {
       let csite = parts[1] || '';
       let cli = parts[2] || '';
 
-      // If user pasted a URL in the first column, parse domain
       if (cname.startsWith('http://') || cname.startsWith('https://') || cname.includes('.com') || cname.includes('.io')) {
         if (!csite) csite = cname;
         cname = cname.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('/')[0].split('.')[0] || cname;
@@ -320,8 +323,9 @@ export const DecisionMakerFinder: React.FC = () => {
         targets,
         {
           ...config,
+          geminiApiKey: geminiKeyInput.trim() || config.geminiApiKey,
+          geminiModel,
           openAiApiKey: openAiKeyInput.trim() || config.openAiApiKey,
-          openAiModel,
         },
         (p) => setProgress(p),
         abortControllerRef.current.signal,
@@ -369,7 +373,8 @@ export const DecisionMakerFinder: React.FC = () => {
     });
   };
 
-  const hasConfiguredOpenAi = serverConfig.hasOpenAiKey || !!openAiKeyInput.trim();
+  const hasConfiguredGemini = serverConfig.hasGeminiKey || !!geminiKeyInput.trim();
+  const hasConfiguredAi = hasConfiguredGemini || serverConfig.hasOpenAiKey || !!openAiKeyInput.trim();
 
   return (
     <div className="space-y-6">
@@ -387,32 +392,37 @@ export const DecisionMakerFinder: React.FC = () => {
         totalRecordsCount={records.length}
       />
 
-      {/* OpenAI API Key Status Banner / Expandable Config */}
+      {/* Google Gemini AI API Status Banner / Expandable Config */}
       <div className="p-4 rounded-2xl bg-white border border-slate-200/80 shadow-xs space-y-3">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">
-            <div className={`p-2 rounded-xl ${hasConfiguredOpenAi ? 'bg-emerald-50 text-emerald-600' : 'bg-amber-50 text-amber-600'}`}>
+            <div className={`p-2 rounded-xl ${hasConfiguredAi ? 'bg-indigo-50 text-indigo-600' : 'bg-amber-50 text-amber-600'}`}>
               <Sparkles className="w-5 h-5" />
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <span className="text-xs font-bold text-slate-900">OpenAI Search & Reasoning Engine</span>
-                {hasConfiguredOpenAi ? (
+                <span className="text-xs font-bold text-slate-900">Google Gemini AI Reasoning Engine</span>
+                {hasConfiguredGemini ? (
                   <Badge variant="success" className="text-[10px] font-semibold py-0.5 px-2">
                     <CheckCircle2 className="w-3 h-3 mr-1 inline" />
-                    OpenAI Ready ({openAiModel})
+                    Gemini Active ({geminiModel} - Free Tier)
+                  </Badge>
+                ) : hasConfiguredAi ? (
+                  <Badge variant="success" className="text-[10px] font-semibold py-0.5 px-2">
+                    <CheckCircle2 className="w-3 h-3 mr-1 inline" />
+                    AI Ready (OpenAI)
                   </Badge>
                 ) : (
                   <Badge variant="warning" className="text-[10px] font-semibold py-0.5 px-2">
                     <AlertCircle className="w-3 h-3 mr-1 inline" />
-                    Key Optional (Heuristic Active)
+                    Free Gemini Key Recommended
                   </Badge>
                 )}
               </div>
               <p className="text-[11px] text-slate-500 mt-0.5">
-                {hasConfiguredOpenAi
-                  ? 'High-precision AI reasoning active. Extracts exact executive names and roles from web & LinkedIn snippets.'
-                  : 'Add your OpenAI API Key below to unlock deep multi-engine intelligence and exact verification.'}
+                {hasConfiguredGemini
+                  ? 'High-speed Gemini AI reasoning active. Extracts exact executive names and roles from web & LinkedIn snippets.'
+                  : 'Add your free Google Gemini API Key below for high-precision decision maker verification.'}
               </p>
             </div>
           </div>
@@ -424,7 +434,7 @@ export const DecisionMakerFinder: React.FC = () => {
             className="text-xs shrink-0 self-start sm:self-auto"
           >
             <Key className="w-3.5 h-3.5 mr-1 text-slate-500" />
-            {showKeyConfig ? 'Hide OpenAI Key' : 'Configure OpenAI Key'}
+            {showKeyConfig ? 'Hide API Key' : 'Configure Gemini API Key'}
             {showKeyConfig ? <ChevronUp className="w-3.5 h-3.5 ml-1" /> : <ChevronDown className="w-3.5 h-3.5 ml-1" />}
           </Button>
         </div>
@@ -433,25 +443,36 @@ export const DecisionMakerFinder: React.FC = () => {
           <div className="pt-3 border-t border-slate-100 space-y-3">
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
               <div className="md:col-span-2 space-y-1">
-                <label className="text-[11px] font-bold text-slate-700">OpenAI API Key (sk-...)</label>
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-bold text-slate-700">Google Gemini API Key (Free)</label>
+                  <a
+                    href="https://aistudio.google.com/app/apikey"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[11px] text-blue-600 hover:underline flex items-center gap-1 font-medium"
+                  >
+                    Get free Gemini key at Google AI Studio <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
                 <input
                   type="password"
-                  value={openAiKeyInput}
-                  onChange={(e) => setOpenAiKeyInput(e.target.value)}
-                  placeholder={serverConfig.hasOpenAiKey ? `Configured in .env (${serverConfig.keyPreview})` : 'sk-proj-...'}
-                  className="w-full h-9 px-3 text-xs font-mono rounded-lg border border-slate-300 focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 bg-white"
+                  value={geminiKeyInput}
+                  onChange={(e) => setGeminiKeyInput(e.target.value)}
+                  placeholder={serverConfig.hasGeminiKey ? `Configured in .env (${serverConfig.geminiKeyPreview})` : 'AIzaSy...'}
+                  className="w-full h-9 px-3 text-xs font-mono rounded-lg border border-slate-300 focus:outline-hidden focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 bg-white"
                 />
               </div>
 
               <div className="space-y-1">
-                <label className="text-[11px] font-bold text-slate-700">AI Model</label>
+                <label className="text-[11px] font-bold text-slate-700">Gemini Model</label>
                 <select
-                  value={openAiModel}
-                  onChange={(e) => setOpenAiModel(e.target.value)}
-                  className="w-full h-9 px-3 text-xs rounded-lg border border-slate-300 bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
+                  value={geminiModel}
+                  onChange={(e) => setGeminiModel(e.target.value)}
+                  className="w-full h-9 px-3 text-xs rounded-lg border border-slate-300 bg-white focus:outline-hidden focus:ring-2 focus:ring-indigo-500/20"
                 >
-                  <option value="gpt-4o-mini">gpt-4o-mini (Recommended - Fast & Accurate)</option>
-                  <option value="gpt-4o">gpt-4o (Maximum Intelligence)</option>
+                  <option value="gemini-1.5-flash">gemini-1.5-flash (Fast & Free Tier)</option>
+                  <option value="gemini-2.0-flash">gemini-2.0-flash (Latest Ultra-Fast)</option>
+                  <option value="gemini-1.5-pro">gemini-1.5-pro (Deep Reasoning)</option>
                 </select>
               </div>
             </div>
@@ -466,8 +487,8 @@ export const DecisionMakerFinder: React.FC = () => {
                     <CheckCircle2 className="w-3.5 h-3.5" /> Key Saved!
                   </span>
                 )}
-                <Button size="sm" onClick={handleSaveOpenAiKey} className="text-xs bg-blue-600 hover:bg-blue-700 text-white">
-                  Save Configuration
+                <Button size="sm" onClick={handleSaveAiKeys} className="text-xs bg-indigo-600 hover:bg-indigo-700 text-white">
+                  Save Gemini Configuration
                 </Button>
               </div>
             </div>
@@ -623,9 +644,9 @@ export const DecisionMakerFinder: React.FC = () => {
                 <Button
                   size="sm"
                   onClick={() => handleAddSingleQuick(true)}
-                  className="flex-1 text-xs bg-blue-600 hover:bg-blue-700 text-white"
+                  className="flex-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white"
                 >
-                  <Sparkles className="w-3.5 h-3.5 mr-1" /> Add & Discover Decision Maker
+                  <Sparkles className="w-3.5 h-3.5 mr-1" /> Add & Discover via Gemini AI
                 </Button>
                 <Button
                   size="sm"
@@ -711,7 +732,7 @@ export const DecisionMakerFinder: React.FC = () => {
           <div className="border-b border-slate-100 pb-3">
             <h3 className="text-sm font-bold text-slate-900">Target Executive Seniority & Titles</h3>
             <p className="text-xs text-slate-500">
-              Select which decision maker titles should be prioritized during AI discovery.
+              Select which decision maker titles should be prioritized during Gemini AI discovery.
             </p>
           </div>
 
@@ -753,17 +774,17 @@ export const DecisionMakerFinder: React.FC = () => {
         <div>
           {records.length === 0 ? (
             <div className="p-12 text-center rounded-2xl bg-white border border-slate-200/80 shadow-xs space-y-4">
-              <div className="w-14 h-14 bg-blue-50 text-blue-600 rounded-2xl flex items-center justify-center mx-auto">
+              <div className="w-14 h-14 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mx-auto">
                 <UserCheck className="w-7 h-7" />
               </div>
               <div className="max-w-md mx-auto space-y-1">
                 <h3 className="text-base font-bold text-slate-900">No Target Companies Loaded</h3>
                 <p className="text-xs text-slate-500 leading-relaxed">
-                  Provide company details (Company Name, Website, or Company LinkedIn URL) to discover verified decision makers and executive leadership.
+                  Provide company details (Company Name, Website, or Company LinkedIn URL) to discover verified decision makers and executive leadership using Google Gemini AI.
                 </p>
               </div>
               <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
-                <Button size="sm" onClick={() => setActiveTab('quick')} className="text-xs bg-blue-600 hover:bg-blue-700 text-white">
+                <Button size="sm" onClick={() => setActiveTab('quick')} className="text-xs bg-indigo-600 hover:bg-indigo-700 text-white">
                   <Plus className="w-3.5 h-3.5 mr-1" /> Quick Paste Accounts
                 </Button>
                 <Button size="sm" variant="outline" onClick={() => setActiveTab('upload')} className="text-xs">

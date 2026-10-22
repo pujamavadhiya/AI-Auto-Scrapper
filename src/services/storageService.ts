@@ -13,6 +13,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   includeConfidenceScore: true,
   includeTimestampInExport: true,
   adapterMode: 'real',
+  geminiApiKey: '',
+  geminiModel: 'gemini-1.5-flash',
   openAiApiKey: '',
   openAiModel: 'gpt-4o-mini',
 };

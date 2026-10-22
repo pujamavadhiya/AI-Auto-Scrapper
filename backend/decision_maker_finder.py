@@ -135,9 +135,15 @@ def clean_linkedin_personal_url(url: str) -> str:
 
 
 class DecisionMakerFinder:
-    def __init__(self, openai_api_key: Optional[str] = None, default_model: str = "gpt-4o-mini"):
+    def __init__(
+        self,
+        gemini_api_key: Optional[str] = None,
+        openai_api_key: Optional[str] = None,
+        default_model: str = "gemini-1.5-flash",
+    ):
+        self.gemini_api_key = (gemini_api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
         self.openai_api_key = (openai_api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
-        self.default_model = default_model
+        self.default_model = default_model or "gemini-1.5-flash"
         self.session = requests.Session()
         self.session.headers.update(BROWSER_HEADERS)
 
@@ -317,6 +323,124 @@ class DecisionMakerFinder:
                 continue
 
         return snippets
+
+    def query_gemini(
+        self,
+        company_name: str,
+        company_website: str,
+        company_linkedin_url: str,
+        website_info: Dict[str, Any],
+        search_snippets: List[Dict[str, str]],
+        target_seniority: Optional[List[str]] = None,
+        api_key_override: Optional[str] = None,
+        model_override: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """
+        Sends the company intelligence and search facts to Google Gemini API for decision maker extraction.
+        Works seamlessly with free tier Google AI Studio Gemini API keys.
+        Returns (parsed_json_dict, error_string).
+        """
+        key = (api_key_override or self.gemini_api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+        if not key:
+            return {}, "Gemini API Key is missing. Please provide your Google Gemini API key in Settings or request."
+
+        model = model_override or "gemini-1.5-flash"
+        if not model.startswith("gemini-"):
+            model = "gemini-1.5-flash"
+
+        roles = target_seniority or DEFAULT_SENIORITY
+
+        context_parts = [
+            "TARGET COMPANY PROFILE:",
+            f"- Company Name: {company_name}",
+            f"- Company Website: {company_website or 'Not specified'}",
+            f"- Company LinkedIn URL: {company_linkedin_url or 'Not specified'}",
+            f"- Target Roles / Seniority: {', '.join(roles)}",
+            "",
+            "VERIFIED EVIDENCE COLLECTED FROM WEB & LINKEDIN:",
+        ]
+
+        if website_info.get("meta_description"):
+            context_parts.append(f"Website Meta: {website_info['meta_description']}")
+
+        if website_info.get("personal_linkedin_links"):
+            context_parts.append("Found Executives on Website:")
+            for item in website_info["personal_linkedin_links"][:4]:
+                context_parts.append(f"  • {item['context']} -> {item['url']}")
+
+        if website_info.get("leadership_snippets"):
+            context_parts.append("Leadership Mention Snippets from Website:")
+            for s in website_info["leadership_snippets"][:5]:
+                context_parts.append(f"  • {s}")
+
+        if search_snippets:
+            context_parts.append("Search Engine & LinkedIn Results:")
+            for s in search_snippets[:8]:
+                context_parts.append(f"  • Title: {s['title']}")
+                context_parts.append(f"    Snippet: {s['snippet']}")
+                if s["url"]:
+                    context_parts.append(f"    URL: {s['url']}")
+
+        prompt_content = "\n".join(context_parts)
+
+        system_instruction = (
+            "You are an expert executive intelligence researcher.\n"
+            "Your task is to identify the primary decision maker (CEO, Founder, Co-Founder, Owner, "
+            "President, Managing Director, or matching requested seniority) for the target company.\n"
+            "Use the provided real search snippets, website leadership excerpts, and verified corporate facts.\n"
+            "STRICT RULES:\n"
+            "1. Output valid JSON only, matching this exact schema:\n"
+            "   {\n"
+            '     "decision_maker_name": "Full Name",\n'
+            '     "position": "Exact Current Job Title / Position",\n'
+            '     "personal_linkedin_url": "https://www.linkedin.com/in/... or empty",\n'
+            '     "confidence_score": 90,\n'
+            '     "evidence": "Brief 1-2 sentence explanation of how this person was verified",\n'
+            '     "is_found": true\n'
+            "   }\n"
+            "2. If no legitimate decision maker can be identified or verified with reasonable confidence, return:\n"
+            '   {"decision_maker_name": "", "position": "", "personal_linkedin_url": "", "confidence_score": 0, "evidence": "Could not verify decision maker", "is_found": false}\n'
+            "3. Do NOT make up fake or generic names. The name must be an actual individual associated with this company.\n"
+            "4. Ensure personal_linkedin_url is a personal LinkedIn URL (/in/...), NOT a company URL (/company/)."
+        )
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": f"{system_instruction}\n\n{prompt_content}"}]
+                }
+            ],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.1
+            }
+        }
+
+        try:
+            resp = self.session.post(url, json=payload, timeout=20)
+            if resp.status_code != 200:
+                return {}, f"Gemini API Error ({resp.status_code}): {resp.text[:250]}"
+
+            data = resp.json()
+            if "error" in data:
+                return {}, f"Gemini Error: {data['error'].get('message', str(data['error']))}"
+
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return {}, "Gemini returned no response candidates."
+
+            raw_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
+            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text.strip(), flags=re.I)
+            raw_text = re.sub(r"\s*```$", "", raw_text.strip())
+
+            parsed = json.loads(raw_text)
+            return parsed, None
+        except Exception as e:
+            logger.error(f"Gemini API call failed: {e}")
+            return {}, f"Gemini Error: {str(e)}"
 
     def query_openai(
         self,
@@ -508,6 +632,7 @@ class DecisionMakerFinder:
         company_website: str = "",
         company_linkedin_url: str = "",
         target_seniority: Optional[List[str]] = None,
+        gemini_api_key: Optional[str] = None,
         openai_api_key: Optional[str] = None,
         model: Optional[str] = None,
     ) -> DecisionMakerResult:
@@ -516,8 +641,8 @@ class DecisionMakerFinder:
           1. Normalizes company website & LinkedIn URL.
           2. Scrapes website leadership pages and extracts embedded executive profiles.
           3. Searches live search engines for executive LinkedIn snippets.
-          4. Uses OpenAI to verify, reason, and extract exact Name, Position, and LinkedIn.
-          5. Falls back to heuristic parsing if OpenAI API key is unavailable.
+          4. Uses Google Gemini (or OpenAI) to verify, reason, and extract exact Name, Position, and LinkedIn.
+          5. Falls back to heuristic parsing if AI key is unavailable.
         """
         company_clean = (company_name or "").strip()
         web_clean = clean_url(company_website)
@@ -548,20 +673,22 @@ class DecisionMakerFinder:
             target_seniority=target_seniority,
         )
 
-        # Step 3: OpenAI AI Reasoning
-        key_to_use = (openai_api_key or self.openai_api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
+        # Step 3: AI Reasoning - Priority 1: Google Gemini (Free & High Speed)
+        gemini_key = (gemini_api_key or self.gemini_api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+        openai_key = (openai_api_key or self.openai_api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
 
-        if key_to_use:
-            logger.info(f"Invoking OpenAI model '{model or self.default_model}' for '{company_clean}'...")
-            ai_data, error = self.query_openai(
+        if gemini_key:
+            g_model = model if (model and "gemini" in model.lower()) else "gemini-1.5-flash"
+            logger.info(f"Invoking Google Gemini model '{g_model}' for '{company_clean}'...")
+            ai_data, error = self.query_gemini(
                 company_name=company_clean,
                 company_website=web_clean,
                 company_linkedin_url=li_clean,
                 website_info=website_info,
                 search_snippets=search_snippets,
                 target_seniority=target_seniority,
-                api_key_override=key_to_use,
-                model_override=model,
+                api_key_override=gemini_key,
+                model_override=g_model,
             )
 
             if not error and ai_data and ai_data.get("is_found") and ai_data.get("decision_maker_name"):
@@ -569,7 +696,51 @@ class DecisionMakerFinder:
                 pos = str(ai_data.get("position", "")).strip()
                 dm_li = clean_linkedin_personal_url(ai_data.get("personal_linkedin_url", ""))
 
-                # If OpenAI didn't have the exact personal LinkedIn URL, check if search or website had it for this person
+                if not dm_li:
+                    for s in search_snippets:
+                        if dm_name.lower() in s.get("title", "").lower() and s.get("url"):
+                            candidate_li = clean_linkedin_personal_url(s["url"])
+                            if candidate_li:
+                                dm_li = candidate_li
+                                break
+
+                confidence = int(ai_data.get("confidence_score") or 92)
+                evidence = str(ai_data.get("evidence") or f"Identified {dm_name} as {pos} via Gemini AI reasoning.")
+
+                return DecisionMakerResult(
+                    company_name=company_clean,
+                    company_website=web_clean,
+                    company_linkedin_url=li_clean,
+                    decision_maker_name=dm_name,
+                    position=pos,
+                    personal_linkedin_url=dm_li,
+                    confidence_score=confidence,
+                    evidence=evidence,
+                    status="enriched",
+                )
+            elif error:
+                logger.warning(f"Gemini API error for '{company_clean}': {error}.")
+
+        # Priority 2: OpenAI (if configured)
+        if openai_key and not gemini_key:
+            o_model = model if (model and "gpt" in model.lower()) else "gpt-4o-mini"
+            logger.info(f"Invoking OpenAI model '{o_model}' for '{company_clean}'...")
+            ai_data, error = self.query_openai(
+                company_name=company_clean,
+                company_website=web_clean,
+                company_linkedin_url=li_clean,
+                website_info=website_info,
+                search_snippets=search_snippets,
+                target_seniority=target_seniority,
+                api_key_override=openai_key,
+                model_override=o_model,
+            )
+
+            if not error and ai_data and ai_data.get("is_found") and ai_data.get("decision_maker_name"):
+                dm_name = str(ai_data.get("decision_maker_name", "")).strip()
+                pos = str(ai_data.get("position", "")).strip()
+                dm_li = clean_linkedin_personal_url(ai_data.get("personal_linkedin_url", ""))
+
                 if not dm_li:
                     for s in search_snippets:
                         if dm_name.lower() in s.get("title", "").lower() and s.get("url"):
@@ -593,9 +764,9 @@ class DecisionMakerFinder:
                     status="enriched",
                 )
             elif error:
-                logger.warning(f"OpenAI error for '{company_clean}': {error}. Trying heuristic extraction.")
+                logger.warning(f"OpenAI error for '{company_clean}': {error}.")
 
-        # Step 4: Fallback to heuristic extraction if OpenAI key not set or failed
+        # Step 4: Fallback to heuristic extraction if AI key not set or failed
         heuristic_res = self.heuristic_fallback(
             company_name=company_clean,
             website_info=website_info,
@@ -604,9 +775,11 @@ class DecisionMakerFinder:
         )
         heuristic_res.company_website = web_clean
         heuristic_res.company_linkedin_url = li_clean
-        if not key_to_use and heuristic_res.status == "enriched":
-            heuristic_res.evidence += " (Tip: Configure OpenAI API Key for higher precision)"
-        elif not key_to_use and heuristic_res.status == "not_found":
-            heuristic_res.evidence = "No decision maker found. Connect your OpenAI API Key for enhanced AI discovery."
+        has_any_key = bool(gemini_key or openai_key)
+        if not has_any_key and heuristic_res.status == "enriched":
+            heuristic_res.evidence += " (Tip: Configure free Gemini API Key for enhanced AI discovery)"
+        elif not has_any_key and heuristic_res.status == "not_found":
+            heuristic_res.evidence = "No decision maker found. Connect your free Gemini API Key for enhanced AI discovery."
+
 
         return heuristic_res

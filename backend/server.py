@@ -85,8 +85,9 @@ class SocialStartPayload(BaseModel):
 
 class DecisionMakerPayload(BaseModel):
     records: List[Dict[str, Any]]
+    geminiKey: Optional[str] = None
     openAiKey: Optional[str] = None
-    model: Optional[str] = "gpt-4o-mini"
+    model: Optional[str] = "gemini-1.5-flash"
     seniority: Optional[List[str]] = None
     delay: Optional[float] = 0.2
 
@@ -745,16 +746,24 @@ def export_social_media_data(task_id: str):
 
 @app.get("/api/decision-makers/config")
 def get_decision_makers_config():
-    """Returns OpenAI API configuration status."""
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    is_set = bool(api_key and not api_key.startswith("your_"))
-    masked = (api_key[:4] + "..." + api_key[-4:]) if is_set and len(api_key) > 8 else ("configured" if is_set else "missing")
+    """Returns AI API configuration status (Google Gemini & OpenAI)."""
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+
+    has_gemini = bool(gemini_key and not gemini_key.startswith("your_"))
+    has_openai = bool(openai_key and not openai_key.startswith("your_"))
+
+    gemini_masked = (gemini_key[:4] + "..." + gemini_key[-4:]) if has_gemini and len(gemini_key) > 8 else ("configured" if has_gemini else "missing")
+    openai_masked = (openai_key[:4] + "..." + openai_key[-4:]) if has_openai and len(openai_key) > 8 else ("configured" if has_openai else "missing")
+
     return {
         "status": "ok",
-        "hasOpenAiKey": is_set,
-        "keyPreview": masked,
-        "defaultModel": "gpt-4o-mini",
-        "engine": "OpenAI Multi-Engine Decision Maker Finder",
+        "hasGeminiKey": has_gemini,
+        "geminiKeyPreview": gemini_masked,
+        "hasOpenAiKey": has_openai,
+        "keyPreview": gemini_masked if has_gemini else openai_masked,
+        "defaultModel": "gemini-1.5-flash",
+        "engine": "Google Gemini Free AI Engine",
     }
 
 
@@ -762,20 +771,25 @@ def get_decision_makers_config():
 def enrich_decision_makers(payload: DecisionMakerPayload):
     """
     Enriches candidate records with verified Decision Maker Name, Position, and LinkedIn.
-    Uses OpenAI AI reasoning synthesized with live website leadership scraping & search dorking.
+    Uses Google Gemini (or OpenAI) AI reasoning synthesized with live website leadership scraping & search dorking.
     """
     records = payload.records
     if not records:
         return {"status": "ok", "results": []}
 
+    gemini_key = (payload.geminiKey or os.environ.get("GEMINI_API_KEY", "")).strip()
     openai_key = (payload.openAiKey or os.environ.get("OPENAI_API_KEY", "")).strip()
-    model = payload.model or "gpt-4o-mini"
+    model = payload.model or ("gemini-1.5-flash" if gemini_key or not openai_key else "gpt-4o-mini")
     seniority = payload.seniority or [
         "CEO", "Founder", "Co-Founder", "Owner", "President", "Managing Director", "C-Level", "VP"
     ]
     delay = payload.delay or 0.2
 
-    finder = DecisionMakerFinder(openai_api_key=openai_key, default_model=model)
+    finder = DecisionMakerFinder(
+        gemini_api_key=gemini_key,
+        openai_api_key=openai_key,
+        default_model=model,
+    )
     enriched_results: List[Dict[str, Any]] = []
 
     for r in records:
@@ -817,6 +831,7 @@ def enrich_decision_makers(payload: DecisionMakerPayload):
             company_website=str(comp_site).strip(),
             company_linkedin_url=str(comp_li).strip(),
             target_seniority=seniority,
+            gemini_api_key=gemini_key,
             openai_api_key=openai_key,
             model=model,
         )

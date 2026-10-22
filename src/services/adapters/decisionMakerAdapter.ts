@@ -35,8 +35,12 @@ export class DecisionMakerAdapter implements IResearchAdapter {
     const batchSize = 1; // 1 record per batch for fast real-time feedback
 
     const settings = storageService.getSettings();
+    const geminiKey = config.geminiApiKey || settings.geminiApiKey || '';
+    const geminiModel = config.geminiModel || settings.geminiModel || 'gemini-1.5-flash';
     const openAiKey = config.openAiApiKey || settings.openAiApiKey || '';
     const openAiModel = config.openAiModel || settings.openAiModel || 'gpt-4o-mini';
+
+    const activeModel = geminiKey || !openAiKey ? geminiModel : openAiModel;
 
     const apiBase = getApiBaseUrl();
     if (!apiBase) {
@@ -110,8 +114,9 @@ export class DecisionMakerAdapter implements IResearchAdapter {
           },
           body: JSON.stringify({
             records: payloadRecords,
+            geminiKey: geminiKey || undefined,
             openAiKey: openAiKey || undefined,
-            model: openAiModel,
+            model: activeModel,
             seniority: config.seniorityLevels || ['CEO', 'Founder', 'Owner', 'Managing Director', 'C-Level', 'VP'],
             delay: 0.2,
           }),
