@@ -125,6 +125,32 @@ export const KeywordLeadCollector: React.FC = () => {
   const pollIntervalRef = useRef<any>(null);
   const sseRef = useRef<EventSource | null>(null);
 
+  // Backend connection status
+  const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    const checkBackend = async () => {
+      const apiBase = getApiBaseUrl();
+      if (!apiBase) {
+        if (mounted) setBackendOnline(false);
+        return;
+      }
+      try {
+        const res = await fetch(`${apiBase}/api/health`);
+        if (mounted) setBackendOnline(res.ok);
+      } catch {
+        if (mounted) setBackendOnline(false);
+      }
+    };
+    checkBackend();
+    const interval = setInterval(checkBackend, 10000);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, []);
+
   // Add keyword
   const handleAddKeyword = (kw: string) => {
     const clean = kw.trim();
@@ -350,7 +376,7 @@ export const KeywordLeadCollector: React.FC = () => {
       {/* Top Banner / Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-200">
         <div>
-          <div className="flex items-center gap-2 mb-1">
+          <div className="flex flex-wrap items-center gap-2 mb-1">
             <span className="p-1.5 rounded-lg bg-indigo-50 border border-indigo-200 text-indigo-700">
               <Sparkles className="w-5 h-5 animate-pulse" />
             </span>
@@ -360,6 +386,24 @@ export const KeywordLeadCollector: React.FC = () => {
             <Badge variant="success" className="bg-emerald-50 text-emerald-700 border-emerald-200 text-xs">
               No SerpAPI Required (100% Free)
             </Badge>
+
+            {backendOnline === true ? (
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"
+                title="FastAPI Python engine is active"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                Engine Online
+              </span>
+            ) : backendOnline === false ? (
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-rose-50 text-rose-700 border border-rose-200"
+                title="Python backend server is offline"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
+                Engine Offline
+              </span>
+            ) : null}
           </div>
           <p className="text-sm text-slate-600 max-w-3xl">
             Extract verified decision-maker LinkedIn profiles using precision search dorks on DuckDuckGo and Bing.
@@ -402,6 +446,32 @@ export const KeywordLeadCollector: React.FC = () => {
           )}
         </div>
       </div>
+
+      {backendOnline === false && (
+        <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex items-start gap-3 shadow-xs">
+          <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+          <div className="flex-1 space-y-1.5">
+            <div className="font-bold text-sm text-amber-950">
+              Python Scraping Engine Offline on Deployed Web
+            </div>
+            <p className="text-amber-800 leading-relaxed text-xs">
+              Keyword Lead Collector uses the Python backend (<code className="bg-white/80 px-1 py-0.5 rounded font-mono text-slate-800">backend/server.py</code>) to execute real-time searches and profile extraction.
+              Because Vercel only hosts the React frontend, you must connect the frontend to your running backend (e.g. deployed on Render.com, Railway, or via Ngrok/Cloudflare tunnel).
+            </p>
+            <div className="pt-1 flex items-center gap-3">
+              <a
+                href="/settings"
+                className="inline-flex items-center gap-1 font-semibold text-blue-700 hover:text-blue-800 bg-white px-3 py-1.5 rounded-lg border border-amber-200 shadow-xs text-xs"
+              >
+                Configure Backend URL in Settings &rarr;
+              </a>
+              <span className="text-amber-700 text-[11px]">
+                Tip: Run <code className="bg-white/80 px-1 rounded font-mono">npx ngrok http 8000</code> or deploy on Render.com.
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main Grid: Config Form & Live Crawler Panel */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
