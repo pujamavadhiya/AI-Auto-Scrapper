@@ -76,6 +76,8 @@ export interface ResearchConfig {
   socialPlatforms?: string[];
   confidenceThreshold?: number; // e.g. 70%
   simulationSpeedMs?: number; // Mock processing delay
+  openAiApiKey?: string;
+  openAiModel?: string;
 }
 
 export interface Project {
@@ -139,4 +141,6 @@ export interface AppSettings {
   includeTimestampInExport: boolean;
   customScraperEndpoint?: string;
   adapterMode: 'mock' | 'custom_api' | 'real';
+  openAiApiKey?: string;
+  openAiModel?: string;
 }

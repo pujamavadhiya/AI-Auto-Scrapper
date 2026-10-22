@@ -46,6 +46,7 @@ from linkedin_finder import (
 )
 from linkedin_collector import CollectorConfig, KeywordLinkedInCollector, clean_linkedin_url
 from social_media_scraper import SocialMediaScraper
+from decision_maker_finder import DecisionMakerFinder
 
 app = FastAPI(title="AI Auto Scrapper API", version="1.0.0")
 
@@ -80,6 +81,14 @@ class SocialStartPayload(BaseModel):
     mode: Optional[str] = "website"
     batchSize: Optional[int] = 5
     delay: Optional[float] = 1.0
+
+
+class DecisionMakerPayload(BaseModel):
+    records: List[Dict[str, Any]]
+    openAiKey: Optional[str] = None
+    model: Optional[str] = "gpt-4o-mini"
+    seniority: Optional[List[str]] = None
+    delay: Optional[float] = 0.2
 
 
 @app.get("/api/health")
@@ -728,6 +737,114 @@ def export_social_media_data(task_id: str):
         "fileName": out_filename,
         "totalCollected": len(records),
     }
+
+
+# =====================================================================
+# Decision Maker Finder with OpenAI Intelligence & Web Dorking
+# =====================================================================
+
+@app.get("/api/decision-makers/config")
+def get_decision_makers_config():
+    """Returns OpenAI API configuration status."""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    is_set = bool(api_key and not api_key.startswith("your_"))
+    masked = (api_key[:4] + "..." + api_key[-4:]) if is_set and len(api_key) > 8 else ("configured" if is_set else "missing")
+    return {
+        "status": "ok",
+        "hasOpenAiKey": is_set,
+        "keyPreview": masked,
+        "defaultModel": "gpt-4o-mini",
+        "engine": "OpenAI Multi-Engine Decision Maker Finder",
+    }
+
+
+@app.post("/api/enrich/decision-makers")
+def enrich_decision_makers(payload: DecisionMakerPayload):
+    """
+    Enriches candidate records with verified Decision Maker Name, Position, and LinkedIn.
+    Uses OpenAI AI reasoning synthesized with live website leadership scraping & search dorking.
+    """
+    records = payload.records
+    if not records:
+        return {"status": "ok", "results": []}
+
+    openai_key = (payload.openAiKey or os.environ.get("OPENAI_API_KEY", "")).strip()
+    model = payload.model or "gpt-4o-mini"
+    seniority = payload.seniority or [
+        "CEO", "Founder", "Co-Founder", "Owner", "President", "Managing Director", "C-Level", "VP"
+    ]
+    delay = payload.delay or 0.2
+
+    finder = DecisionMakerFinder(openai_api_key=openai_key, default_model=model)
+    enriched_results: List[Dict[str, Any]] = []
+
+    for r in records:
+        # Extract inputs flexibly from common column keys
+        comp_name = (
+            r.get("companyName")
+            or r.get("Company")
+            or r.get("company")
+            or r.get("Company Name")
+            or r.get("customFields", {}).get("Company")
+            or r.get("customFields", {}).get("Company Name")
+            or r.get("customFields", {}).get("company")
+            or ""
+        )
+        comp_site = (
+            r.get("companyWebsite")
+            or r.get("Website")
+            or r.get("website")
+            or r.get("Company URL")
+            or r.get("domain")
+            or r.get("customFields", {}).get("Website")
+            or r.get("customFields", {}).get("Company URL")
+            or r.get("customFields", {}).get("website")
+            or ""
+        )
+        comp_li = (
+            r.get("companyLinkedinUrl")
+            or r.get("Company Linkedin")
+            or r.get("Company LinkedIn")
+            or r.get("companyLinkedin")
+            or r.get("customFields", {}).get("Company Linkedin")
+            or r.get("customFields", {}).get("Company LinkedIn")
+            or r.get("customFields", {}).get("Linkedin")
+            or ""
+        )
+
+        res = finder.find_decision_maker(
+            company_name=str(comp_name).strip(),
+            company_website=str(comp_site).strip(),
+            company_linkedin_url=str(comp_li).strip(),
+            target_seniority=seniority,
+            openai_api_key=openai_key,
+            model=model,
+        )
+
+        out_record = dict(r)
+        if res.status == "enriched" and res.decision_maker_name:
+            out_record["personName"] = res.decision_maker_name
+            out_record["title"] = res.position
+            if res.personal_linkedin_url:
+                out_record["linkedinUrl"] = res.personal_linkedin_url
+            if res.company_website and not out_record.get("companyWebsite"):
+                out_record["companyWebsite"] = res.company_website
+            if res.company_linkedin_url and not out_record.get("companyLinkedinUrl"):
+                out_record["companyLinkedinUrl"] = res.company_linkedin_url
+            out_record["confidenceScore"] = res.confidence_score
+            out_record["enrichmentStatus"] = "enriched"
+            out_record["notes"] = res.evidence
+            out_record["lastEnrichedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        else:
+            out_record["enrichmentStatus"] = "not_found"
+            out_record["notes"] = res.evidence or "No verified decision maker found."
+            out_record["confidenceScore"] = 0
+
+        enriched_results.append(out_record)
+        if delay > 0:
+            time.sleep(delay)
+
+    return {"status": "ok", "results": enriched_results}
 
 
 if __name__ == "__main__":

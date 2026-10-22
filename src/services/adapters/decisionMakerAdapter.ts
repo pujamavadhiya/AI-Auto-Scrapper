@@ -1,148 +1,188 @@
-import { IResearchAdapter, ModuleMetadata, simulateDelay } from './baseAdapter';
+import { IResearchAdapter, ModuleMetadata } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
-import { MOCK_COMPANIES } from '../mockData';
+import { getApiBaseUrl } from '../../config/api';
+import { storageService } from '../storageService';
 
 export class DecisionMakerAdapter implements IResearchAdapter {
   readonly metadata: ModuleMetadata = {
     id: 'decision-maker',
     name: 'Decision Maker Finder',
-    description: 'Pinpoints executive leadership, C-suite, VPs, and Department Heads from corporate registries and professional networks.',
-    badge: 'Core Enrichment',
+    description: 'Pinpoints executive leadership (Founders, CEOs, Managing Directors, C-Suite) using company name, website, and company LinkedIn URL via OpenAI AI intelligence and web search dorks.',
+    badge: 'AI Decision Maker',
     category: 'People Intelligence',
-    inputRequirements: ['Company Name', 'Domain (optional)', 'Target Seniority (optional)'],
-    outputFields: ['Decision Maker Name', 'Exact Job Title', 'Department', 'Confidence Score', 'Enrichment Status'],
-    integrationNote: 'Plugs directly into your custom Scraping Module via POST /api/enrich/decision-makers when ready.',
+    inputRequirements: ['Company Name', 'Company Website', 'Company LinkedIn URL'],
+    outputFields: ['Decision Maker Name', 'Exact Position / Job Title', 'Personal LinkedIn URL', 'Confidence Score', 'Enrichment Status'],
+    integrationNote: 'Uses OpenAI API synthesized with live corporate leadership pages and search dorking.',
   };
 
   async enrichSingle(record: EnrichmentRecord, config: ResearchConfig): Promise<EnrichmentRecord> {
-    const companyClean = record.companyName.trim().toLowerCase();
-    const matched = MOCK_COMPANIES.find((c) =>
-      companyClean.includes(c.name.toLowerCase()) ||
-      c.name.toLowerCase().includes(companyClean) ||
-      (record.domain && c.domain.toLowerCase().includes(record.domain.toLowerCase()))
-    );
-
-    if (matched && matched.decisionMakers.length > 0) {
-      // Pick a decision maker respecting seniority if possible
-      let dm = matched.decisionMakers[0];
-      if (config.seniorityLevels && config.seniorityLevels.length > 0 && !config.seniorityLevels.includes('All')) {
-        const found = matched.decisionMakers.find((d: any) =>
-          config.seniorityLevels?.some((lvl) => d.title.toLowerCase().includes(lvl.toLowerCase()))
-        );
-        if (found) dm = found;
-      }
-
-      return {
-        ...record,
-        personName: dm.name,
-        title: dm.title,
-        domain: record.domain || matched.domain,
-        companyWebsite: record.companyWebsite || matched.website,
-        email: config.verifyEmails ? dm.email : record.email,
-        emailStatus: config.verifyEmails ? dm.emailStatus : record.emailStatus,
-        phone: config.findDirectPhones ? dm.phone : record.phone,
-        phoneType: config.findDirectPhones ? dm.phoneType : record.phoneType,
-        linkedinUrl: dm.linkedin,
-        companyLinkedinUrl: matched.companyLinkedin,
-        confidenceScore: dm.confidence,
-        enrichmentStatus: 'enriched',
-        lastEnrichedAt: new Date().toISOString(),
-        notes: `Simulated match via AI Auto Scrapper Mock Registry for ${matched.name}`,
-      };
-    }
-
-    // Dynamic fallback generation based on company name
-    const syntheticTitle = config.seniorityLevels && config.seniorityLevels.length > 0 && !config.seniorityLevels.includes('All')
-      ? `${config.seniorityLevels[0]} of Growth & Strategy`
-      : 'Chief Executive Officer';
-
-    const safeSlug = record.companyName.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const syntheticDomain = record.domain || `${safeSlug || 'company'}.io`;
-
-    return {
-      ...record,
-      personName: record.personName || 'Alexander Sterling',
-      title: record.title || syntheticTitle,
-      domain: syntheticDomain,
-      companyWebsite: record.companyWebsite || `https://${syntheticDomain}`,
-      email: config.verifyEmails ? `leadership@${syntheticDomain}` : record.email,
-      emailStatus: 'probable',
-      phone: config.findDirectPhones ? '+1 (555) 019-2834' : record.phone,
-      phoneType: 'direct',
-      linkedinUrl: `https://www.linkedin.com/in/exec-${safeSlug}`,
-      companyLinkedinUrl: `https://www.linkedin.com/company/${safeSlug}`,
-      confidenceScore: Math.floor(Math.random() * 15) + 82, // 82-96%
-      enrichmentStatus: 'enriched',
-      lastEnrichedAt: new Date().toISOString(),
-      notes: 'Generated via algorithmic pattern simulation',
-    };
+    const list = await this.enrichBatch([record], config);
+    return list[0] || record;
   }
 
   async enrichBatch(
     records: EnrichmentRecord[],
     config: ResearchConfig,
     onProgress?: (progress: ResearchProgress) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onChunk?: (chunkResults: EnrichmentRecord[]) => void
   ): Promise<EnrichmentRecord[]> {
     const totalCount = records.length;
+    if (totalCount === 0) return [];
+
     const enrichedList: EnrichmentRecord[] = [];
     const startTime = Date.now();
-    const delayPerItem = config.simulationSpeedMs || 400;
+    const batchSize = 1; // 1 record per batch for fast real-time feedback
 
-    for (let i = 0; i < totalCount; i++) {
+    const settings = storageService.getSettings();
+    const openAiKey = config.openAiApiKey || settings.openAiApiKey || '';
+    const openAiModel = config.openAiModel || settings.openAiModel || 'gpt-4o-mini';
+
+    const apiBase = getApiBaseUrl();
+    if (!apiBase) {
+      throw new Error(
+        'Backend server URL is not configured. Please go to Settings to set your Backend API URL (or run locally on http://127.0.0.1:8000).'
+      );
+    }
+
+    for (let i = 0; i < totalCount; i += batchSize) {
       if (signal?.aborted) {
         throw new DOMException('Operation cancelled', 'AbortError');
       }
 
-      const currentRecord = records[i];
+      const chunk = records.slice(i, i + batchSize);
+      const currentItem = chunk[0];
+      const displayName = currentItem.companyName || currentItem.companyWebsite || `Record #${i + 1}`;
 
-      // Stage 1: Initializing & querying indices
       onProgress?.({
         isActive: true,
         currentIndex: i + 1,
         totalCount,
         percentage: Math.round(((i + 0.3) / totalCount) * 100),
         status: 'running',
-        stageMessage: `Querying executive directory for "${currentRecord.companyName}"...`,
-        currentItemName: currentRecord.companyName,
-        leadsFound: enrichedList.length,
+        stageMessage: `Investigating decision maker for "${displayName}"...`,
+        currentItemName: displayName,
+        leadsFound: enrichedList.filter((r) => r.enrichmentStatus === 'enriched').length,
         leadsProcessed: i,
         elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
       });
 
-      await simulateDelay(delayPerItem * 0.4, signal);
+      try {
+        const payloadRecords = chunk.map((r) => {
+          const compName =
+            r.companyName ||
+            r.customFields?.['Company'] ||
+            r.customFields?.['Company Name'] ||
+            r.customFields?.['company'] ||
+            '';
 
-      // Stage 2: Entity matching & validation
-      onProgress?.({
-        isActive: true,
-        currentIndex: i + 1,
-        totalCount,
-        percentage: Math.round(((i + 0.7) / totalCount) * 100),
-        status: 'running',
-        stageMessage: `Matching decision maker titles (${config.seniorityLevels?.join(', ') || 'C-Suite'})...`,
-        currentItemName: currentRecord.companyName,
-        leadsFound: enrichedList.length,
-        leadsProcessed: i,
-        elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
-      });
+          let siteUrl =
+            r.companyWebsite ||
+            r.domain ||
+            r.customFields?.['Website'] ||
+            r.customFields?.['Company URL'] ||
+            r.customFields?.['website'] ||
+            r.customFields?.['URL'] ||
+            r.customFields?.['Domain'] ||
+            '';
 
-      await simulateDelay(delayPerItem * 0.6, signal);
+          let compLi =
+            r.companyLinkedinUrl ||
+            r.customFields?.['Company Linkedin'] ||
+            r.customFields?.['Company LinkedIn'] ||
+            r.customFields?.['companyLinkedin'] ||
+            r.customFields?.['Company_Linkedin'] ||
+            r.customFields?.['Linkedin'] ||
+            '';
 
-      const enriched = await this.enrichSingle(currentRecord, config);
-      enrichedList.push(enriched);
+          return {
+            ...r,
+            companyName: compName,
+            companyWebsite: siteUrl,
+            companyLinkedinUrl: compLi,
+          };
+        });
 
-      onProgress?.({
-        isActive: true,
-        currentIndex: i + 1,
-        totalCount,
-        percentage: Math.round(((i + 1) / totalCount) * 100),
-        status: 'running',
-        stageMessage: `Identified: ${enriched.personName} (${enriched.title})`,
-        currentItemName: currentRecord.companyName,
-        leadsFound: enrichedList.length,
-        leadsProcessed: i + 1,
-        elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
-      });
+        const response = await fetch(`${apiBase}/api/enrich/decision-makers`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            records: payloadRecords,
+            openAiKey: openAiKey || undefined,
+            model: openAiModel,
+            seniority: config.seniorityLevels || ['CEO', 'Founder', 'Owner', 'Managing Director', 'C-Level', 'VP'],
+            delay: 0.2,
+          }),
+          signal,
+        });
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.detail || `Server error (${response.status})`);
+        }
+
+        const data = await response.json();
+        const serverResults: EnrichmentRecord[] = data.results || [];
+
+        const mergedChunk: EnrichmentRecord[] = chunk.map((orig, idx) => {
+          const enriched = serverResults[idx];
+          if (!enriched) return orig;
+
+          return {
+            ...orig,
+            personName: enriched.personName || orig.personName,
+            title: enriched.title || orig.title,
+            companyWebsite: enriched.companyWebsite || orig.companyWebsite,
+            companyLinkedinUrl: enriched.companyLinkedinUrl || orig.companyLinkedinUrl,
+            linkedinUrl: enriched.linkedinUrl || orig.linkedinUrl,
+            confidenceScore: enriched.confidenceScore ?? orig.confidenceScore,
+            enrichmentStatus: enriched.enrichmentStatus || 'enriched',
+            notes: enriched.notes || orig.notes,
+            lastEnrichedAt: enriched.lastEnrichedAt || new Date().toISOString(),
+          };
+        });
+
+        enrichedList.push(...mergedChunk);
+        if (onChunk) {
+          onChunk(mergedChunk);
+        }
+
+        const foundSoFar = enrichedList.filter((r) => r.enrichmentStatus === 'enriched').length;
+        const lastEnriched = mergedChunk[0];
+
+        onProgress?.({
+          isActive: true,
+          currentIndex: Math.min(i + batchSize, totalCount),
+          totalCount,
+          percentage: Math.round(((i + batchSize) / totalCount) * 100),
+          status: 'running',
+          stageMessage: lastEnriched?.personName
+            ? `Identified: ${lastEnriched.personName} (${lastEnriched.title}) for "${displayName}"`
+            : `Completed analysis for "${displayName}"`,
+          currentItemName: displayName,
+          leadsFound: foundSoFar,
+          leadsProcessed: Math.min(i + batchSize, totalCount),
+          elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
+        });
+      } catch (err: any) {
+        if (err.name === 'AbortError') {
+          throw err;
+        }
+
+        console.error('Error enriching decision maker chunk:', err);
+        const errorChunk: EnrichmentRecord[] = chunk.map((r) => ({
+          ...r,
+          enrichmentStatus: 'error',
+          notes: `Failed: ${err.message || 'Unknown network error'}`,
+        }));
+
+        enrichedList.push(...errorChunk);
+        if (onChunk) {
+          onChunk(errorChunk);
+        }
+      }
     }
 
     onProgress?.({
@@ -151,9 +191,9 @@ export class DecisionMakerAdapter implements IResearchAdapter {
       totalCount,
       percentage: 100,
       status: 'completed',
-      stageMessage: `Batch finished. Successfully enriched ${enrichedList.length} decision makers.`,
+      stageMessage: `Enrichment complete. Found ${enrichedList.filter((r) => r.enrichmentStatus === 'enriched').length} verified decision makers.`,
       currentItemName: '',
-      leadsFound: enrichedList.length,
+      leadsFound: enrichedList.filter((r) => r.enrichmentStatus === 'enriched').length,
       leadsProcessed: totalCount,
       elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
     });
@@ -161,3 +201,5 @@ export class DecisionMakerAdapter implements IResearchAdapter {
     return enrichedList;
   }
 }
+
+export const decisionMakerService = new DecisionMakerAdapter();

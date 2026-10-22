@@ -13,6 +13,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   includeConfidenceScore: true,
   includeTimestampInExport: true,
   adapterMode: 'real',
+  openAiApiKey: '',
+  openAiModel: 'gpt-4o-mini',
 };
 
 export const storageService = {
