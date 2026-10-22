@@ -30,6 +30,7 @@ import { Badge } from '../components/ui/Badge';
 import { Input } from '../components/ui/Input';
 import { Select } from '../components/ui/Select';
 import { cn } from '../lib/utils';
+import { getApiBaseUrl } from '../config/api';
 
 export interface ScrapedProfile {
   'Company name': string;
@@ -165,8 +166,18 @@ export const KeywordLeadCollector: React.FC = () => {
     setErrorMessage(null);
     setProgressMessage('Connecting to search workers...');
 
+    const apiBase = getApiBaseUrl();
+    if (!apiBase) {
+      setIsRunning(false);
+      setStatus('error');
+      setErrorMessage(
+        'Backend server URL is not configured. Please set your Backend API URL in Settings or start the backend locally on port 8000.'
+      );
+      return;
+    }
+
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/collector/start', {
+      const res = await fetch(`${apiBase}/api/collector/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -203,8 +214,11 @@ export const KeywordLeadCollector: React.FC = () => {
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
 
     pollIntervalRef.current = setInterval(async () => {
+      const apiBase = getApiBaseUrl();
+      if (!apiBase) return;
+
       try {
-        const res = await fetch(`http://127.0.0.1:8000/api/collector/status/${id}`);
+        const res = await fetch(`${apiBase}/api/collector/status/${id}`);
         if (!res.ok) return;
 
         const data = await res.json();
@@ -249,9 +263,11 @@ export const KeywordLeadCollector: React.FC = () => {
   // Stop Scraping
   const handleStopScraping = async () => {
     if (!taskId) return;
+    const apiBase = getApiBaseUrl();
+    if (!apiBase) return;
     setProgressMessage('Halting crawler and preparing Excel spreadsheet...');
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/collector/stop/${taskId}`, {
+      const res = await fetch(`${apiBase}/api/collector/stop/${taskId}`, {
         method: 'POST',
       });
       if (res.ok) {
@@ -273,14 +289,16 @@ export const KeywordLeadCollector: React.FC = () => {
       return;
     }
 
+    const apiBase = getApiBaseUrl();
+
     // If scraper is running or stopped, try exporting current snapshot from backend first
-    if (taskId) {
+    if (taskId && apiBase) {
       try {
-        const expRes = await fetch(`http://127.0.0.1:8000/api/collector/export-current/${taskId}`);
+        const expRes = await fetch(`${apiBase}/api/collector/export-current/${taskId}`);
         if (expRes.ok) {
           const expData = await expRes.json();
           if (expData.downloadUrl) {
-            window.open(`http://127.0.0.1:8000${expData.downloadUrl}`, '_blank');
+            window.open(`${apiBase}${expData.downloadUrl}`, '_blank');
             return;
           }
         }
@@ -289,8 +307,8 @@ export const KeywordLeadCollector: React.FC = () => {
       }
     }
 
-    if (downloadUrl) {
-      window.open(`http://127.0.0.1:8000${downloadUrl}`, '_blank');
+    if (downloadUrl && apiBase) {
+      window.open(`${apiBase}${downloadUrl}`, '_blank');
       return;
     }
 

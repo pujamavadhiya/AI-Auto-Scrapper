@@ -1,7 +1,6 @@
 import { IResearchAdapter, ModuleMetadata } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
-
-const API_BASE = 'http://127.0.0.1:8000';
+import { getApiBaseUrl } from '../../config/api';
 
 export class SocialMediaAdapter implements IResearchAdapter {
   readonly metadata: ModuleMetadata = {
@@ -68,7 +67,14 @@ export class SocialMediaAdapter implements IResearchAdapter {
           X: r.twitterUrl || '',
         }));
 
-        const res = await fetch(`${API_BASE}/api/enrich/social-media`, {
+        const apiBase = getApiBaseUrl();
+        if (!apiBase) {
+          throw new Error(
+            'Backend server URL is not configured. Please go to Settings to set your Backend API URL (or start your backend locally on http://127.0.0.1:8000).'
+          );
+        }
+
+        const res = await fetch(`${apiBase}/api/enrich/social-media`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

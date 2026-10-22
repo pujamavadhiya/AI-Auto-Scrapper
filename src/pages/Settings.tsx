@@ -11,22 +11,84 @@ import {
   HelpCircle,
   ShieldCheck,
   Zap,
+  Server,
+  Globe,
+  Activity,
+  Wifi,
+  WifiOff,
+  ExternalLink,
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 import { storageService } from '../services/storageService';
 import { AppSettings } from '../types';
+import { getApiBaseUrl } from '../config/api';
 
 export const Settings: React.FC = () => {
   const [settings, setSettings] = useState<AppSettings>(() => storageService.getSettings());
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
 
+  // Backend connection state
+  const [backendEndpoint, setBackendEndpoint] = useState<string>(
+    settings.customScraperEndpoint || (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://127.0.0.1:8000' : '')
+  );
+  const [testState, setTestState] = useState<{
+    status: 'idle' | 'testing' | 'online' | 'offline';
+    message: string;
+  }>({
+    status: 'idle',
+    message: '',
+  });
+
   const handleUpdate = (updated: Partial<AppSettings>) => {
     const next = storageService.saveSettings(updated);
     setSettings(next);
     setSaveNotice('Settings updated successfully!');
-    setTimeout(() => setSaveNotice(null), 2000);
+    setTimeout(() => setSaveNotice(null), 2500);
+  };
+
+  const handleTestBackend = async () => {
+    const target = backendEndpoint.trim().replace(/\/+$/, '');
+    if (!target) {
+      setTestState({
+        status: 'offline',
+        message: 'Please enter a valid backend URL (e.g. https://your-backend.onrender.com or http://127.0.0.1:8000).',
+      });
+      return;
+    }
+
+    setTestState({ status: 'testing', message: 'Pinging backend health endpoint...' });
+
+    try {
+      const startTime = Date.now();
+      const res = await fetch(`${target}/api/health`, { method: 'GET' });
+      const latency = Date.now() - startTime;
+
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setTestState({
+          status: 'online',
+          message: `Backend Online! Connected successfully (${latency}ms latency). Engine: ${data.engine || 'FastAPI'}`,
+        });
+        // Auto-save the working endpoint
+        handleUpdate({ customScraperEndpoint: target });
+      } else {
+        setTestState({
+          status: 'offline',
+          message: `Server returned HTTP ${res.status}. Check your backend server logs.`,
+        });
+      }
+    } catch (err: any) {
+      setTestState({
+        status: 'offline',
+        message: `Failed to connect: ${err.message}. If deploying to Vercel, deploy your Python backend on Render/Railway with HTTPS.`,
+      });
+    }
+  };
+
+  const handleSaveEndpoint = () => {
+    handleUpdate({ customScraperEndpoint: backendEndpoint.trim() });
   };
 
   const handleResetData = () => {
@@ -43,11 +105,11 @@ export const Settings: React.FC = () => {
         <div>
           <h2 className="text-xl font-bold text-slate-900 tracking-tight">Platform & Adapter Settings</h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Manage research simulation speed, export preferences, and view scraper integration hooks.
+            Configure backend crawler endpoints, research latency, and export formats.
           </p>
         </div>
         <Badge variant="default" className="text-xs">
-          Modular Sandbox
+          Modular Architecture
         </Badge>
       </div>
 
@@ -57,6 +119,132 @@ export const Settings: React.FC = () => {
           <span>{saveNotice}</span>
         </div>
       )}
+
+      {/* 0. Cloud & Vercel Backend Server Configuration */}
+      <Card className="border-blue-200 shadow-xs">
+        <CardHeader className="p-5 border-b border-slate-100 bg-blue-50/30">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Server className="w-5 h-5 text-blue-600" />
+              <div>
+                <CardTitle className="text-base text-slate-900">Python Backend Server (Cloud & Vercel)</CardTitle>
+                <CardDescription className="text-xs mt-0.5">
+                  Connect your deployed FastAPI backend server to power live multi-threaded scraping.
+                </CardDescription>
+              </div>
+            </div>
+            {testState.status === 'online' && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800">
+                <Wifi className="w-3.5 h-3.5 text-emerald-600" />
+                Online
+              </span>
+            )}
+            {testState.status === 'offline' && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-rose-100 text-rose-800">
+                <WifiOff className="w-3.5 h-3.5 text-rose-600" />
+                Offline
+              </span>
+            )}
+          </div>
+        </CardHeader>
+
+        <CardContent className="p-5 space-y-4">
+          <div className="space-y-1.5">
+            <label className="block text-xs font-semibold text-slate-800">
+              Backend API Server URL
+            </label>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="text"
+                value={backendEndpoint}
+                onChange={(e) => setBackendEndpoint(e.target.value)}
+                placeholder="https://ai-auto-scrapper-backend.onrender.com or http://127.0.0.1:8000"
+                className="flex-1 px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 bg-white"
+              />
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleTestBackend}
+                  disabled={testState.status === 'testing'}
+                  className="text-xs whitespace-nowrap"
+                >
+                  <Activity className="w-3.5 h-3.5 mr-1.5 text-blue-600" />
+                  {testState.status === 'testing' ? 'Testing...' : 'Test Connection'}
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={handleSaveEndpoint}
+                  className="text-xs bg-blue-600 hover:bg-blue-700 text-white whitespace-nowrap"
+                >
+                  Save URL
+                </Button>
+              </div>
+            </div>
+            <p className="text-[11px] text-slate-500">
+              Active endpoint resolved by frontend:{' '}
+              <code className="text-blue-700 bg-blue-50 px-1 py-0.5 rounded font-mono">
+                {getApiBaseUrl() || 'None (Running in local-only mode)'}
+              </code>
+            </p>
+          </div>
+
+          {testState.message && (
+            <div
+              className={`p-3 rounded-xl border text-xs font-medium flex items-start gap-2 ${
+                testState.status === 'online'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-rose-50 border-rose-200 text-rose-800'
+              }`}
+            >
+              {testState.status === 'online' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+              ) : (
+                <WifiOff className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              )}
+              <span>{testState.message}</span>
+            </div>
+          )}
+
+          {/* Setup Guide Accordion / Box */}
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+            <h4 className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
+              <Globe className="w-4 h-4 text-slate-600" />
+              How to configure your backend for Vercel deployment:
+            </h4>
+            <div className="text-xs text-slate-600 space-y-2 leading-relaxed">
+              <p>
+                <strong>Why was the backend offline?</strong> Vercel only hosts the compiled React frontend. The Python scrapers (<code className="font-mono bg-white px-1 py-0.5 rounded text-slate-700">backend/server.py</code>) require a running Python runtime.
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
+                  <span className="font-bold text-slate-800 text-[11px] block">Option 1: Deploy on Render.com (Free)</span>
+                  <p className="text-[11px] text-slate-500">
+                    1. Create a free Web Service on <strong>Render.com</strong> from your GitHub repo.
+                    <br />
+                    2. Build Command: <code className="bg-slate-100 px-1 rounded">pip install -r requirements.txt</code>
+                    <br />
+                    3. Start Command: <code className="bg-slate-100 px-1 rounded">uvicorn backend.server:app --host 0.0.0.0 --port $PORT</code>
+                    <br />
+                    4. Paste your Render URL above (or set <code className="bg-slate-100 px-1 rounded">VITE_API_URL</code> in Vercel).
+                  </p>
+                </div>
+
+                <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
+                  <span className="font-bold text-slate-800 text-[11px] block">Option 2: Local Development</span>
+                  <p className="text-[11px] text-slate-500">
+                    If testing on your local machine, run:
+                    <br />
+                    <code className="bg-slate-100 px-1 rounded font-mono">venv/bin/python backend/server.py</code>
+                    <br />
+                    The frontend automatically detects <code className="bg-slate-100 px-1 rounded font-mono">http://127.0.0.1:8000</code>.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* 1. Simulation & Crawler Timing */}
       <Card>

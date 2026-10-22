@@ -24,6 +24,7 @@ import { EnrichmentRecord, ResearchConfig, ResearchProgress, ColumnMapping } fro
 import { ParsedFileResult } from '../services/excelService';
 import { socialMediaService } from '../services/adapters';
 import { storageService } from '../services/storageService';
+import { getApiBaseUrl } from '../config/api';
 
 export const SocialMediaFinder: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'table' | 'upload' | 'quick-input' | 'settings'>('table');
@@ -42,8 +43,13 @@ export const SocialMediaFinder: React.FC = () => {
   React.useEffect(() => {
     let mounted = true;
     const checkBackend = async () => {
+      const apiBase = getApiBaseUrl();
+      if (!apiBase) {
+        if (mounted) setBackendOnline(false);
+        return;
+      }
       try {
-        const res = await fetch('http://127.0.0.1:8000/api/health');
+        const res = await fetch(`${apiBase}/api/health`);
         if (mounted) setBackendOnline(res.ok);
       } catch {
         if (mounted) setBackendOnline(false);
