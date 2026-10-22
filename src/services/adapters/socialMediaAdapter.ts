@@ -120,6 +120,15 @@ export class SocialMediaAdapter implements IResearchAdapter {
         if (err.name === 'AbortError') {
           throw err;
         }
+        if (
+          err.message?.includes('Failed to fetch') ||
+          err.message?.includes('NetworkError') ||
+          err.message?.includes('Load failed')
+        ) {
+          throw new Error(
+            'Backend server is offline. Please start the backend server with: venv/bin/python backend/server.py'
+          );
+        }
         // Fallback for failed network requests on this chunk
         const fallbackChunk: EnrichmentRecord[] = [];
         for (const r of chunk) {

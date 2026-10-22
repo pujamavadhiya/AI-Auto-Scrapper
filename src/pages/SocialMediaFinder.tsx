@@ -36,8 +36,26 @@ export const SocialMediaFinder: React.FC = () => {
   const [batchSize, setBatchSize] = useState<number>(5);
   const [delaySec, setDelaySec] = useState<number>(1.0);
 
-  // Quick input text state
   const [quickInputText, setQuickInputText] = useState<string>('');
+  const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+
+  React.useEffect(() => {
+    let mounted = true;
+    const checkBackend = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:8000/api/health');
+        if (mounted) setBackendOnline(res.ok);
+      } catch {
+        if (mounted) setBackendOnline(false);
+      }
+    };
+    checkBackend();
+    const interval = setInterval(checkBackend, 10000);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, []);
 
   const [config, setConfig] = useState<ResearchConfig>({
     socialPlatforms: ['Facebook', 'Instagram', 'LinkedIn', 'Twitter/X'],
@@ -280,6 +298,24 @@ export const SocialMediaFinder: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
+          {backendOnline === true ? (
+            <span
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"
+              title="FastAPI Python engine is active on port 8000"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+              Engine Online
+            </span>
+          ) : backendOnline === false ? (
+            <span
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-rose-50 text-rose-700 border border-rose-200"
+              title="Python server not detected on http://127.0.0.1:8000"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
+              Engine Offline
+            </span>
+          ) : null}
+
           {records.length > 0 && (
             <>
               <Button

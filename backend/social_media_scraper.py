@@ -72,6 +72,11 @@ IG_BAD = {
 SHARE_RE = re.compile(r"sharer|share\.php|/share\b|intent/|plugins/|dialog/|/login|/hashtag/", re.I)
 HREF_RE = re.compile(r"""href=["']([^"']+)["']""", re.I)
 
+RAW_SOCIAL_RE = re.compile(
+    r"https?://(?:[a-zA-Z0-9-]+\.)*(?:facebook\.com|fb\.me|fb\.com|instagram\.com|linkedin\.com|twitter\.com|x\.com)/[^\s\"'<>\\)]+",
+    re.I
+)
+
 COLUMNS = [
     "Company",
     "Website",
@@ -88,39 +93,64 @@ COLUMNS = [
 # HTTP Fetch
 # --------------------------------------------------------------------------- #
 def fetch_html(url: str, timeout: int = 15, extra_headers: Optional[Dict[str, str]] = None) -> str:
-    """Equivalent of the n8n HTTP Request node with neverError=true:
-    any failure just returns an empty string."""
+    """Fetch website HTML with SSL verification fallback and comprehensive browser headers."""
     if not url or not str(url).strip():
         return ""
     u = str(url).strip()
     if not re.match(r"^https?://", u, re.I):
         u = "https://" + u.lstrip("/")
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
     if extra_headers:
         headers.update(extra_headers)
-    try:
-        r = requests.get(u, headers=headers, timeout=timeout, verify=False, allow_redirects=True)
-        return r.text or ""
-    except Exception:
-        return ""
+
+    # First attempt HTTPS, fallback to HTTP if connection or SSL error occurs
+    targets = [u]
+    if u.startswith("https://"):
+        targets.append(u.replace("https://", "http://", 1))
+
+    for target in targets:
+        try:
+            r = requests.get(target, headers=headers, timeout=timeout, verify=False, allow_redirects=True)
+            if r.text:
+                return r.text
+        except Exception:
+            continue
+    return ""
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def _clean(u: str) -> str:
+    # Remove escaped backslashes from JSON/scripts
+    u = re.sub(r"\\+", "", u)
+    # Strip tracking parameters & fragments
     u = re.sub(r"[?#].*$", "", u)
     return re.sub(r"[/.,;]+$", "", u)
 
 
 def _first_seg(u: str, domain_re: str) -> str:
-    parts = re.split(domain_re + r"/", u, maxsplit=1, flags=re.I)
+    # Use non-capturing group (?:...) so alternation | binds to domain_re correctly
+    parts = re.split(r"(?:" + domain_re + r")/", u, maxsplit=1, flags=re.I)
     after = parts[1] if len(parts) > 1 else ""
-    return after.split("/")[0].lower()
+    return after.lstrip("/").split("/")[0].lower()
 
 
 def _find(html: str, domain_re: str, validate: Callable[[str], bool]) -> str:
-    pattern = re.compile(r"https?://(?:[a-z0-9-]+\.)*" + domain_re + r"/[^\s\"'<>\\)]+", re.I)
+    pattern = re.compile(r"https?://(?:[a-z0-9-]+\.)*(?:" + domain_re + r")/[^\s\"'<>\\)]+", re.I)
     for m in pattern.finditer(html):
         u = _clean(m.group(0))
         if validate(u):
@@ -143,13 +173,16 @@ def _is(h: str, d: str) -> bool:
 def extract_company_links(html: str) -> Dict[str, str]:
     """Strict regex extraction (n8n 'Extract Social Links1' node)."""
     if not html:
-        return {"Facebook": "", "Instagram": "", "Linkedin": ""}
+        return {"Facebook": "", "Instagram": "", "Linkedin": "", "X": ""}
     # un-escape JSON-embedded links and HTML entities
     html = html.replace(r"\/", "/")
     html = html.replace("&amp;", "&")
     html = re.sub(r"&#x2F;", "/", html, flags=re.I)
 
-    fb_re, ig_re, li_re = r"facebook\.com", r"instagram\.com", r"linkedin\.com"
+    fb_re = r"facebook\.com|fb\.me|fb\.com"
+    ig_re = r"instagram\.com"
+    li_re = r"linkedin\.com"
+    tw_re = r"twitter\.com|x\.com"
 
     def fb_ok(u: str) -> bool:
         s = _first_seg(u, fb_re)
@@ -162,14 +195,19 @@ def extract_company_links(html: str) -> Dict[str, str]:
     def li_ok(u: str) -> bool:
         s = _first_seg(u, li_re)
         after = re.split(r"linkedin\.com/", u, maxsplit=1, flags=re.I)
-        segs = (after[1] if len(after) > 1 else "").split("/")
+        segs = (after[1] if len(after) > 1 else "").lstrip("/").split("/")
         rest = segs[1] if len(segs) > 1 else ""
         return s in {"company", "showcase", "school"} and bool(rest) and rest.lower() != "linkedin"
+
+    def tw_ok(u: str) -> bool:
+        s = _first_seg(u, tw_re)
+        return bool(s) and s not in ("share", "intent", "search", "explore", "home", "login", "signup")
 
     return {
         "Facebook": _find(html, fb_re, fb_ok),
         "Instagram": _find(html, ig_re, ig_ok),
         "Linkedin": _find(html, li_re, li_ok),
+        "X": _find(html, tw_re, tw_ok),
     }
 
 
@@ -177,16 +215,35 @@ def extract_company_links(html: str) -> Dict[str, str]:
 # MODE "website"  ->  n8n nodes: Filter - Has Website + Extract Social Links
 # --------------------------------------------------------------------------- #
 def extract_all_links(html: str, orig: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
-    """Href-based multi-platform extraction (n8n 'Extract Social Links' node)."""
+    """Href & script-based multi-platform extraction (n8n 'Extract Social Links' node)."""
     orig = orig or {}
-    links = []
-    if html:
-        for m in HREF_RE.finditer(html):
-            l = m.group(1).strip()
-            if l.startswith("//"):
-                l = "https:" + l
-            links.append(l)
-    links = list(dict.fromkeys(links))  # unique, keep order
+    if not html:
+        return {
+            "Facebook": orig.get("Facebook") or orig.get("facebookUrl") or "",
+            "Instagram": orig.get("Instagram") or orig.get("instagramUrl") or "",
+            "Linkedin": orig.get("Linkedin") or orig.get("companyLinkedinUrl") or orig.get("linkedinUrl") or "",
+            "X": orig.get("X") or orig.get("twitterUrl") or "",
+            "fetch_status": "empty_or_failed",
+        }
+
+    # Un-escape JSON-embedded links and HTML entities
+    html = html.replace(r"\/", "/")
+    html = html.replace("&amp;", "&")
+    html = re.sub(r"&#x2F;", "/", html, flags=re.I)
+
+    raw_candidates = []
+    # 1. Collect standard <a href="..."> links
+    for m in HREF_RE.finditer(html):
+        l = m.group(1).strip()
+        if l.startswith("//"):
+            l = "https:" + l
+        raw_candidates.append(l)
+
+    # 2. Collect full URLs from scripts, JSON-LD, metadata, and body
+    for m in RAW_SOCIAL_RE.finditer(html):
+        raw_candidates.append(m.group(0).strip())
+
+    links = list(dict.fromkeys(raw_candidates))  # unique, keep order
 
     f = {"facebook": [], "instagram": [], "linkedin": [], "x": []}
     for link in links:
@@ -206,8 +263,8 @@ def extract_all_links(html: str, orig: Optional[Dict[str, Any]] = None) -> Dict[
                 f["instagram"].append(cleaned_url)
         elif _is(h, "linkedin.com"):
             s = _first_seg(cleaned_url, r"linkedin\.com")
-            # Prefer company / school / showcase if available, but collect all verified non-share LinkedIn links
-            if s and s not in ("share", "share.php", "intent", "login", "signup"):
+            # Filter out non-profile actions
+            if s and s not in ("share", "share.php", "intent", "login", "signup", "feed"):
                 f["linkedin"].append(cleaned_url)
         elif _is(h, "twitter.com") or h == "x.com":
             s = _first_seg(cleaned_url, r"twitter\.com|x\.com")
@@ -271,7 +328,7 @@ class SocialMediaScraper:
             facebook = links.get("Facebook") or row.get("Facebook") or row.get("facebookUrl") or ""
             instagram = links.get("Instagram") or row.get("Instagram") or row.get("instagramUrl") or ""
             linkedin = links.get("Linkedin") or row.get("Linkedin") or row.get("companyLinkedinUrl") or row.get("linkedinUrl") or ""
-            x_tw = row.get("X") or row.get("twitterUrl") or ""
+            x_tw = links.get("X") or row.get("X") or row.get("twitterUrl") or ""
             fetch_status = "ok" if html else "empty_or_failed"
         else:
             links = extract_all_links(html, row)
