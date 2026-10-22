@@ -6,20 +6,11 @@ Input sheet (CSV or XLSX) with columns like:
     company name | website | decision maker name | decision maker linkedin url
 Output: same sheet + "Email", "Phone", "Enrich Status" columns.
 
-Everything provider-specific lives in leadocean_config.json (created with --init-config).
-Fill it in from your LeadOcean dashboard / API docs - no code changes needed.
-
-Usage
------
-    pip install requests pandas openpyxl
-    export LEADOCEAN_API_KEY="your_key"
-    python backend/leadocean_enricher.py --init-config          # writes leadocean_config.json
-    python backend/leadocean_enricher.py --input leads.csv --output leads_enriched.csv --limit 5
-    python backend/leadocean_enricher.py --input leads.xlsx     # full run
-
-Flags: --limit N (test on N rows), --dry-run (print requests, no API calls),
-       --overwrite (re-enrich rows that already have an email),
-       --debug (print the first raw API response so you can fix the paths)
+LeadOcean API (/v1/people/enrich):
+    - Method: POST
+    - Header: x-api-key: <key>
+    - Payload: {"linkedin_url": "https://www.linkedin.com/in/...", "reveal_email": true}
+    - Response: { "data": { "contact_data": { "contact_emails": [...], "contact_phones": [...] } } }
 """
 from __future__ import annotations
 
@@ -53,46 +44,33 @@ if not logger.handlers:
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
 
-# Config path resolution: check backend directory and project root
-CONFIG_FILENAMES = ["leadocean_config.json", "backend/leadocean_config.json"]
+CONFIG_PATH = "leadocean_config.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "_help": "Fill these in from your LeadOcean API docs. Values like {linkedin} are filled from each row.",
+    "_help": "LeadOcean API Configuration. The /v1/people/enrich endpoint requires 'linkedin_url' and 'reveal_email': true.",
     "url": "https://api.leadocean.io/v1/people/enrich",
     "method": "POST",
     "api_key_env": "LEADOCEAN_API_KEY",
     "auth_in": "header",              # "header" or "query"
     "auth_name": "x-api-key",         # header name, or query-param name if auth_in = "query"
     "auth_prefix": "",                # e.g. "Bearer " or "" (for x-api-key style headers)
-    "request_map": {                  # keys = what the API expects; values = templates
+    "request_map": {
         "linkedin_url": "{linkedin}",
-        "full_name": "{name}",
-        "first_name": "{first_name}",
-        "last_name": "{last_name}",
-        "company": "{company}",
-        "domain": "{domain}",
         "reveal_email": True,
-        "reveal_phone": True,
     },
     "email_paths": [
-        "email",
+        "data.contact_data.contact_emails",
+        "data.contact_data.contact_emails.0.email",
+        "contact_data.contact_emails.0.email",
         "data.email",
-        "data.emails.0.email",
-        "data.work_email",
-        "result.email",
-        "emails.0",
-        "contact_data.emails.0.email",
-        "contact_data.personal_emails.0",
+        "email",
     ],
     "phone_paths": [
-        "phone",
+        "data.contact_data.contact_phones",
+        "data.contact_data.contact_phones.0.phone",
+        "contact_data.contact_phones.0.phone",
         "data.phone",
-        "data.phones.0.number",
-        "data.direct_phone",
-        "result.phone",
-        "phones.0",
-        "contact_data.phones.0.number",
-        "contact_data.direct_numbers.0",
+        "phone",
     ],
     "timeout_seconds": 40,
     "delay_seconds": 0.5,             # pause between rows
@@ -205,11 +183,11 @@ def first_value(data: Any, paths: List[str]) -> str:
             if isinstance(v[0], str) and v[0].strip():
                 return v[0].strip()
             if isinstance(v[0], dict):
-                val = v[0].get("email") or v[0].get("number") or v[0].get("value") or v[0].get("phone")
+                val = v[0].get("email") or v[0].get("phone") or v[0].get("number") or v[0].get("value")
                 if isinstance(val, str) and val.strip():
                     return val.strip()
-        if isinstance(v, dict):                      # e.g. {"email": "x@y.com"}
-            val = v.get("email") or v.get("number") or v.get("value") or v.get("phone")
+        if isinstance(v, dict):
+            val = v.get("email") or v.get("phone") or v.get("number") or v.get("value")
             if isinstance(val, str) and val.strip():
                 return val.strip()
         if isinstance(v, str) and v.strip():
@@ -217,18 +195,102 @@ def first_value(data: Any, paths: List[str]) -> str:
     return ""
 
 
+def extract_email(data: Any, preferred_domain: str = "") -> str:
+    """Extracts the best email from LeadOcean response (matching company domain first)."""
+    if not isinstance(data, dict):
+        return ""
+
+    contact_emails = (
+        data.get("data", {}).get("contact_data", {}).get("contact_emails")
+        or data.get("contact_data", {}).get("contact_emails")
+        or []
+    )
+
+    clean_dom = (preferred_domain or "").lower().replace("www.", "").strip()
+
+    if isinstance(contact_emails, list) and contact_emails:
+        # First priority: email matching the company's domain
+        if clean_dom:
+            for item in contact_emails:
+                em = item.get("email") if isinstance(item, dict) else (str(item) if isinstance(item, str) else "")
+                if em and f"@{clean_dom}" in em.lower():
+                    return em.strip()
+
+        # Second priority: work email
+        for item in contact_emails:
+            if isinstance(item, dict):
+                if item.get("type") in ("work", "work_primary") and item.get("email"):
+                    return str(item["email"]).strip()
+
+        # Third priority: first valid email
+        for item in contact_emails:
+            em = item.get("email") if isinstance(item, dict) else (str(item) if isinstance(item, str) else "")
+            if em and "@" in em:
+                return em.strip()
+
+    # Fallback to configured paths
+    return first_value(data, [
+        "data.contact_data.contact_emails.0.email",
+        "contact_data.contact_emails.0.email",
+        "data.email",
+        "email",
+    ])
+
+
+def extract_phone(data: Any) -> str:
+    """Extracts the best direct phone number from LeadOcean response."""
+    if not isinstance(data, dict):
+        return ""
+
+    contact_phones = (
+        data.get("data", {}).get("contact_data", {}).get("contact_phones")
+        or data.get("contact_data", {}).get("contact_phones")
+        or []
+    )
+
+    if isinstance(contact_phones, list) and contact_phones:
+        for item in contact_phones:
+            ph = item.get("phone") if isinstance(item, dict) else (str(item) if isinstance(item, str) else "")
+            if ph and isinstance(ph, str) and len(re.sub(r"\D", "", ph)) >= 7:
+                return ph.strip()
+
+    # Fallback to configured paths
+    return first_value(data, [
+        "data.contact_data.contact_phones.0.phone",
+        "contact_data.contact_phones.0.phone",
+        "data.phone",
+        "phone",
+    ])
+
+
 def build_request(cfg: Dict[str, Any], ctx: Dict[str, str], api_key: str) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, str]]:
+    url = cfg.get("url", "https://api.leadocean.io/v1/people/enrich")
+    is_leadocean_enrich = "leadocean.io/v1/people/enrich" in url
+
     payload: Dict[str, Any] = {}
-    for k, tmpl in cfg.get("request_map", {}).items():
-        if isinstance(tmpl, bool):
-            payload[k] = tmpl
-            continue
-        try:
-            val = str(tmpl).format(**ctx)
-            if val.strip():                              # skip empty fields
-                payload[k] = val
-        except Exception:
-            pass
+
+    if is_leadocean_enrich:
+        # LeadOcean strictly requires exactly one identifier: linkedin_url, email, phone, or person_id
+        # and rejects unrecognized fields like full_name, company, domain.
+        payload = {"reveal_email": True}
+        if ctx.get("linkedin"):
+            payload["linkedin_url"] = ctx["linkedin"]
+        elif ctx.get("email"):
+            payload["email"] = ctx["email"]
+        elif ctx.get("phone"):
+            payload["phone"] = ctx["phone"]
+    else:
+        # Generic provider template
+        for k, tmpl in cfg.get("request_map", {}).items():
+            if isinstance(tmpl, bool):
+                payload[k] = tmpl
+                continue
+            try:
+                val = str(tmpl).format(**ctx).strip()
+                if val:
+                    payload[k] = val
+            except Exception:
+                pass
 
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     params: Dict[str, str] = {}
@@ -251,7 +313,6 @@ def call_api(cfg: Dict[str, Any], ctx: Dict[str, str], api_key: str) -> Tuple[Op
     timeout = cfg.get("timeout_seconds", 40)
     url = cfg.get("url", "https://api.leadocean.io/v1/people/enrich")
 
-    # If endpoint placeholder is still present, substitute with default
     if "REPLACE_WITH" in url:
         url = "https://api.leadocean.io/v1/people/enrich"
 
@@ -274,7 +335,7 @@ def call_api(cfg: Dict[str, Any], ctx: Dict[str, str], api_key: str) -> Tuple[Op
             if r.status_code == 404:
                 return {}, "not_found"
             if r.status_code >= 400:
-                return None, f"http_{r.status_code}: {r.text[:120]}"
+                return None, f"http_{r.status_code}: {r.text[:140]}"
             try:
                 return r.json(), ""
             except ValueError:
@@ -319,17 +380,35 @@ def enrich_dataframe(
         row = df.loc[i]
         linkedin = clean_linkedin(row[cols["linkedin"]]) if "linkedin" in cols else ""
         name = str(row[cols["name"]]).strip() if "name" in cols else ""
+        comp = str(row[cols["company"]]).strip() if "company" in cols else ""
+        domain = clean_domain(row[cols["website"]]) if "website" in cols else ""
         first, last = split_name(name)
+
+        if not linkedin and name and comp:
+            try:
+                try:
+                    from decision_maker_finder import find_decision_maker
+                except ImportError:
+                    from backend.decision_maker_finder import find_decision_maker
+                dm = find_decision_maker(comp, domain, "")
+                if dm and dm.get("url"):
+                    linkedin = clean_linkedin(dm["url"])
+                    progress(f"    Resolved LinkedIn URL: {linkedin}")
+            except Exception:
+                pass
+
         ctx = {
             "linkedin": linkedin,
             "name": name,
             "first_name": first,
             "last_name": last,
-            "company": str(row[cols["company"]]).strip() if "company" in cols else "",
-            "domain": clean_domain(row[cols["website"]]) if "website" in cols else "",
+            "company": comp,
+            "domain": domain,
         }
-        if not linkedin and not (name and (ctx["company"] or ctx["domain"])):
+
+        if not linkedin:
             df.at[i, "Enrich Status"] = "skipped_missing_input"
+            progress(f"[{n}/{len(todo)}] {name or comp}: skipped (LinkedIn URL required for LeadOcean)")
             continue
 
         if dry_run:
@@ -341,29 +420,34 @@ def enrich_dataframe(
         if debug and not shown_debug and data is not None:
             progress("RAW RESPONSE (first row):\n" + json.dumps(data, indent=2)[:2000])
             shown_debug = True
+
         if data is None:
             df.at[i, "Enrich Status"] = f"error: {err}"
         else:
-            email = first_value(data, cfg["email_paths"])
-            phone = first_value(data, cfg["phone_paths"])
+            email = extract_email(data, domain)
+            phone = extract_phone(data)
             df.at[i, "Email"] = email
             df.at[i, "Phone"] = phone
             df.at[i, "Enrich Status"] = "found" if (email or phone) else "no_data"
 
         progress(
-            f"[{n}/{len(todo)}] {name or ctx['company']}: {df.at[i, 'Enrich Status']} "
-            f"{df.at[i, 'Email']} {df.at[i, 'Phone']}"
+            f"[{n}/{len(todo)}] {name or comp}: {df.at[i, 'Enrich Status']} "
+            f"Email: {df.at[i, 'Email'] or '-'} | Phone: {df.at[i, 'Phone'] or '-'}"
         )
 
-        if checkpoint_path and n % 25 == 0:          # save progress so a crash loses little
+        if checkpoint_path and n % 25 == 0:
             write_sheet(df, checkpoint_path)
         time.sleep(cfg.get("delay_seconds", 0.5))
+
     return df
 
 
-def load_config(path: str = "leadocean_config.json") -> Dict[str, Any]:
-    # Look in provided path, current directory, parent directory
-    candidates = [Path(path), Path(__file__).resolve().parent / path, Path(__file__).resolve().parent.parent / path]
+def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
+    candidates = [
+        Path(path),
+        Path(__file__).resolve().parent / path,
+        Path(__file__).resolve().parent.parent / path,
+    ]
     found_file = None
     for c in candidates:
         if c.exists():
@@ -413,7 +497,7 @@ class ContactEnrichmentResult:
 
 
 class LeadOceanEnricher:
-    def __init__(self, api_key: Optional[str] = None, config_path: str = "leadocean_config.json"):
+    def __init__(self, api_key: Optional[str] = None, config_path: str = CONFIG_PATH):
         self.config = load_config(config_path)
         env_key_name = self.config.get("api_key_env", "LEADOCEAN_API_KEY")
         self.api_key = (api_key or os.environ.get(env_key_name, "") or os.environ.get("LEADOCEAN_API_KEY", "")).strip()
@@ -434,26 +518,6 @@ class LeadOceanEnricher:
         dom = clean_domain(web)
         first, last = split_name(nm)
 
-        ctx = {
-            "linkedin": li,
-            "name": nm,
-            "first_name": first,
-            "last_name": last,
-            "company": comp,
-            "domain": dom,
-        }
-
-        if not li and not (nm and (comp or dom)):
-            return ContactEnrichmentResult(
-                company_name=comp,
-                decision_maker_name=nm,
-                decision_maker_linkedin=li,
-                website=web,
-                domain=dom,
-                enrich_status="skipped_missing_input",
-                raw_error="Please provide either a LinkedIn URL or Decision Maker Name + Company/Domain",
-            )
-
         if not key:
             return ContactEnrichmentResult(
                 company_name=comp,
@@ -464,6 +528,41 @@ class LeadOceanEnricher:
                 enrich_status="error",
                 raw_error="LEADOCEAN_API_KEY is missing. Please configure LEADOCEAN_API_KEY in .env or Settings.",
             )
+
+        # If LinkedIn URL is missing, attempt to resolve via SerpApi DecisionMakerFinder
+        if not li and comp:
+            try:
+                try:
+                    from decision_maker_finder import find_decision_maker
+                except ImportError:
+                    from backend.decision_maker_finder import find_decision_maker
+                dm = find_decision_maker(comp, web, "")
+                if dm and dm.get("url"):
+                    li = clean_linkedin(dm["url"])
+                    if not nm and dm.get("name"):
+                        nm = dm["name"]
+            except Exception as e:
+                logger.debug(f"Could not auto-resolve LinkedIn: {e}")
+
+        if not li:
+            return ContactEnrichmentResult(
+                company_name=comp,
+                decision_maker_name=nm,
+                decision_maker_linkedin=li,
+                website=web,
+                domain=dom,
+                enrich_status="skipped_missing_input",
+                raw_error="LeadOcean requires a verified LinkedIn profile URL to retrieve email and phone.",
+            )
+
+        ctx = {
+            "linkedin": li,
+            "name": nm,
+            "first_name": first,
+            "last_name": last,
+            "company": comp,
+            "domain": dom,
+        }
 
         data, err = call_api(self.config, ctx, key)
         if data is None:
@@ -477,8 +576,8 @@ class LeadOceanEnricher:
                 raw_error=err,
             )
 
-        email = first_value(data, self.config.get("email_paths", DEFAULT_CONFIG["email_paths"]))
-        phone = first_value(data, self.config.get("phone_paths", DEFAULT_CONFIG["phone_paths"]))
+        email = extract_email(data, dom)
+        phone = extract_phone(data)
         status = "found" if (email or phone) else "no_data"
 
         return ContactEnrichmentResult(
@@ -499,7 +598,7 @@ class LeadOceanEnricher:
 def main():
     ap = argparse.ArgumentParser(description="Add email + phone to a lead sheet using the LeadOcean API.")
     ap.add_argument("--init-config", action="store_true", help="write a template leadocean_config.json and exit")
-    ap.add_argument("--config", default="leadocean_config.json")
+    ap.add_argument("--config", default=CONFIG_PATH)
     ap.add_argument("--input", help="CSV or XLSX file")
     ap.add_argument("--output", help="output path (default: <input>_enriched.<ext>)")
     ap.add_argument("--api-key", default=os.getenv("LEADOCEAN_API_KEY"))
