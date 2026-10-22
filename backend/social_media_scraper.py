@@ -302,10 +302,44 @@ class SocialMediaScraper:
 
     def scrape_single(self, row: Dict[str, Any]) -> Dict[str, Any]:
         """Scrapes social media URLs for a single company/website row."""
-        raw_url = str(row.get("Website") or row.get("Company URL") or row.get("website") or row.get("companyWebsite") or row.get("domain") or "").strip()
-        company_name = str(row.get("Company") or row.get("Company Name") or row.get("companyName") or "").strip()
+        customs = row.get("customFields", {}) if isinstance(row.get("customFields"), dict) else {}
+        raw_url = str(
+            row.get("Website")
+            or row.get("Company URL")
+            or row.get("companyWebsite")
+            or row.get("website")
+            or row.get("domain")
+            or row.get("Domain")
+            or row.get("URL")
+            or row.get("Url")
+            or row.get("url")
+            or customs.get("Website")
+            or customs.get("Company URL")
+            or customs.get("website")
+            or customs.get("URL")
+            or ""
+        ).strip()
 
-        if not raw_url and not company_name:
+        company_name = str(
+            row.get("Company")
+            or row.get("Company Name")
+            or row.get("companyName")
+            or customs.get("Company")
+            or customs.get("Company Name")
+            or ""
+        ).strip()
+
+        # Clean repeated protocol prefixes (e.g. https://https://)
+        url = re.sub(r"^(https?://)+", "https://", raw_url, flags=re.I).strip()
+        if url and not re.match(r"^https?://", url, re.I):
+            url = "https://" + url.lstrip("/")
+
+        if not company_name and url:
+            domain_slug = url.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0].split(".")[0]
+            if domain_slug:
+                company_name = domain_slug.capitalize()
+
+        if not url and not company_name:
             return {
                 **row,
                 "Facebook": row.get("Facebook", ""),
@@ -315,11 +349,6 @@ class SocialMediaScraper:
                 "Fetch Status": "no_website",
                 "Confidence Score": 0,
             }
-
-        # Normalize URL
-        url = raw_url
-        if url and not re.match(r"^https?://", url, re.I):
-            url = "https://" + url.lstrip("/")
 
         html = fetch_html(url, timeout=self.timeout) if url else ""
 

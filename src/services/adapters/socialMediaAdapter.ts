@@ -57,15 +57,39 @@ export class SocialMediaAdapter implements IResearchAdapter {
       });
 
       try {
-        const payloadRecords = chunk.map((r) => ({
-          ...r,
-          Company: r.companyName,
-          Website: r.companyWebsite || (r.domain ? `https://${r.domain}` : ''),
-          Facebook: r.facebookUrl || '',
-          Instagram: r.instagramUrl || '',
-          Linkedin: r.companyLinkedinUrl || r.linkedinUrl || '',
-          X: r.twitterUrl || '',
-        }));
+        const payloadRecords = chunk.map((r) => {
+          let targetUrl =
+            r.companyWebsite ||
+            r.domain ||
+            r.customFields?.['Website'] ||
+            r.customFields?.['Company URL'] ||
+            r.customFields?.['website'] ||
+            r.customFields?.['URL'] ||
+            r.customFields?.['Domain'] ||
+            '';
+          targetUrl = String(targetUrl).trim().replace(/^(https?:\/\/)+/i, 'https://');
+          if (targetUrl && !targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+            targetUrl = `https://${targetUrl.replace(/^\/+/, '')}`;
+          }
+
+          const compName =
+            r.companyName ||
+            r.customFields?.['Company'] ||
+            r.customFields?.['Company Name'] ||
+            r.customFields?.['company'] ||
+            '';
+
+          return {
+            ...r,
+            Company: compName,
+            'Company URL': targetUrl,
+            Website: targetUrl,
+            Facebook: r.facebookUrl || r.customFields?.['Facebook'] || '',
+            Instagram: r.instagramUrl || r.customFields?.['Instagram'] || '',
+            Linkedin: r.companyLinkedinUrl || r.linkedinUrl || r.customFields?.['Linkedin'] || r.customFields?.['LinkedIn'] || '',
+            X: r.twitterUrl || r.customFields?.['X'] || r.customFields?.['Twitter'] || '',
+          };
+        });
 
         const apiBase = getApiBaseUrl();
         if (!apiBase) {

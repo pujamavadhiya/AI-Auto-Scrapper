@@ -98,7 +98,20 @@ export const SocialMediaFinder: React.FC = () => {
   };
 
   const handleMappingConfirmed = (newRecords: EnrichmentRecord[], _mapping: ColumnMapping) => {
-    setRecords(newRecords);
+    // Ensure all uploaded records have clean companyWebsite populated
+    const normalized = newRecords.map((r) => {
+      let web = r.companyWebsite || r.domain || r.customFields?.['Website'] || r.customFields?.['Company URL'] || r.customFields?.['website'] || r.customFields?.['URL'] || '';
+      web = String(web).trim().replace(/^(https?:\/\/)+/i, 'https://');
+      if (web && !web.startsWith('http://') && !web.startsWith('https://')) {
+        web = `https://${web.replace(/^\/+/, '')}`;
+      }
+      return {
+        ...r,
+        companyWebsite: web || r.companyWebsite,
+      };
+    });
+
+    setRecords(normalized);
     setParsedFile(null);
     setActiveTab('table');
 
@@ -107,13 +120,13 @@ export const SocialMediaFinder: React.FC = () => {
       name: `Social Media Scrape (${new Date().toLocaleDateString()})`,
       description: `Uploaded via Social Media URL Finder (${socialMode} mode)`,
       moduleType: 'social-finder',
-      records: newRecords,
+      records: normalized,
       config,
       status: 'draft',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       sourceFileName: parsedFile?.fileName,
-      totalRecords: newRecords.length,
+      totalRecords: normalized.length,
       enrichedRecords: 0,
     });
   };

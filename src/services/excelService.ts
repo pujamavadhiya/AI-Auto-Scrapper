@@ -81,24 +81,26 @@ export const excelService = {
     for (const header of headers) {
       const norm = normalize(header);
 
-      if (!mapping.companyName && (norm.includes('company') || norm.includes('organization') || norm.includes('account') || norm.includes('business'))) {
+      // Check URL / Website / Domain FIRST so "Company URL" or "Company Website" maps to domain, NOT companyName
+      if (!mapping.domain && (norm.includes('domain') || norm.includes('url') || norm.includes('website') || norm.includes('homepage') || norm === 'web' || norm === 'site')) {
+        mapping.domain = header;
+      } else if (!mapping.companyName && !norm.includes('url') && !norm.includes('website') && !norm.includes('domain') && (norm.includes('company') || norm.includes('organization') || norm.includes('account') || norm.includes('business') || norm === 'name')) {
         mapping.companyName = header;
-      } else if (!mapping.personName && (norm.includes('contact') || norm.includes('fullname') || norm.includes('person') || norm.includes('name') || norm.includes('lead'))) {
+      } else if (!mapping.personName && (norm.includes('contact') || norm.includes('fullname') || norm.includes('person') || norm.includes('lead') || norm.includes('decisionmaker'))) {
         mapping.personName = header;
       } else if (!mapping.title && (norm.includes('title') || norm.includes('job') || norm.includes('role') || norm.includes('position') || norm.includes('designation'))) {
         mapping.title = header;
-      } else if (!mapping.domain && (norm.includes('domain') || norm.includes('url') || norm.includes('website') || norm.includes('web'))) {
-        mapping.domain = header;
-      } else if (!mapping.country && (norm.includes('country') || norm.includes('location') || norm.includes('nation') || norm.includes('region'))) {
+      } else if (!mapping.country && (norm.includes('country') || norm.includes('location') || norm.includes('nation') || norm.includes('region') || norm.includes('city') || norm.includes('state'))) {
         mapping.country = header;
       } else if (!mapping.industry && (norm.includes('industry') || norm.includes('sector') || norm.includes('vertical') || norm.includes('category'))) {
         mapping.industry = header;
       }
     }
 
-    // Fallback if companyName still empty: take the first column
+    // Fallback if companyName still empty: take the first non-domain column
     if (!mapping.companyName && headers.length > 0) {
-      mapping.companyName = headers[0];
+      const firstNonDomain = headers.find((h) => h !== mapping.domain) || headers[0];
+      mapping.companyName = firstNonDomain;
     }
 
     return mapping;
@@ -112,7 +114,40 @@ export const excelService = {
       const companyVal = mapping.companyName ? String(row[mapping.companyName] || '').trim() : '';
       const personVal = mapping.personName ? String(row[mapping.personName] || '').trim() : '';
       const titleVal = mapping.title ? String(row[mapping.title] || '').trim() : '';
-      const domainVal = mapping.domain ? String(row[mapping.domain] || '').trim() : '';
+      let rawDomain = mapping.domain ? String(row[mapping.domain] || '').trim() : '';
+
+      // If domain wasn't mapped, check if row contains 'Website' or 'Company URL' directly
+      if (!rawDomain) {
+        for (const [k, v] of Object.entries(row)) {
+          const lk = k.toLowerCase();
+          if ((lk.includes('website') || lk.includes('url') || lk.includes('domain')) && v) {
+            rawDomain = String(v).trim();
+            break;
+          }
+        }
+      }
+
+      // Clean and normalize website URL
+      let cleanWebsite = rawDomain;
+      if (cleanWebsite) {
+        // Strip repeated protocols like https://https://
+        cleanWebsite = cleanWebsite.replace(/^(https?:\/\/)+/i, 'https://').trim();
+        if (!cleanWebsite.startsWith('http://') && !cleanWebsite.startsWith('https://')) {
+          cleanWebsite = `https://${cleanWebsite.replace(/^\/+/, '')}`;
+        }
+      }
+
+      // Canonical host domain (e.g. stripe.com)
+      const cleanDomain = rawDomain
+        ? rawDomain
+            .replace(/^https?:\/\//i, '')
+            .replace(/^www\./i, '')
+            .split('/')[0]
+            .split('?')[0]
+            .split('#')[0]
+            .trim()
+        : '';
+
       const countryVal = mapping.country ? String(row[mapping.country] || '').trim() : '';
       const industryVal = mapping.industry ? String(row[mapping.industry] || '').trim() : '';
 
@@ -125,14 +160,33 @@ export const excelService = {
         }
       }
 
+      // Extract existing social media URLs if present in the uploaded sheet
+      const getVal = (...keys: string[]) => {
+        for (const k of keys) {
+          if (row[k]) return String(row[k]).trim();
+          if (customFields[k]) return String(customFields[k]).trim();
+        }
+        return '';
+      };
+
+      const existingFb = getVal('Facebook', 'facebookUrl', 'Facebook URL', 'facebook');
+      const existingIg = getVal('Instagram', 'instagramUrl', 'Instagram URL', 'instagram');
+      const existingLi = getVal('Linkedin', 'LinkedIn', 'companyLinkedinUrl', 'LinkedIn URL', 'Company LinkedIn', 'linkedin');
+      const existingTw = getVal('X', 'Twitter', 'twitterUrl', 'Twitter URL', 'Twitter / X URL', 'x', 'twitter');
+
       return {
         id: `rec-${Date.now()}-${index + 1}`,
         companyName: companyVal || `Company #${index + 1}`,
+        companyWebsite: cleanWebsite || undefined,
+        domain: cleanDomain || undefined,
         personName: personVal || undefined,
         title: titleVal || undefined,
-        domain: domainVal || undefined,
         country: countryVal || undefined,
         industry: industryVal || undefined,
+        facebookUrl: existingFb || undefined,
+        instagramUrl: existingIg || undefined,
+        companyLinkedinUrl: existingLi || undefined,
+        twitterUrl: existingTw || undefined,
         enrichmentStatus: 'idle',
         confidenceScore: undefined,
         customFields,
