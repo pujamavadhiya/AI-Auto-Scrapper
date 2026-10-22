@@ -47,6 +47,7 @@ from linkedin_finder import (
 from linkedin_collector import CollectorConfig, KeywordLinkedInCollector, clean_linkedin_url
 from social_media_scraper import SocialMediaScraper
 from decision_maker_finder import DecisionMakerFinder
+from leadocean_enricher import LeadOceanEnricher, load_config as load_leadocean_config
 
 app = FastAPI(title="AI Auto Scrapper API", version="1.0.0")
 
@@ -88,6 +89,19 @@ class DecisionMakerPayload(BaseModel):
     serpapiKey: Optional[str] = None
     maxQueries: Optional[int] = 2
     delay: Optional[float] = 0.5
+
+
+class ContactEnrichPayload(BaseModel):
+    records: List[Dict[str, Any]]
+    apiKey: Optional[str] = None
+    delay: Optional[float] = 0.3
+    overwrite: Optional[bool] = False
+
+
+class UpdateLeadOceanConfigPayload(BaseModel):
+    apiKey: Optional[str] = None
+    url: Optional[str] = None
+    authName: Optional[str] = None
 
 
 @app.get("/api/health")
@@ -846,6 +860,177 @@ def enrich_decision_makers(payload: DecisionMakerPayload):
             out_record["notes"] = res.evidence or "No verified decision maker found."
             out_record["confidenceScore"] = 0
             out_record["confidence"] = "none"
+
+        enriched_results.append(out_record)
+        if delay > 0:
+            time.sleep(delay)
+
+    return {"status": "ok", "results": enriched_results}
+
+
+# =====================================================================
+# LeadOcean Phone & Email Contact Enricher
+# =====================================================================
+
+@app.get("/api/leadocean/config")
+def get_leadocean_config():
+    """Returns current LeadOcean API and endpoint configuration."""
+    load_dotenv(ROOT_DIR / ".env", override=True)
+    cfg = load_leadocean_config()
+    api_key = os.environ.get(cfg.get("api_key_env", "LEADOCEAN_API_KEY"), "") or os.environ.get("LEADOCEAN_API_KEY", "")
+    api_key = api_key.strip()
+    is_set = bool(api_key and not api_key.startswith("your_"))
+    masked = (api_key[:4] + "..." + api_key[-4:]) if is_set and len(api_key) > 8 else ("configured" if is_set else "missing")
+    return {
+        "status": "ok",
+        "hasApiKey": is_set,
+        "keyPreview": masked,
+        "url": cfg.get("url", "https://api.leadocean.io/v1/people/enrich"),
+        "method": cfg.get("method", "POST"),
+        "authName": cfg.get("auth_name", "x-api-key"),
+        "engine": "LeadOcean Email & Phone Enricher",
+    }
+
+
+@app.post("/api/leadocean/config")
+def update_leadocean_config(payload: UpdateLeadOceanConfigPayload):
+    """Updates LeadOcean config in leadocean_config.json and .env."""
+    cfg = load_leadocean_config()
+    if payload.url:
+        cfg["url"] = payload.url.strip()
+    if payload.authName:
+        cfg["auth_name"] = payload.authName.strip()
+
+    cfg_path = ROOT_DIR / "leadocean_config.json"
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+    if payload.apiKey:
+        clean_key = payload.apiKey.strip()
+        os.environ["LEADOCEAN_API_KEY"] = clean_key
+        env_file = ROOT_DIR / ".env"
+        lines = []
+        if env_file.exists():
+            lines = env_file.read_text(encoding="utf-8").splitlines()
+        found = False
+        new_lines = []
+        for line in lines:
+            if line.startswith("LEADOCEAN_API_KEY="):
+                new_lines.append(f"LEADOCEAN_API_KEY={clean_key}")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"LEADOCEAN_API_KEY={clean_key}")
+        env_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+    return {"status": "ok", "message": "LeadOcean settings updated successfully."}
+
+
+@app.post("/api/enrich/contacts")
+def enrich_contacts(payload: ContactEnrichPayload):
+    """
+    Enriches candidate records with verified Email, Phone, and Enrich Status
+    using LeadOcean API.
+    """
+    records = payload.records
+    if not records:
+        return {"status": "ok", "results": []}
+
+    load_dotenv(ROOT_DIR / ".env", override=True)
+    cfg = load_leadocean_config()
+    api_key = (payload.apiKey or os.environ.get("LEADOCEAN_API_KEY", "") or os.environ.get(cfg.get("api_key_env", ""), "")).strip()
+    delay = payload.delay or 0.3
+    overwrite = bool(payload.overwrite)
+
+    enricher = LeadOceanEnricher(api_key=api_key)
+    enriched_results: List[Dict[str, Any]] = []
+
+    for r in records:
+        # Check if already has email and overwrite is False
+        existing_email = r.get("email") or r.get("Email") or (r.get("customFields", {}) or {}).get("Email")
+        if existing_email and not overwrite:
+            enriched_results.append(dict(r))
+            continue
+
+        comp_name = (
+            r.get("companyName")
+            or r.get("Company")
+            or r.get("company")
+            or r.get("Company Name")
+            or r.get("Name")
+            or (r.get("customFields", {}) or {}).get("Company Name")
+            or (r.get("customFields", {}) or {}).get("Company")
+            or (r.get("customFields", {}) or {}).get("Name")
+            or ""
+        )
+        comp_site = (
+            r.get("companyWebsite")
+            or r.get("domain")
+            or r.get("Website")
+            or r.get("website")
+            or r.get("Company URL")
+            or (r.get("customFields", {}) or {}).get("Website")
+            or (r.get("customFields", {}) or {}).get("domain")
+            or ""
+        )
+        person_name = (
+            r.get("personName")
+            or r.get("decisionMakerName")
+            or r.get("Decision Maker Name")
+            or r.get("contactName")
+            or r.get("Full Name")
+            or r.get("name")
+            or (r.get("customFields", {}) or {}).get("Decision Maker Name")
+            or (r.get("customFields", {}) or {}).get("Full Name")
+            or (r.get("customFields", {}) or {}).get("name")
+            or ""
+        )
+        person_li = (
+            r.get("linkedinUrl")
+            or r.get("personalLinkedinUrl")
+            or r.get("decisionMakerLinkedin")
+            or r.get("Decision Maker Linkedin")
+            or r.get("Decision Maker LinkedIn")
+            or (r.get("customFields", {}) or {}).get("Decision Maker Linkedin")
+            or (r.get("customFields", {}) or {}).get("Decision Maker LinkedIn")
+            or ""
+        )
+
+        res = enricher.enrich_single(
+            company=str(comp_name).strip(),
+            website=str(comp_site).strip(),
+            name=str(person_name).strip(),
+            linkedin_url=str(person_li).strip(),
+            api_key=api_key,
+        )
+
+        out_record = dict(r)
+        if "customFields" not in out_record or not isinstance(out_record["customFields"], dict):
+            out_record["customFields"] = {}
+
+        if res.email:
+            out_record["email"] = res.email
+            out_record["emailStatus"] = "verified"
+            out_record["customFields"]["Email"] = res.email
+        if res.phone:
+            out_record["phone"] = res.phone
+            out_record["phoneType"] = "direct"
+            out_record["customFields"]["Phone"] = res.phone
+
+        out_record["customFields"]["Enrich Status"] = res.enrich_status
+
+        if res.enrich_status == "found":
+            out_record["enrichmentStatus"] = "enriched"
+            out_record["confidenceScore"] = 95
+            out_record["lastEnrichedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            out_record["notes"] = f"LeadOcean matched: {res.email} {res.phone}".strip()
+        elif res.enrich_status.startswith("error"):
+            out_record["enrichmentStatus"] = "error"
+            out_record["notes"] = res.raw_error or res.enrich_status
+        else:
+            out_record["enrichmentStatus"] = "not_found"
+            out_record["notes"] = res.raw_error or "No contact records found on LeadOcean."
 
         enriched_results.append(out_record)
         if delay > 0:

@@ -147,4 +147,7 @@ export interface AppSettings {
   geminiModel?: string;
   openAiApiKey?: string;
   openAiModel?: string;
+  serpApiKey?: string;
+  leadoceanApiKey?: string;
+  leadoceanEndpoint?: string;
 }

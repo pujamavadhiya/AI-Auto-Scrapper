@@ -311,6 +311,77 @@ export const Settings: React.FC = () => {
         </CardContent>
       </Card>
 
+      {/* LeadOcean Phone & Email Enricher Settings */}
+      <Card>
+        <CardHeader className="p-5 border-b border-slate-100">
+          <div className="flex items-center gap-2">
+            <Key className="w-4 h-4 text-emerald-600" />
+            <CardTitle className="text-base">LeadOcean Email & Phone Enrichment API</CardTitle>
+          </div>
+          <CardDescription className="text-xs">
+            Connect your LeadOcean API key to enrich leads with verified corporate emails and direct phone numbers.
+          </CardDescription>
+        </CardHeader>
+
+        <CardContent className="p-5 space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <label className="block text-xs font-semibold text-slate-800">
+                LeadOcean API Key
+              </label>
+              <input
+                type="password"
+                value={settings.leadoceanApiKey || ''}
+                onChange={(e) => {
+                  const key = e.target.value.trim();
+                  handleUpdate({ leadoceanApiKey: key });
+                  const apiBase = getApiBaseUrl();
+                  if (apiBase) {
+                    fetch(`${apiBase}/api/leadocean/config`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ apiKey: key }),
+                    }).catch(() => {});
+                  }
+                }}
+                placeholder="lo_live_..."
+                className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 bg-white"
+              />
+              <p className="text-[11px] text-slate-500">
+                Stored in <code className="bg-slate-100 px-1 py-0.5 rounded font-mono">.env</code> as <code className="bg-slate-100 px-1 py-0.5 rounded font-mono">LEADOCEAN_API_KEY</code>.
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block text-xs font-semibold text-slate-800">
+                LeadOcean Endpoint URL
+              </label>
+              <input
+                type="text"
+                value={settings.leadoceanEndpoint || 'https://api.leadocean.io/v1/people/enrich'}
+                onChange={(e) => {
+                  const url = e.target.value.trim();
+                  handleUpdate({ leadoceanEndpoint: url });
+                  const apiBase = getApiBaseUrl();
+                  if (apiBase) {
+                    fetch(`${apiBase}/api/leadocean/config`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ url }),
+                    }).catch(() => {});
+                  }
+                }}
+                placeholder="https://api.leadocean.io/v1/people/enrich"
+                className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 bg-white"
+              />
+              <p className="text-[11px] text-slate-500">
+                Configured in <code className="bg-slate-100 px-1 py-0.5 rounded font-mono">leadocean_config.json</code>.
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
       {/* 1. Simulation & Crawler Timing */}
       <Card>
         <CardHeader className="p-5 border-b border-slate-100">

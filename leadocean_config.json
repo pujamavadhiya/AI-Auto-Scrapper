@@ -1,0 +1,40 @@
+{
+  "_help": "Fill these in from your LeadOcean API docs. Values like {linkedin} are filled from each row.",
+  "url": "https://api.leadocean.io/v1/people/enrich",
+  "method": "POST",
+  "api_key_env": "LEADOCEAN_API_KEY",
+  "auth_in": "header",
+  "auth_name": "x-api-key",
+  "auth_prefix": "",
+  "request_map": {
+    "linkedin_url": "{linkedin}",
+    "full_name": "{name}",
+    "first_name": "{first_name}",
+    "last_name": "{last_name}",
+    "company": "{company}",
+    "domain": "{domain}",
+    "reveal_email": true,
+    "reveal_phone": true
+  },
+  "email_paths": [
+    "email",
+    "data.email",
+    "data.emails.0.email",
+    "result.email",
+    "emails.0",
+    "contact_data.emails.0.email",
+    "contact_data.personal_emails.0"
+  ],
+  "phone_paths": [
+    "phone",
+    "data.phone",
+    "data.phones.0.number",
+    "result.phone",
+    "phones.0",
+    "contact_data.phones.0.number",
+    "contact_data.direct_numbers.0"
+  ],
+  "timeout_seconds": 40,
+  "delay_seconds": 0.5,
+  "max_retries": 3
+}
