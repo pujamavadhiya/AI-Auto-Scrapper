@@ -1,18 +1,17 @@
 import { IResearchAdapter, ModuleMetadata } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
 import { getApiBaseUrl } from '../../config/api';
-import { storageService } from '../storageService';
 
 export class DecisionMakerAdapter implements IResearchAdapter {
   readonly metadata: ModuleMetadata = {
     id: 'decision-maker',
     name: 'Decision Maker Finder',
-    description: 'Pinpoints executive leadership (Founders, CEOs, Managing Directors, C-Suite) using company name, website, and company LinkedIn URL via OpenAI AI intelligence and web search dorks.',
-    badge: 'AI Decision Maker',
+    description: "Searches Google via SerpApi for LinkedIn profiles of the company's top people, picks the most senior verified executive matching the company, and extracts Name, Post, and LinkedIn URL.",
+    badge: 'SerpApi Engine',
     category: 'People Intelligence',
-    inputRequirements: ['Company Name', 'Company Website', 'Company LinkedIn URL'],
-    outputFields: ['Decision Maker Name', 'Exact Position / Job Title', 'Personal LinkedIn URL', 'Confidence Score', 'Enrichment Status'],
-    integrationNote: 'Uses OpenAI API synthesized with live corporate leadership pages and search dorking.',
+    inputRequirements: ['Company Name', 'Website (optional)', 'Company LinkedIn URL (optional)'],
+    outputFields: ['Decision Maker Name', 'Decision Maker Post', 'Decision Maker Linkedin', 'Decision Maker Confidence'],
+    integrationNote: 'Directly executes precision SerpApi Google dorking and hierarchical executive title ranking.',
   };
 
   async enrichSingle(record: EnrichmentRecord, config: ResearchConfig): Promise<EnrichmentRecord> {
@@ -33,14 +32,6 @@ export class DecisionMakerAdapter implements IResearchAdapter {
     const enrichedList: EnrichmentRecord[] = [];
     const startTime = Date.now();
     const batchSize = 1; // 1 record per batch for fast real-time feedback
-
-    const settings = storageService.getSettings();
-    const geminiKey = config.geminiApiKey || settings.geminiApiKey || '';
-    const geminiModel = config.geminiModel || settings.geminiModel || 'gemini-1.5-flash';
-    const openAiKey = config.openAiApiKey || settings.openAiApiKey || '';
-    const openAiModel = config.openAiModel || settings.openAiModel || 'gpt-4o-mini';
-
-    const activeModel = geminiKey || !openAiKey ? geminiModel : openAiModel;
 
     const apiBase = getApiBaseUrl();
     if (!apiBase) {
@@ -64,7 +55,7 @@ export class DecisionMakerAdapter implements IResearchAdapter {
         totalCount,
         percentage: Math.round(((i + 0.3) / totalCount) * 100),
         status: 'running',
-        stageMessage: `Investigating decision maker for "${displayName}"...`,
+        stageMessage: `Querying SerpApi Google LinkedIn registry for "${displayName}"...`,
         currentItemName: displayName,
         leadsFound: enrichedList.filter((r) => r.enrichmentStatus === 'enriched').length,
         leadsProcessed: i,
@@ -75,6 +66,7 @@ export class DecisionMakerAdapter implements IResearchAdapter {
         const payloadRecords = chunk.map((r) => {
           const compName =
             r.companyName ||
+            r.customFields?.['Name'] ||
             r.customFields?.['Company'] ||
             r.customFields?.['Company Name'] ||
             r.customFields?.['company'] ||
@@ -92,11 +84,10 @@ export class DecisionMakerAdapter implements IResearchAdapter {
 
           let compLi =
             r.companyLinkedinUrl ||
+            r.customFields?.['Linkedin'] ||
             r.customFields?.['Company Linkedin'] ||
             r.customFields?.['Company LinkedIn'] ||
             r.customFields?.['companyLinkedin'] ||
-            r.customFields?.['Company_Linkedin'] ||
-            r.customFields?.['Linkedin'] ||
             '';
 
           return {
@@ -114,11 +105,8 @@ export class DecisionMakerAdapter implements IResearchAdapter {
           },
           body: JSON.stringify({
             records: payloadRecords,
-            geminiKey: geminiKey || undefined,
-            openAiKey: openAiKey || undefined,
-            model: activeModel,
-            seniority: config.seniorityLevels || ['CEO', 'Founder', 'Owner', 'Managing Director', 'C-Level', 'VP'],
-            delay: 0.2,
+            maxQueries: 2,
+            delay: 0.5,
           }),
           signal,
         });
@@ -146,6 +134,10 @@ export class DecisionMakerAdapter implements IResearchAdapter {
             enrichmentStatus: enriched.enrichmentStatus || 'enriched',
             notes: enriched.notes || orig.notes,
             lastEnrichedAt: enriched.lastEnrichedAt || new Date().toISOString(),
+            customFields: {
+              ...(orig.customFields || {}),
+              ...(enriched.customFields || {}),
+            },
           };
         });
 

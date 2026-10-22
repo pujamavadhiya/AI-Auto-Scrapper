@@ -1,30 +1,52 @@
 #!/usr/bin/env python3
 """
-Decision Maker Finder Engine
-Finds verified decision makers (Founders, CEOs, C-Suite, Managing Directors, Owners)
-using Company Name, Company Website, and Company LinkedIn URL.
-Utilizes live web scraping of company leadership pages + targeted search dorks,
-synthesized and verified via OpenAI API.
+Decision Maker Finder  (SerpApi + Google Sheets / Web App)
+
+For every company row in your sheet or web table, it searches Google (through SerpApi)
+for LinkedIn profiles of the company's top people, picks the most senior one whose
+profile text actually mentions the company, and writes back:
+
+    Decision Maker Name | Decision Maker Post | Decision Maker Linkedin
+    (+ "Decision Maker Confidence" if that column exists in your sheet)
+
+Setup
+-----
+    pip install requests gspread openpyxl
+    export SERPAPI_KEY="your_key"            # or pass --serpapi-key
+    python backend/decision_maker_finder.py --creds service_account.json
+
+Useful flags
+    --limit 10        only process the first 10 pending rows (test first!)
+    --dry-run         don't write to the sheet, only print + save the CSV log
+    --max-queries 2   Google searches per company (each one costs 1 SerpApi credit)
+    --overwrite       also redo rows that already have a decision maker
+    --input file.xlsx run on a local Excel/CSV file instead of Google Sheets
+    --company "Acme"  test a single company directly in terminal
 """
 from __future__ import annotations
 
-import json
+import argparse
+import csv
 import logging
 import os
 import re
+import sys
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
 
 try:
-    from openai import OpenAI
+    from dotenv import load_dotenv
+    load_dotenv()
+    # Also load from parent or current directory .env if present
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
 except ImportError:
-    OpenAI = None
+    pass
 
 logger = logging.getLogger("decision_maker_finder")
 if not logger.handlers:
@@ -33,32 +55,227 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-DEFAULT_SENIORITY = [
-    "CEO",
-    "Founder",
-    "Co-Founder",
-    "Owner",
-    "President",
-    "Managing Director",
-    "Chief Executive Officer",
-    "Director",
-    "COO",
-    "CTO",
-    "VP",
+# --------------------------------------------------------------------------- #
+# CONFIG
+# --------------------------------------------------------------------------- #
+SPREADSHEET_ID = "1kdvZZKCaEVHfhTJxl9eoBkEMPaLdoaA1CT3UnNMa3zI"
+SHEET_GID = 917469084
+
+COL_COMPANY = "Name"                          # company name column
+COL_WEBSITE = "Website"                       # company website column
+COL_COMPANY_LI = "Linkedin"                   # company LinkedIn page column
+COL_DM_NAME = "Decision Maker Name"
+COL_DM_POST = "Decision Maker Post"
+COL_DM_LI = "Decision Maker Linkedin"
+COL_DM_CONF = "Decision Maker Confidence"     # optional; skipped if not in sheet
+
+SERPAPI_URL = "https://serpapi.com/search.json"
+
+# Most senior first. Lower index = better.
+TITLE_PRIORITY = [
+    ["owner", "co-owner", "founder", "co-founder", "cofounder"],
+    ["ceo", "chief executive", "president", "chief sumo"],
+    ["managing director", "general manager", "managing partner", "principal", "partner"],
+    ["chief operating", "coo", "chief financial", "cfo", "vice president", "vp"],
+    ["director", "head of", "chief"],
+    ["manager"],
 ]
 
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
+# Search groups (one Google query each, in order, stopping as soon as we have a confident hit)
+QUERY_GROUPS = [
+    '"Owner" OR "Founder" OR "CEO" OR "President" OR "Co-Founder"',
+    '"Managing Director" OR "General Manager" OR "Vice President" OR "Director" OR "Partner"',
+]
+
+COMPANY_SUFFIXES = {
+    "inc", "llc", "ltd", "co", "corp", "corporation", "company", "incorporated",
+    "limited", "lp", "llp", "plc", "the", "and", "of", "&",
 }
 
 
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def norm(text: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9 ]", " ", (text or "").lower())
+
+
+def company_tokens(company: str, company_li: str = "", website: str = "") -> Tuple[List[str], str, str]:
+    """Distinctive lowercase tokens that identify the company in a profile snippet."""
+    toks = [t for t in norm(company).split() if t not in COMPANY_SUFFIXES and len(t) > 1]
+    slug = ""
+    m = re.search(r"linkedin\.com/(?:company|showcase)/([^/?#]+)", company_li or "", re.I)
+    if m:
+        slug = m.group(1).replace("-", " ").lower()
+    domain = ""
+    if website:
+        d = re.sub(r"^https?://(www\.)?", "", str(website).strip().lower()).split("/")[0]
+        domain = d.split(".")[0]
+    return toks, slug.strip(), domain
+
+
+def company_match(text: str, company: str, company_li: str = "", website: str = "") -> float:
+    """Return a 0..1 score of how well the result text matches the company."""
+    t = norm(text)
+    toks, slug, domain = company_tokens(company, company_li, website)
+    full = " ".join(toks)
+    if full and full in t:
+        return 1.0
+    if slug and slug in t:
+        return 1.0
+    if domain and len(domain) > 3 and domain in t.replace(" ", ""):
+        return 0.8
+    if toks:
+        hit = sum(1 for tok in toks if re.search(r"\b" + re.escape(tok) + r"\b", t))
+        return hit / len(toks) if hit else 0.0
+    return 0.0
+
+
+def title_rank(title: Optional[str]) -> Optional[int]:
+    """Lower is more senior; None if no decision-maker keyword found."""
+    t = norm(title)
+    for rank, group in enumerate(TITLE_PRIORITY):
+        for kw in group:
+            if re.search(r"\b" + re.escape(norm(kw).strip()) + r"\b", t):
+                return rank
+    return None
+
+
+def clean_linkedin_url(url: Optional[str]) -> str:
+    m = re.match(r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/in/([^/?#]+)", str(url or ""), re.I)
+    return f"https://www.linkedin.com/in/{m.group(1)}" if m else ""
+
+
+def parse_profile(result: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Turn one organic Google result into {name, title, text, url} or None.
+    LinkedIn result titles look like:  'Jane Doe - Owner - Acme Tobacco | LinkedIn'"""
+    url = clean_linkedin_url(result.get("link", ""))
+    if not url:
+        return None
+    raw_title = re.sub(r"\s*[|·]\s*LinkedIn.*$", "", result.get("title", ""), flags=re.I).strip()
+    # Split by standard dashes or common headline delimiters / emojis
+    parts = re.split(r"\s+[-–—]\s+|(?<=\s)[|•·/](?=\s)|[⚡️👑🚀💼]\s*", raw_title)
+    name = re.sub(r",.*$", "", parts[0]).strip()              # drop ", MBA" style suffixes
+    name = re.sub(r"[^\w\s.'’-]", "", name).strip()
+
+    # If delimiter wasn't detected and name contains a title keyword, split them
+    job = parts[1].strip() if len(parts) > 1 else ""
+    if not job and len(name.split()) > 2:
+        m_title = re.search(r"\b(founder|co-founder|ceo|owner|director|president|partner|manager|chief|head of|vp|ex)\b", name, re.I)
+        if m_title and m_title.start() > 3:
+            job = name[m_title.start():].strip()
+            name = name[:m_title.start()].strip()
+
+    if not name or "linkedin member" in name.lower() or len(name.split()) < 2:
+        return None
+
+    snippet = result.get("snippet", "") or ""
+    if not job:                                                # fall back to snippet "Title at Company"
+        m = re.search(r"([^·.|]+?)\s+(?:at|@)\s+", snippet)
+        job = m.group(1).strip() if m else ""
+    return {"name": name, "title": job, "text": f"{raw_title} {snippet}", "url": url}
+
+
+# --------------------------------------------------------------------------- #
+# SerpApi
+# --------------------------------------------------------------------------- #
+_SEARCH_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def serp_search(query: str, api_key: str, num: int = 10, retries: int = 2) -> List[Dict[str, Any]]:
+    cache_key = f"{query.strip()}:{api_key[:6]}"
+    if cache_key in _SEARCH_CACHE:
+        return _SEARCH_CACHE[cache_key]
+
+    params = {
+        "engine": "google",
+        "q": query,
+        "num": num,
+        "api_key": api_key,
+        "hl": "en",
+        "gl": "us",
+    }
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(SERPAPI_URL, params=params, timeout=40)
+            data = r.json()
+            if r.status_code == 200 and "error" not in data:
+                results = data.get("organic_results", [])
+                _SEARCH_CACHE[cache_key] = results
+                return results
+            err = data.get("error", f"HTTP {r.status_code}")
+            if "no results" in str(err).lower():
+                _SEARCH_CACHE[cache_key] = []
+                return []
+            if r.status_code in (401, 403) or "invalid api key" in str(err).lower():
+                logger.error(f"SerpApi auth error: {err}")
+                return []
+            if "run out of searches" in str(err).lower():
+                logger.error("SerpApi: out of search credits.")
+                return []
+            logger.warning(f"    SerpApi error: {err} (attempt {attempt + 1})")
+        except requests.RequestException as e:
+            logger.warning(f"    network error: {e} (attempt {attempt + 1})")
+        time.sleep(2 * (attempt + 1))
+    return []
+
+
+def find_decision_maker(
+    company: str,
+    website: str = "",
+    company_li: str = "",
+    api_key: Optional[str] = None,
+    max_queries: int = 2,
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns dict(name, title, url, confidence) or None.
+    Uses user's precision SerpApi search groups, seniority rank, and company matching.
+    """
+    key = (api_key or os.environ.get("SERPAPI_KEY", "")).strip()
+    if not key or not company:
+        return None
+
+    best = None
+    for group in QUERY_GROUPS[:max_queries]:
+        # Enclose group in parentheses to ensure boolean OR groups correctly in Google search
+        query = f'site:linkedin.com/in ({group}) "{company}"'
+        for res in serp_search(query, key):
+            prof = parse_profile(res)
+            if not prof:
+                continue
+            match = company_match(prof["text"], company, company_li, website)
+            rank = title_rank(prof["title"] or prof["text"])
+            if rank is None or match < 0.5:
+                continue
+
+            # Prioritize current role matching company over former/ex roles
+            is_job_match = company_match(prof["title"], company, company_li, website) >= 0.8
+            is_former = bool(re.search(r"\b(?:ex|former)\b", prof["text"].lower()))
+            tier = 0 if (is_job_match and not is_former) else (2 if is_former else 1)
+
+            # Lower sort key = better: tier first, then seniority rank, then company match
+            key_tuple = (tier, rank, -match)
+            if best is None or key_tuple < best["key"]:
+                best = {**prof, "key": key_tuple, "match": match, "rank": rank, "tier": tier}
+
+        # Stop early if we have a top tier (tier 0) senior + well-matched hit
+        if best and best["tier"] == 0 and best["rank"] <= 1 and best["match"] >= 0.8:
+            break
+
+    if not best:
+        return None
+    confidence = "high" if best["match"] >= 0.8 and best["rank"] <= 2 else "medium"
+    return {
+        "name": best["name"],
+        "title": best["title"],
+        "url": best["url"],
+        "confidence": confidence,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Dataclass & Class Wrapper for FastAPI Server / Web Application
+# --------------------------------------------------------------------------- #
 @dataclass
 class DecisionMakerResult:
     company_name: str
@@ -67,6 +284,7 @@ class DecisionMakerResult:
     decision_maker_name: str = ""
     position: str = ""
     personal_linkedin_url: str = ""
+    confidence: str = "none"  # "high" | "medium" | "none"
     confidence_score: int = 0
     evidence: str = ""
     status: str = "not_found"  # "enriched" | "not_found" | "error"
@@ -80,6 +298,7 @@ class DecisionMakerResult:
             "decision_maker_name": self.decision_maker_name,
             "position": self.position,
             "personal_linkedin_url": self.personal_linkedin_url,
+            "confidence": self.confidence,
             "confidence_score": self.confidence_score,
             "evidence": self.evidence,
             "status": self.status,
@@ -87,699 +306,254 @@ class DecisionMakerResult:
         }
 
 
-def clean_url(url: Optional[str]) -> str:
-    """Normalizes URL with https protocol."""
-    if not url:
-        return ""
-    u = str(url).strip()
-    if not u or u.lower() in ("nan", "none", "null", "-"):
-        return ""
-    u = re.sub(r"^(https?:\/\/)+", "https://", u, flags=re.IGNORECASE)
-    if not u.startswith("http://") and not u.startswith("https://"):
-        u = "https://" + u.lstrip("/")
-    return u.rstrip("/")
-
-
-def extract_domain(url: str) -> str:
-    try:
-        parsed = urlparse(clean_url(url))
-        domain = parsed.netloc.lower()
-        if domain.startswith("www."):
-            domain = domain[4:]
-        return domain
-    except Exception:
-        return ""
-
-
-def extract_linkedin_company_slug(url: str) -> str:
-    """Extracts company slug from a LinkedIn company URL."""
-    if not url:
-        return ""
-    clean = clean_url(url).lower()
-    m = re.search(r"linkedin\.com/(?:company|school)/([^/?#]+)", clean)
-    if m:
-        return m.group(1).strip()
-    return ""
-
-
-def clean_linkedin_personal_url(url: str) -> str:
-    """Normalizes a LinkedIn personal profile URL."""
-    if not url:
-        return ""
-    clean = clean_url(url)
-    m = re.search(r"linkedin\.com/in/([^/?#]+)", clean, re.IGNORECASE)
-    if m:
-        slug = m.group(1).strip()
-        return f"https://www.linkedin.com/in/{slug}"
-    return ""
-
-
 class DecisionMakerFinder:
-    def __init__(
-        self,
-        gemini_api_key: Optional[str] = None,
-        openai_api_key: Optional[str] = None,
-        default_model: str = "gemini-1.5-flash",
-    ):
-        self.gemini_api_key = (gemini_api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
-        self.openai_api_key = (openai_api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
-        self.default_model = default_model or "gemini-1.5-flash"
-        self.session = requests.Session()
-        self.session.headers.update(BROWSER_HEADERS)
-
-    def scrape_website_leadership(self, website: str) -> Dict[str, Any]:
-        """
-        Scrapes company website for leadership, founder, and executive information.
-        Checks homepage and common leadership sub-pages (/about, /team, /leadership, etc.).
-        """
-        info: Dict[str, Any] = {
-            "meta_description": "",
-            "leadership_snippets": [],
-            "personal_linkedin_links": [],
-        }
-
-        base_url = clean_url(website)
-        if not base_url:
-            return info
-
-        parsed = urlparse(base_url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-
-        candidate_paths = [
-            "",
-            "/about",
-            "/about-us",
-            "/team",
-            "/our-team",
-            "/leadership",
-            "/management",
-            "/company",
-        ]
-
-        visited: set[str] = set()
-
-        for path in candidate_paths:
-            target = f"{origin}{path}"
-            if target in visited:
-                continue
-            visited.add(target)
-
-            try:
-                resp = self.session.get(target, timeout=5, allow_redirects=True)
-                if resp.status_code != 200 or not resp.text:
-                    continue
-
-                soup = BeautifulSoup(resp.text, "html.parser")
-
-                # Grab meta description on first page
-                if not info["meta_description"]:
-                    meta = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
-                    if meta and meta.get("content"):
-                        info["meta_description"] = meta.get("content", "").strip()[:400]
-
-                # Look for personal LinkedIn links on the page
-                for a in soup.find_all("a", href=True):
-                    href = a.get("href", "")
-                    if "linkedin.com/in/" in href.lower():
-                        cleaned_li = clean_linkedin_personal_url(href)
-                        if cleaned_li and cleaned_li not in info["personal_linkedin_links"]:
-                            anchor_text = a.get_text(separator=" ", strip=True)
-                            parent_text = a.parent.get_text(separator=" ", strip=True) if a.parent else ""
-                            context_snippet = (anchor_text or parent_text)[:120]
-                            info["personal_linkedin_links"].append({
-                                "url": cleaned_li,
-                                "context": context_snippet,
-                            })
-
-                # Look for headings and paragraphs containing leadership keywords
-                keywords_pattern = re.compile(
-                    r"\b(founder|co-founder|ceo|chief executive|owner|president|managing director|director|cto|coo|leadership|executive)\b",
-                    re.IGNORECASE,
-                )
-
-                elements = soup.find_all(["h1", "h2", "h3", "h4", "p", "div", "span"], limit=200)
-                for el in elements:
-                    text = el.get_text(separator=" ", strip=True)
-                    if 20 <= len(text) <= 300 and keywords_pattern.search(text):
-                        if text not in info["leadership_snippets"]:
-                            info["leadership_snippets"].append(text)
-                            if len(info["leadership_snippets"]) >= 10:
-                                break
-
-                # If we found strong leadership snippets or team links, we don't need to check every subpath
-                if len(info["personal_linkedin_links"]) >= 2 or len(info["leadership_snippets"]) >= 5:
-                    break
-
-            except Exception as e:
-                logger.debug(f"Error scraping {target}: {e}")
-                continue
-
-        return info
-
-    def search_candidates(
-        self,
-        company_name: str,
-        company_website: str,
-        company_linkedin_url: str,
-        target_seniority: Optional[List[str]] = None,
-    ) -> List[Dict[str, str]]:
-        """
-        Executes precision search dorks across Bing, Yahoo, and DDG to identify
-        real executive candidates and their LinkedIn URLs.
-        """
-        snippets: List[Dict[str, str]] = []
-        if not company_name and not company_website and not company_linkedin_url:
-            return snippets
-
-        clean_name = re.sub(r'[,.\'"()]', " ", company_name).strip() if company_name else ""
-        slug = extract_linkedin_company_slug(company_linkedin_url)
-        domain = extract_domain(company_website)
-
-        target_name = clean_name or slug or domain
-
-        roles_list = target_seniority if target_seniority and len(target_seniority) > 0 else ["CEO", "Founder", "Owner", "President", "Managing Director"]
-        roles_term = " OR ".join([f'"{r}"' if " " in r else r for r in roles_list[:4]])
-
-        queries: List[str] = [
-            f'site:linkedin.com/in "{target_name}" ({roles_term})',
-            f'site:linkedin.com/in "{target_name}" "CEO"',
-            f'site:linkedin.com/in "{target_name}" "Founder"',
-            f'site:linkedin.com/in "{target_name}"',
-        ]
-
-        if slug and slug.lower() != target_name.lower():
-            queries.append(f'site:linkedin.com/in "{slug}" ({roles_term})')
-
-        try:
-            import backend.linkedin_profile_collector as lpc
-        except ImportError:
-            try:
-                import linkedin_profile_collector as lpc
-            except ImportError:
-                lpc = None
-
-        seen_urls = set()
-
-        for q in queries:
-            if len(snippets) >= 8:
-                break
-            try:
-                if lpc and hasattr(lpc, "run_search"):
-                    raw_results = lpc.run_search(q, 1, ['bing', 'yahoo', 'ddg'])
-                    if raw_results:
-                        for r in raw_results:
-                            title = r.get("title", "")
-                            body = r.get("snippet", "")
-                            url = r.get("url", "")
-                            li_url = clean_linkedin_personal_url(url)
-                            item_key = li_url or title
-                            if item_key not in seen_urls:
-                                seen_urls.add(item_key)
-                                snippets.append({
-                                    "title": title,
-                                    "snippet": body,
-                                    "url": li_url or url,
-                                })
-                        if len(snippets) >= 5:
-                            break
-                else:
-                    with DDGS() as ddgs:
-                        res = list(ddgs.text(q, max_results=6))
-                        for r in res:
-                            title = r.get("title", "")
-                            body = r.get("body", "")
-                            url = r.get("href", "")
-                            li_url = clean_linkedin_personal_url(url)
-                            item_key = li_url or title
-                            if item_key not in seen_urls:
-                                seen_urls.add(item_key)
-                                snippets.append({
-                                    "title": title,
-                                    "snippet": body,
-                                    "url": li_url or url,
-                                })
-            except Exception as e:
-                logger.debug(f"Search query failed for '{q}': {e}")
-                continue
-
-        return snippets
-
-    def query_gemini(
-        self,
-        company_name: str,
-        company_website: str,
-        company_linkedin_url: str,
-        website_info: Dict[str, Any],
-        search_snippets: List[Dict[str, str]],
-        target_seniority: Optional[List[str]] = None,
-        api_key_override: Optional[str] = None,
-        model_override: Optional[str] = None,
-    ) -> Tuple[Dict[str, Any], Optional[str]]:
-        """
-        Sends the company intelligence and search facts to Google Gemini API for decision maker extraction.
-        Works seamlessly with free tier Google AI Studio Gemini API keys.
-        Returns (parsed_json_dict, error_string).
-        """
-        key = (api_key_override or self.gemini_api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
-        if not key:
-            return {}, "Gemini API Key is missing. Please provide your Google Gemini API key in Settings or request."
-
-        model = model_override or "gemini-1.5-flash"
-        if not model.startswith("gemini-"):
-            model = "gemini-1.5-flash"
-
-        roles = target_seniority or DEFAULT_SENIORITY
-
-        context_parts = [
-            "TARGET COMPANY PROFILE:",
-            f"- Company Name: {company_name}",
-            f"- Company Website: {company_website or 'Not specified'}",
-            f"- Company LinkedIn URL: {company_linkedin_url or 'Not specified'}",
-            f"- Target Roles / Seniority: {', '.join(roles)}",
-            "",
-            "VERIFIED EVIDENCE COLLECTED FROM WEB & LINKEDIN:",
-        ]
-
-        if website_info.get("meta_description"):
-            context_parts.append(f"Website Meta: {website_info['meta_description']}")
-
-        if website_info.get("personal_linkedin_links"):
-            context_parts.append("Found Executives on Website:")
-            for item in website_info["personal_linkedin_links"][:4]:
-                context_parts.append(f"  • {item['context']} -> {item['url']}")
-
-        if website_info.get("leadership_snippets"):
-            context_parts.append("Leadership Mention Snippets from Website:")
-            for s in website_info["leadership_snippets"][:5]:
-                context_parts.append(f"  • {s}")
-
-        if search_snippets:
-            context_parts.append("Search Engine & LinkedIn Results:")
-            for s in search_snippets[:8]:
-                context_parts.append(f"  • Title: {s['title']}")
-                context_parts.append(f"    Snippet: {s['snippet']}")
-                if s["url"]:
-                    context_parts.append(f"    URL: {s['url']}")
-
-        prompt_content = "\n".join(context_parts)
-
-        system_instruction = (
-            "You are an expert executive intelligence researcher.\n"
-            "Your task is to identify the primary decision maker (CEO, Founder, Co-Founder, Owner, "
-            "President, Managing Director, or matching requested seniority) for the target company.\n"
-            "Use the provided real search snippets, website leadership excerpts, and verified corporate facts.\n"
-            "STRICT RULES:\n"
-            "1. Output valid JSON only, matching this exact schema:\n"
-            "   {\n"
-            '     "decision_maker_name": "Full Name",\n'
-            '     "position": "Exact Current Job Title / Position",\n'
-            '     "personal_linkedin_url": "https://www.linkedin.com/in/... or empty",\n'
-            '     "confidence_score": 90,\n'
-            '     "evidence": "Brief 1-2 sentence explanation of how this person was verified",\n'
-            '     "is_found": true\n'
-            "   }\n"
-            "2. If no legitimate decision maker can be identified or verified with reasonable confidence, return:\n"
-            '   {"decision_maker_name": "", "position": "", "personal_linkedin_url": "", "confidence_score": 0, "evidence": "Could not verify decision maker", "is_found": false}\n'
-            "3. Do NOT make up fake or generic names. The name must be an actual individual associated with this company.\n"
-            "4. Ensure personal_linkedin_url is a personal LinkedIn URL (/in/...), NOT a company URL (/company/)."
-        )
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": f"{system_instruction}\n\n{prompt_content}"}]
-                }
-            ],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.1
-            }
-        }
-
-        try:
-            resp = self.session.post(url, json=payload, timeout=20)
-            if resp.status_code != 200:
-                return {}, f"Gemini API Error ({resp.status_code}): {resp.text[:250]}"
-
-            data = resp.json()
-            if "error" in data:
-                return {}, f"Gemini Error: {data['error'].get('message', str(data['error']))}"
-
-            candidates = data.get("candidates", [])
-            if not candidates:
-                return {}, "Gemini returned no response candidates."
-
-            raw_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
-            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text.strip(), flags=re.I)
-            raw_text = re.sub(r"\s*```$", "", raw_text.strip())
-
-            parsed = json.loads(raw_text)
-            return parsed, None
-        except Exception as e:
-            logger.error(f"Gemini API call failed: {e}")
-            return {}, f"Gemini Error: {str(e)}"
-
-    def query_openai(
-        self,
-        company_name: str,
-        company_website: str,
-        company_linkedin_url: str,
-        website_info: Dict[str, Any],
-        search_snippets: List[Dict[str, str]],
-        target_seniority: Optional[List[str]] = None,
-        api_key_override: Optional[str] = None,
-        model_override: Optional[str] = None,
-    ) -> Tuple[Dict[str, Any], Optional[str]]:
-        """
-        Sends the company intelligence and search facts to OpenAI for decision maker extraction.
-        Returns (parsed_json_dict, error_string).
-        """
-        key = (api_key_override or self.openai_api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
-        if not key:
-            return {}, "OpenAI API Key is missing. Please provide your OpenAI API key in Settings or request."
-
-        if OpenAI is None:
-            return {}, "OpenAI Python library is not installed."
-
-        model = model_override or self.default_model or "gpt-4o-mini"
-        roles = target_seniority or DEFAULT_SENIORITY
-
-        # Prepare context payload
-        context_parts = [
-            f"TARGET COMPANY PROFILE:",
-            f"- Company Name: {company_name}",
-            f"- Company Website: {company_website or 'Not specified'}",
-            f"- Company LinkedIn URL: {company_linkedin_url or 'Not specified'}",
-            f"- Target Roles / Seniority: {', '.join(roles)}",
-            "",
-            "VERIFIED EVIDENCE COLLECTED FROM WEB & LINKEDIN:",
-        ]
-
-        if website_info.get("meta_description"):
-            context_parts.append(f"Website Meta: {website_info['meta_description']}")
-
-        if website_info.get("personal_linkedin_links"):
-            context_parts.append("Found Executives on Website:")
-            for item in website_info["personal_linkedin_links"][:4]:
-                context_parts.append(f"  • {item['context']} -> {item['url']}")
-
-        if website_info.get("leadership_snippets"):
-            context_parts.append("Leadership Mention Snippets from Website:")
-            for s in website_info["leadership_snippets"][:5]:
-                context_parts.append(f"  • {s}")
-
-        if search_snippets:
-            context_parts.append("Search Engine & LinkedIn Results:")
-            for s in search_snippets[:8]:
-                context_parts.append(f"  • Title: {s['title']}")
-                context_parts.append(f"    Snippet: {s['snippet']}")
-                if s["url"]:
-                    context_parts.append(f"    URL: {s['url']}")
-
-        prompt_content = "\n".join(context_parts)
-
-        system_instruction = (
-            "You are a master corporate intelligence researcher.\n"
-            "Your task is to identify the primary decision maker (CEO, Founder, Co-Founder, Owner, "
-            "President, Managing Director, or matching requested seniority) for the target company.\n"
-            "Use the provided real search snippets, website leadership excerpts, and your verified knowledge.\n"
-            "STRICT RULES:\n"
-            "1. Output valid JSON only, matching this exact schema:\n"
-            "   {\n"
-            '     "decision_maker_name": "Full Name",\n'
-            '     "position": "Exact Current Job Title / Position",\n'
-            '     "personal_linkedin_url": "https://www.linkedin.com/in/... or empty",\n'
-            '     "confidence_score": 90,\n'
-            '     "evidence": "Brief 1-2 sentence explanation of how this person was verified",\n'
-            '     "is_found": true\n'
-            "   }\n"
-            "2. If no legitimate decision maker can be identified or verified with at least 50% confidence, return:\n"
-            '   {"decision_maker_name": "", "position": "", "personal_linkedin_url": "", "confidence_score": 0, "evidence": "Could not verify decision maker", "is_found": false}\n'
-            "3. Do NOT make up fake or generic names. The name must be an actual individual associated with this company.\n"
-            "4. Ensure personal_linkedin_url is a personal LinkedIn URL (/in/...), NOT a company URL (/company/)."
-        )
-
-        try:
-            client = OpenAI(api_key=key)
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": prompt_content},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.1,
-            )
-            raw_content = response.choices[0].message.content or "{}"
-            parsed = json.loads(raw_content)
-            return parsed, None
-        except Exception as e:
-            logger.error(f"OpenAI API call failed: {e}")
-            return {}, f"OpenAI Error: {str(e)}"
-
-    def heuristic_fallback(
-        self,
-        company_name: str,
-        website_info: Dict[str, Any],
-        search_snippets: List[Dict[str, str]],
-        target_seniority: Optional[List[str]] = None,
-    ) -> DecisionMakerResult:
-        """
-        Fast heuristic extractor used if OpenAI key is not provided or fails.
-        Extracts candidate names and titles from regex patterns in search snippets & site text.
-        """
-        res = DecisionMakerResult(company_name=company_name)
-
-        # 1. Check if website has direct executive LinkedIn links
-        for item in website_info.get("personal_linkedin_links", []):
-            ctx = item.get("context", "")
-            url = item.get("url", "")
-            m = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[-–|,:]\s*([A-Za-z\s&]+)", ctx)
-            if m:
-                res.decision_maker_name = m.group(1).strip()
-                res.position = m.group(2).strip()
-                res.personal_linkedin_url = url
-                res.confidence_score = 85
-                res.evidence = f"Extracted from company website leadership link ({ctx})"
-                res.status = "enriched"
-                return res
-
-        # 2. Check search snippets with standard LinkedIn title pattern
-        # e.g.: "Noah Kagan - Chief Sumo at AppSumo .com | LinkedIn"
-        title_pattern = re.compile(
-            r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[-–|]\s*(?:([^–|-]+?)(?:[-–|]|$))",
-            re.UNICODE,
-        )
-
-        clean_cname = company_name.strip().lower()
-
-        # Pass 1: candidates where company name appears in title or snippet
-        for s in search_snippets:
-            title = s.get("title", "")
-            snippet = s.get("snippet", "")
-            url = s.get("url", "")
-            full_text = f"{title} {snippet}".lower()
-
-            if clean_cname and clean_cname not in full_text:
-                continue
-
-            m = title_pattern.search(title)
-            if m:
-                candidate_name = m.group(1).strip()
-                candidate_title = m.group(2).strip()
-
-                if candidate_name.lower() in ("linkedin", "home", "about", "top", "best", "the"):
-                    continue
-
-                if re.search(r"\b(CEO|Founder|Owner|President|Director|Managing|Chief|VP)\b", candidate_title, re.I):
-                    res.decision_maker_name = candidate_name
-                    res.position = candidate_title
-                    res.personal_linkedin_url = clean_linkedin_personal_url(url)
-                    res.confidence_score = 80
-                    res.evidence = f"Extracted from verified company LinkedIn match: '{title}'"
-                    res.status = "enriched"
-                    return res
-
-        # Pass 2: any executive pattern if pass 1 didn't find anything
-        for s in search_snippets:
-            title = s.get("title", "")
-            url = s.get("url", "")
-            m = title_pattern.search(title)
-            if m:
-                candidate_name = m.group(1).strip()
-                candidate_title = m.group(2).strip()
-                if candidate_name.lower() in ("linkedin", "home", "about", "top", "best", "the"):
-                    continue
-                if re.search(r"\b(CEO|Founder|Owner|President|Director|Managing|Chief|VP)\b", candidate_title, re.I):
-                    res.decision_maker_name = candidate_name
-                    res.position = candidate_title
-                    res.personal_linkedin_url = clean_linkedin_personal_url(url)
-                    res.confidence_score = 65
-                    res.evidence = f"Extracted from LinkedIn candidate result: '{title}'"
-                    res.status = "enriched"
-                    return res
-
-        res.status = "not_found"
-        res.evidence = "No verified decision maker found matching criteria"
-        return res
+    def __init__(self, serpapi_key: Optional[str] = None):
+        self.serpapi_key = (serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
 
     def find_decision_maker(
         self,
-        company_name: str,
-        company_website: str = "",
-        company_linkedin_url: str = "",
-        target_seniority: Optional[List[str]] = None,
-        gemini_api_key: Optional[str] = None,
-        openai_api_key: Optional[str] = None,
-        model: Optional[str] = None,
+        company: str,
+        website: str = "",
+        company_li: str = "",
+        api_key: Optional[str] = None,
+        max_queries: int = 2,
     ) -> DecisionMakerResult:
-        """
-        Orchestrates full decision maker enrichment for a single company:
-          1. Normalizes company website & LinkedIn URL.
-          2. Scrapes website leadership pages and extracts embedded executive profiles.
-          3. Searches live search engines for executive LinkedIn snippets.
-          4. Uses Google Gemini (or OpenAI) to verify, reason, and extract exact Name, Position, and LinkedIn.
-          5. Falls back to heuristic parsing if AI key is unavailable.
-        """
-        company_clean = (company_name or "").strip()
-        web_clean = clean_url(company_website)
-        li_clean = clean_url(company_linkedin_url)
+        key = (api_key or self.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
+        comp = (company or "").strip()
+        web = (website or "").strip()
+        li = (company_li or "").strip()
 
-        if not company_clean and not web_clean and not li_clean:
+        if not comp:
             return DecisionMakerResult(
-                company_name=company_clean,
+                company_name=comp,
                 status="error",
-                error_message="Company name, website, or LinkedIn URL is required.",
+                error_message="Company name is required.",
             )
 
-        logger.info(f"Finding decision maker for: '{company_clean}' (Site: '{web_clean}', LI: '{li_clean}')")
+        if not key:
+            return DecisionMakerResult(
+                company_name=comp,
+                status="error",
+                error_message="SERPAPI_KEY is missing. Please configure SERPAPI_KEY in .env or Settings.",
+            )
 
-        # Step 1: Scrape website leadership
-        website_info: Dict[str, Any] = {}
-        if web_clean:
+        dm = find_decision_maker(comp, web, li, key, max_queries)
+        if not dm:
+            return DecisionMakerResult(
+                company_name=comp,
+                company_website=web,
+                company_linkedin_url=li,
+                confidence="none",
+                confidence_score=0,
+                evidence="No verified decision maker match found on Google/LinkedIn.",
+                status="not_found",
+            )
+
+        conf = dm.get("confidence", "medium")
+        conf_score = 95 if conf == "high" else 80
+
+        return DecisionMakerResult(
+            company_name=comp,
+            company_website=web,
+            company_linkedin_url=li,
+            decision_maker_name=dm.get("name", ""),
+            position=dm.get("title", ""),
+            personal_linkedin_url=dm.get("url", ""),
+            confidence=conf,
+            confidence_score=conf_score,
+            evidence=f"Matched via SerpApi: {dm.get('name')} ({dm.get('title')}) with {conf} confidence.",
+            status="enriched",
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Google Sheets
+# --------------------------------------------------------------------------- #
+def open_sheet(creds_path: str, spreadsheet_id: str = SPREADSHEET_ID, gid: int = SHEET_GID):
+    import gspread
+    gc = gspread.service_account(filename=creds_path)
+    return gc.open_by_key(spreadsheet_id).get_worksheet_by_id(gid)
+
+
+def read_rows(ws) -> Tuple[List[str], List[Dict[str, Any]]]:
+    values = ws.get_all_values()
+    if not values:
+        return [], []
+    header = values[0]
+    rows = []
+    for idx, vals in enumerate(values[1:], start=2):
+        vals = vals + [""] * (len(header) - len(vals))
+        row = dict(zip(header, vals))
+        row["row_number"] = idx
+        rows.append(row)
+    return header, rows
+
+
+def write_row(ws, header: List[str], row_number: int, values: Dict[str, Any]):
+    import gspread
+    cells = [
+        gspread.Cell(row_number, header.index(col) + 1, val)
+        for col, val in values.items()
+        if col in header
+    ]
+    if cells:
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
+
+
+# --------------------------------------------------------------------------- #
+# Main CLI
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description="Find company decision makers + LinkedIn URLs via SerpApi.")
+    ap.add_argument("--creds", help="Google service-account JSON key (for Google Sheets)")
+    ap.add_argument("--input", help="Local CSV or Excel file to process")
+    ap.add_argument("--company", help="Single company name to test directly")
+    ap.add_argument("--website", default="", help="Company website for --company test")
+    ap.add_argument("--linkedin", default="", help="Company LinkedIn URL for --company test")
+    ap.add_argument("--serpapi-key", default=os.getenv("SERPAPI_KEY"), help="SerpApi key (or env SERPAPI_KEY)")
+    ap.add_argument("--limit", type=int, default=0, help="max rows to process (0 = all)")
+    ap.add_argument("--max-queries", type=int, default=2, choices=[1, 2], help="searches per company")
+    ap.add_argument("--delay", type=float, default=1.0, help="seconds between companies")
+    ap.add_argument("--overwrite", action="store_true", help="redo rows that already have a decision maker")
+    ap.add_argument("--dry-run", action="store_true", help="don't write to the sheet")
+    ap.add_argument("--log", default="decision_makers_log.csv", help="CSV log path")
+    args = ap.parse_args()
+
+    api_key = (args.serpapi_key or os.getenv("SERPAPI_KEY", "")).strip()
+    if not api_key:
+        sys.exit("Provide a SerpApi key via --serpapi-key or SERPAPI_KEY env var.")
+
+    # 1. Single company mode
+    if args.company:
+        print(f"Finding decision maker for '{args.company}'...")
+        dm = find_decision_maker(args.company, args.website, args.linkedin, api_key, args.max_queries)
+        if dm:
+            print(f"FOUND: {dm['name']} | {dm['title']} | {dm['url']} ({dm['confidence']} confidence)")
+        else:
+            print("No confident decision maker found.")
+        return
+
+    # 2. Local CSV / Excel mode
+    if args.input:
+        in_path = Path(args.input)
+        if not in_path.exists():
+            sys.exit(f"Input file not found: {in_path}")
+        rows: List[Dict[str, str]] = []
+        if in_path.suffix.lower() == ".csv":
+            with open(in_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+        else:
             try:
-                website_info = self.scrape_website_leadership(web_clean)
+                import openpyxl
+                wb = openpyxl.load_workbook(in_path)
+                ws = wb.active
+                data = list(ws.iter_rows(values_only=True))
+                header = [str(c or "").strip() for c in data[0]]
+                for r_vals in data[1:]:
+                    row_dict = {header[i]: str(r_vals[i] or "").strip() for i in range(min(len(header), len(r_vals)))}
+                    rows.append(row_dict)
             except Exception as e:
-                logger.debug(f"Website scraping failed for {web_clean}: {e}")
+                sys.exit(f"Failed to read Excel file: {e}")
 
-        # Step 2: Live Search & LinkedIn Dorking
-        search_snippets = self.search_candidates(
-            company_name=company_clean,
-            company_website=web_clean,
-            company_linkedin_url=li_clean,
-            target_seniority=target_seniority,
+        todo = [r for r in rows if r.get(COL_COMPANY, "").strip() and (args.overwrite or not r.get(COL_DM_LI, "").strip())]
+        if args.limit:
+            todo = todo[:args.limit]
+        print(f"{len(todo)} companies to process from {in_path.name}")
+
+        log, found = [], 0
+        for i, r in enumerate(todo, 1):
+            company = r.get(COL_COMPANY, "").strip()
+            dm = find_decision_maker(company, r.get(COL_WEBSITE, ""), r.get(COL_COMPANY_LI, ""), api_key, args.max_queries)
+            if dm:
+                found += 1
+                print(f"[{i}/{len(todo)}] {company}: {dm['name']} | {dm['title']} | {dm['url']} ({dm['confidence']})")
+                r[COL_DM_NAME] = dm["name"]
+                r[COL_DM_POST] = dm["title"]
+                r[COL_DM_LI] = dm["url"]
+                r[COL_DM_CONF] = dm["confidence"]
+            else:
+                print(f"[{i}/{len(todo)}] {company}: no confident match")
+            log.append({
+                "company": company,
+                "name": dm["name"] if dm else "",
+                "title": dm["title"] if dm else "",
+                "linkedin": dm["url"] if dm else "",
+                "confidence": dm["confidence"] if dm else "",
+            })
+            time.sleep(args.delay)
+
+        if log:
+            with open(args.log, "w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(log[0].keys()))
+                w.writeheader()
+                w.writerows(log)
+        print(f"Done. {found}/{len(todo)} found. Log: {args.log}")
+        return
+
+    # 3. Google Sheets mode (default if --creds provided)
+    if not args.creds:
+        sys.exit("Please provide --creds service_account.json, or --input file.xlsx, or --company 'Acme'.")
+
+    ws = open_sheet(args.creds)
+    header, rows = read_rows(ws)
+    for col in (COL_COMPANY, COL_DM_NAME, COL_DM_LI):
+        if col not in header:
+            sys.exit(f"Column '{col}' not found in sheet. Found: {header}")
+
+    todo = [
+        r for r in rows
+        if r.get(COL_COMPANY, "").strip()
+        and (args.overwrite or not r.get(COL_DM_LI, "").strip())
+    ]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"{len(todo)} companies to process from Google Sheet")
+
+    log, found = [], 0
+    for i, r in enumerate(todo, 1):
+        company = r[COL_COMPANY].strip()
+        dm = find_decision_maker(
+            company,
+            r.get(COL_WEBSITE, ""),
+            r.get(COL_COMPANY_LI, ""),
+            api_key,
+            args.max_queries,
         )
-
-        # Step 3: AI Reasoning - Priority 1: Google Gemini (Free & High Speed)
-        gemini_key = (gemini_api_key or self.gemini_api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
-        openai_key = (openai_api_key or self.openai_api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
-
-        if gemini_key:
-            g_model = model if (model and "gemini" in model.lower()) else "gemini-1.5-flash"
-            logger.info(f"Invoking Google Gemini model '{g_model}' for '{company_clean}'...")
-            ai_data, error = self.query_gemini(
-                company_name=company_clean,
-                company_website=web_clean,
-                company_linkedin_url=li_clean,
-                website_info=website_info,
-                search_snippets=search_snippets,
-                target_seniority=target_seniority,
-                api_key_override=gemini_key,
-                model_override=g_model,
-            )
-
-            if not error and ai_data and ai_data.get("is_found") and ai_data.get("decision_maker_name"):
-                dm_name = str(ai_data.get("decision_maker_name", "")).strip()
-                pos = str(ai_data.get("position", "")).strip()
-                dm_li = clean_linkedin_personal_url(ai_data.get("personal_linkedin_url", ""))
-
-                if not dm_li:
-                    for s in search_snippets:
-                        if dm_name.lower() in s.get("title", "").lower() and s.get("url"):
-                            candidate_li = clean_linkedin_personal_url(s["url"])
-                            if candidate_li:
-                                dm_li = candidate_li
-                                break
-
-                confidence = int(ai_data.get("confidence_score") or 92)
-                evidence = str(ai_data.get("evidence") or f"Identified {dm_name} as {pos} via Gemini AI reasoning.")
-
-                return DecisionMakerResult(
-                    company_name=company_clean,
-                    company_website=web_clean,
-                    company_linkedin_url=li_clean,
-                    decision_maker_name=dm_name,
-                    position=pos,
-                    personal_linkedin_url=dm_li,
-                    confidence_score=confidence,
-                    evidence=evidence,
-                    status="enriched",
+        if dm:
+            found += 1
+            print(f"[{i}/{len(todo)}] {company}: {dm['name']} | {dm['title']} | {dm['url']} ({dm['confidence']})")
+            if not args.dry_run:
+                write_row(
+                    ws,
+                    header,
+                    r["row_number"],
+                    {
+                        COL_DM_NAME: dm["name"],
+                        COL_DM_POST: dm["title"],
+                        COL_DM_LI: dm["url"],
+                        COL_DM_CONF: dm["confidence"],
+                    },
                 )
-            elif error:
-                logger.warning(f"Gemini API error for '{company_clean}': {error}.")
+        else:
+            print(f"[{i}/{len(todo)}] {company}: no confident match")
+        log.append({
+            "row_number": r["row_number"],
+            "company": company,
+            "name": dm["name"] if dm else "",
+            "title": dm["title"] if dm else "",
+            "linkedin": dm["url"] if dm else "",
+            "confidence": dm["confidence"] if dm else "",
+        })
+        time.sleep(args.delay)
 
-        # Priority 2: OpenAI (if configured)
-        if openai_key and not gemini_key:
-            o_model = model if (model and "gpt" in model.lower()) else "gpt-4o-mini"
-            logger.info(f"Invoking OpenAI model '{o_model}' for '{company_clean}'...")
-            ai_data, error = self.query_openai(
-                company_name=company_clean,
-                company_website=web_clean,
-                company_linkedin_url=li_clean,
-                website_info=website_info,
-                search_snippets=search_snippets,
-                target_seniority=target_seniority,
-                api_key_override=openai_key,
-                model_override=o_model,
-            )
-
-            if not error and ai_data and ai_data.get("is_found") and ai_data.get("decision_maker_name"):
-                dm_name = str(ai_data.get("decision_maker_name", "")).strip()
-                pos = str(ai_data.get("position", "")).strip()
-                dm_li = clean_linkedin_personal_url(ai_data.get("personal_linkedin_url", ""))
-
-                if not dm_li:
-                    for s in search_snippets:
-                        if dm_name.lower() in s.get("title", "").lower() and s.get("url"):
-                            candidate_li = clean_linkedin_personal_url(s["url"])
-                            if candidate_li:
-                                dm_li = candidate_li
-                                break
-
-                confidence = int(ai_data.get("confidence_score") or 90)
-                evidence = str(ai_data.get("evidence") or f"Identified {dm_name} as {pos} via OpenAI AI reasoning.")
-
-                return DecisionMakerResult(
-                    company_name=company_clean,
-                    company_website=web_clean,
-                    company_linkedin_url=li_clean,
-                    decision_maker_name=dm_name,
-                    position=pos,
-                    personal_linkedin_url=dm_li,
-                    confidence_score=confidence,
-                    evidence=evidence,
-                    status="enriched",
-                )
-            elif error:
-                logger.warning(f"OpenAI error for '{company_clean}': {error}.")
-
-        # Step 4: Fallback to heuristic extraction if AI key not set or failed
-        heuristic_res = self.heuristic_fallback(
-            company_name=company_clean,
-            website_info=website_info,
-            search_snippets=search_snippets,
-            target_seniority=target_seniority,
-        )
-        heuristic_res.company_website = web_clean
-        heuristic_res.company_linkedin_url = li_clean
-        has_any_key = bool(gemini_key or openai_key)
-        if not has_any_key and heuristic_res.status == "enriched":
-            heuristic_res.evidence += " (Tip: Configure free Gemini API Key for enhanced AI discovery)"
-        elif not has_any_key and heuristic_res.status == "not_found":
-            heuristic_res.evidence = "No decision maker found. Connect your free Gemini API Key for enhanced AI discovery."
+    if log:
+        with open(args.log, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(log[0].keys()))
+            w.writeheader()
+            w.writerows(log)
+    print(f"Done. {found}/{len(todo)} found. Log: {args.log}")
 
 
-        return heuristic_res
+if __name__ == "__main__":
+    main()

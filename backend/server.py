@@ -25,8 +25,8 @@ sys.path.insert(0, str(BASE_DIR))
 
 # Load .env
 from dotenv import load_dotenv
-load_dotenv(ROOT_DIR / ".env")
-load_dotenv(BASE_DIR / ".env")
+load_dotenv(ROOT_DIR / ".env", override=True)
+load_dotenv(BASE_DIR / ".env", override=True)
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -85,11 +85,9 @@ class SocialStartPayload(BaseModel):
 
 class DecisionMakerPayload(BaseModel):
     records: List[Dict[str, Any]]
-    geminiKey: Optional[str] = None
-    openAiKey: Optional[str] = None
-    model: Optional[str] = "gemini-1.5-flash"
-    seniority: Optional[List[str]] = None
-    delay: Optional[float] = 0.2
+    serpapiKey: Optional[str] = None
+    maxQueries: Optional[int] = 2
+    delay: Optional[float] = 0.5
 
 
 @app.get("/api/health")
@@ -746,24 +744,16 @@ def export_social_media_data(task_id: str):
 
 @app.get("/api/decision-makers/config")
 def get_decision_makers_config():
-    """Returns AI API configuration status (Google Gemini & OpenAI)."""
-    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
-
-    has_gemini = bool(gemini_key and not gemini_key.startswith("your_"))
-    has_openai = bool(openai_key and not openai_key.startswith("your_"))
-
-    gemini_masked = (gemini_key[:4] + "..." + gemini_key[-4:]) if has_gemini and len(gemini_key) > 8 else ("configured" if has_gemini else "missing")
-    openai_masked = (openai_key[:4] + "..." + openai_key[-4:]) if has_openai and len(openai_key) > 8 else ("configured" if has_openai else "missing")
-
+    """Returns SerpApi configuration status for Decision Maker Finder."""
+    load_dotenv(ROOT_DIR / ".env", override=True)
+    api_key = os.environ.get("SERPAPI_KEY", "").strip()
+    is_set = bool(api_key and not api_key.startswith("your_"))
+    masked = (api_key[:4] + "..." + api_key[-4:]) if is_set and len(api_key) > 8 else ("configured" if is_set else "missing")
     return {
         "status": "ok",
-        "hasGeminiKey": has_gemini,
-        "geminiKeyPreview": gemini_masked,
-        "hasOpenAiKey": has_openai,
-        "keyPreview": gemini_masked if has_gemini else openai_masked,
-        "defaultModel": "gemini-1.5-flash",
-        "engine": "Google Gemini Free AI Engine",
+        "hasSerpApiKey": is_set,
+        "keyPreview": masked,
+        "engine": "SerpApi Decision Maker Finder",
     }
 
 
@@ -771,34 +761,28 @@ def get_decision_makers_config():
 def enrich_decision_makers(payload: DecisionMakerPayload):
     """
     Enriches candidate records with verified Decision Maker Name, Position, and LinkedIn.
-    Uses Google Gemini (or OpenAI) AI reasoning synthesized with live website leadership scraping & search dorking.
+    Uses precision SerpApi Google dorking and title ranking algorithm.
     """
     records = payload.records
     if not records:
         return {"status": "ok", "results": []}
 
-    gemini_key = (payload.geminiKey or os.environ.get("GEMINI_API_KEY", "")).strip()
-    openai_key = (payload.openAiKey or os.environ.get("OPENAI_API_KEY", "")).strip()
-    model = payload.model or ("gemini-1.5-flash" if gemini_key or not openai_key else "gpt-4o-mini")
-    seniority = payload.seniority or [
-        "CEO", "Founder", "Co-Founder", "Owner", "President", "Managing Director", "C-Level", "VP"
-    ]
-    delay = payload.delay or 0.2
+    load_dotenv(ROOT_DIR / ".env", override=True)
+    api_key = (payload.serpapiKey or os.environ.get("SERPAPI_KEY", "")).strip()
+    max_queries = payload.maxQueries or 2
+    delay = payload.delay or 0.5
 
-    finder = DecisionMakerFinder(
-        gemini_api_key=gemini_key,
-        openai_api_key=openai_key,
-        default_model=model,
-    )
+    finder = DecisionMakerFinder(serpapi_key=api_key)
     enriched_results: List[Dict[str, Any]] = []
 
     for r in records:
-        # Extract inputs flexibly from common column keys
         comp_name = (
             r.get("companyName")
+            or r.get("Name")
             or r.get("Company")
             or r.get("company")
             or r.get("Company Name")
+            or r.get("customFields", {}).get("Name")
             or r.get("customFields", {}).get("Company")
             or r.get("customFields", {}).get("Company Name")
             or r.get("customFields", {}).get("company")
@@ -817,43 +801,51 @@ def enrich_decision_makers(payload: DecisionMakerPayload):
         )
         comp_li = (
             r.get("companyLinkedinUrl")
+            or r.get("Linkedin")
             or r.get("Company Linkedin")
             or r.get("Company LinkedIn")
             or r.get("companyLinkedin")
+            or r.get("customFields", {}).get("Linkedin")
             or r.get("customFields", {}).get("Company Linkedin")
             or r.get("customFields", {}).get("Company LinkedIn")
-            or r.get("customFields", {}).get("Linkedin")
             or ""
         )
 
         res = finder.find_decision_maker(
-            company_name=str(comp_name).strip(),
-            company_website=str(comp_site).strip(),
-            company_linkedin_url=str(comp_li).strip(),
-            target_seniority=seniority,
-            gemini_api_key=gemini_key,
-            openai_api_key=openai_key,
-            model=model,
+            company=str(comp_name).strip(),
+            website=str(comp_site).strip(),
+            company_li=str(comp_li).strip(),
+            api_key=api_key,
+            max_queries=max_queries,
         )
 
         out_record = dict(r)
         if res.status == "enriched" and res.decision_maker_name:
             out_record["personName"] = res.decision_maker_name
             out_record["title"] = res.position
-            if res.personal_linkedin_url:
-                out_record["linkedinUrl"] = res.personal_linkedin_url
+            out_record["linkedinUrl"] = res.personal_linkedin_url
             if res.company_website and not out_record.get("companyWebsite"):
                 out_record["companyWebsite"] = res.company_website
             if res.company_linkedin_url and not out_record.get("companyLinkedinUrl"):
                 out_record["companyLinkedinUrl"] = res.company_linkedin_url
             out_record["confidenceScore"] = res.confidence_score
+            out_record["confidence"] = res.confidence
             out_record["enrichmentStatus"] = "enriched"
             out_record["notes"] = res.evidence
             out_record["lastEnrichedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+            # Also populate user's expected columns: Decision Maker Name | Decision Maker Post | Decision Maker Linkedin
+            if "customFields" not in out_record or not isinstance(out_record["customFields"], dict):
+                out_record["customFields"] = {}
+            out_record["customFields"]["Decision Maker Name"] = res.decision_maker_name
+            out_record["customFields"]["Decision Maker Post"] = res.position
+            out_record["customFields"]["Decision Maker Linkedin"] = res.personal_linkedin_url
+            out_record["customFields"]["Decision Maker Confidence"] = res.confidence
         else:
             out_record["enrichmentStatus"] = "not_found"
             out_record["notes"] = res.evidence or "No verified decision maker found."
             out_record["confidenceScore"] = 0
+            out_record["confidence"] = "none"
 
         enriched_results.append(out_record)
         if delay > 0:

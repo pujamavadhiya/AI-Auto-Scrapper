@@ -4,19 +4,16 @@ import {
   FileSpreadsheet,
   Plus,
   UploadCloud,
-  Sparkles,
   Key,
   CheckCircle2,
   AlertCircle,
-  ExternalLink,
-  ChevronDown,
-  ChevronUp,
   Briefcase,
   Globe,
   Linkedin,
   Trash2,
   Play,
   RotateCcw,
+  Sparkles,
 } from 'lucide-react';
 import { ModuleHeader } from '../components/common/ModuleHeader';
 import { FileUploader } from '../components/common/FileUploader';
@@ -32,22 +29,8 @@ import { decisionMakerService } from '../services/adapters';
 import { storageService } from '../services/storageService';
 import { getApiBaseUrl } from '../config/api';
 
-const AVAILABLE_SENIORITY = [
-  'CEO',
-  'Founder',
-  'Co-Founder',
-  'Owner',
-  'President',
-  'Managing Director',
-  'Chief Executive Officer',
-  'CTO',
-  'COO',
-  'VP',
-  'Director',
-];
-
 export const DecisionMakerFinder: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'table' | 'quick' | 'upload' | 'config'>('table');
+  const [activeTab, setActiveTab] = useState<'table' | 'quick' | 'upload'>('table');
   const [records, setRecords] = useState<EnrichmentRecord[]>([]);
   const [parsedFile, setParsedFile] = useState<ParsedFileResult | null>(null);
 
@@ -61,30 +44,19 @@ export const DecisionMakerFinder: React.FC = () => {
   // Bulk paste text state
   const [bulkPasteText, setBulkPasteText] = useState('');
 
-  // AI Key & Engine Config State (Gemini Primary Free Tier + OpenAI)
+  // SerpApi status from backend server
   const [serverConfig, setServerConfig] = useState<{
-    hasGeminiKey: boolean;
-    geminiKeyPreview: string;
-    hasOpenAiKey: boolean;
+    hasSerpApiKey: boolean;
+    keyPreview: string;
     engine: string;
   }>({
-    hasGeminiKey: false,
-    geminiKeyPreview: 'checking...',
-    hasOpenAiKey: false,
-    engine: 'Google Gemini Free AI Engine',
+    hasSerpApiKey: false,
+    keyPreview: 'checking...',
+    engine: 'SerpApi Decision Maker Finder',
   });
 
-  const [geminiKeyInput, setGeminiKeyInput] = useState<string>(() => storageService.getSettings().geminiApiKey || '');
-  const [geminiModel, setGeminiModel] = useState<string>(() => storageService.getSettings().geminiModel || 'gemini-1.5-flash');
-  const [openAiKeyInput, setOpenAiKeyInput] = useState<string>(() => storageService.getSettings().openAiApiKey || '');
-  const [showKeyConfig, setShowKeyConfig] = useState(false);
-  const [saveKeySuccess, setSaveKeySuccess] = useState(false);
-
   const [config, setConfig] = useState<ResearchConfig>({
-    seniorityLevels: ['CEO', 'Founder', 'Co-Founder', 'Owner', 'Managing Director'],
-    geminiApiKey: storageService.getSettings().geminiApiKey || '',
-    geminiModel: storageService.getSettings().geminiModel || 'gemini-1.5-flash',
-    openAiApiKey: storageService.getSettings().openAiApiKey || '',
+    seniorityLevels: ['Owner', 'Founder', 'CEO', 'Managing Director'],
   });
 
   const [progress, setProgress] = useState<ResearchProgress>({
@@ -112,7 +84,7 @@ export const DecisionMakerFinder: React.FC = () => {
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Check backend server AI config on mount
+  // Check backend SerpApi config on mount
   useEffect(() => {
     const checkServerConfig = async () => {
       const apiBase = getApiBaseUrl();
@@ -122,10 +94,9 @@ export const DecisionMakerFinder: React.FC = () => {
         if (res.ok) {
           const data = await res.json();
           setServerConfig({
-            hasGeminiKey: !!data.hasGeminiKey,
-            geminiKeyPreview: data.geminiKeyPreview || 'missing',
-            hasOpenAiKey: !!data.hasOpenAiKey,
-            engine: data.engine || 'Google Gemini Free AI Engine',
+            hasSerpApiKey: !!data.hasSerpApiKey,
+            keyPreview: data.keyPreview || 'missing',
+            engine: data.engine || 'SerpApi Decision Maker Finder',
           });
         }
       } catch (e) {
@@ -135,29 +106,20 @@ export const DecisionMakerFinder: React.FC = () => {
     checkServerConfig();
   }, []);
 
-  const handleSaveAiKeys = () => {
-    storageService.saveSettings({
-      geminiApiKey: geminiKeyInput.trim(),
-      geminiModel,
-      openAiApiKey: openAiKeyInput.trim(),
-    });
-    setConfig((prev) => ({
-      ...prev,
-      geminiApiKey: geminiKeyInput.trim(),
-      geminiModel,
-      openAiApiKey: openAiKeyInput.trim(),
-    }));
-    setSaveKeySuccess(true);
-    setTimeout(() => setSaveKeySuccess(false), 2500);
-  };
-
   const handleFileParsed = (parsed: ParsedFileResult) => {
     setParsedFile(parsed);
   };
 
   const handleMappingConfirmed = (newRecords: EnrichmentRecord[], _mapping: ColumnMapping) => {
-    // Normalize uploaded records
     const normalized = newRecords.map((r) => {
+      let comp =
+        r.companyName ||
+        r.customFields?.['Name'] ||
+        r.customFields?.['Company'] ||
+        r.customFields?.['Company Name'] ||
+        r.customFields?.['company'] ||
+        '';
+
       let web =
         r.companyWebsite ||
         r.domain ||
@@ -173,9 +135,10 @@ export const DecisionMakerFinder: React.FC = () => {
 
       let li =
         r.companyLinkedinUrl ||
+        r.customFields?.['Linkedin'] ||
         r.customFields?.['Company Linkedin'] ||
         r.customFields?.['Company LinkedIn'] ||
-        r.customFields?.['Linkedin'] ||
+        r.customFields?.['companyLinkedin'] ||
         '';
       li = String(li).trim().replace(/^(https?:\/\/)+/i, 'https://');
       if (li && !li.startsWith('http://') && !li.startsWith('https://')) {
@@ -184,6 +147,7 @@ export const DecisionMakerFinder: React.FC = () => {
 
       return {
         ...r,
+        companyName: comp,
         companyWebsite: web || r.companyWebsite,
         companyLinkedinUrl: li || r.companyLinkedinUrl,
       };
@@ -193,11 +157,10 @@ export const DecisionMakerFinder: React.FC = () => {
     setParsedFile(null);
     setActiveTab('table');
 
-    // Save project in localStorage
     storageService.saveProject({
       id: `proj-${Date.now()}`,
       name: `Decision Makers Import (${new Date().toLocaleDateString()})`,
-      description: 'Imported via Decision Maker Finder Spreadsheet',
+      description: 'Imported via SerpApi Decision Maker Finder',
       moduleType: 'decision-maker',
       records: normalized,
       config,
@@ -211,8 +174,8 @@ export const DecisionMakerFinder: React.FC = () => {
   };
 
   const handleAddSingleQuick = (autoStart: boolean = false) => {
-    if (!quickForm.companyName.trim() && !quickForm.companyWebsite.trim() && !quickForm.companyLinkedinUrl.trim()) {
-      alert('Please enter at least a Company Name, Website, or Company LinkedIn URL.');
+    if (!quickForm.companyName.trim()) {
+      alert('Please enter a Company Name.');
       return;
     }
 
@@ -228,7 +191,7 @@ export const DecisionMakerFinder: React.FC = () => {
 
     const newRec: EnrichmentRecord = {
       id: `dm-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
-      companyName: quickForm.companyName.trim() || web.replace(/^https?:\/\//i, '').split('/')[0],
+      companyName: quickForm.companyName.trim(),
       companyWebsite: web,
       companyLinkedinUrl: li,
       enrichmentStatus: 'idle',
@@ -321,16 +284,10 @@ export const DecisionMakerFinder: React.FC = () => {
     try {
       await decisionMakerService.enrichBatch(
         targets,
-        {
-          ...config,
-          geminiApiKey: geminiKeyInput.trim() || config.geminiApiKey,
-          geminiModel,
-          openAiApiKey: openAiKeyInput.trim() || config.openAiApiKey,
-        },
+        config,
         (p) => setProgress(p),
         abortControllerRef.current.signal,
         (chunkResults) => {
-          // Live chunk update directly into the table
           setRecords((prev) => {
             const chunkMap = new Map(chunkResults.map((r) => [r.id, r]));
             return prev.map((item) => chunkMap.get(item.id) || item);
@@ -355,16 +312,6 @@ export const DecisionMakerFinder: React.FC = () => {
     abortControllerRef.current?.abort();
   };
 
-  const handleToggleSeniority = (role: string) => {
-    setConfig((prev) => {
-      const current = prev.seniorityLevels || [];
-      const updated = current.includes(role)
-        ? current.filter((r) => r !== role)
-        : [...current, role];
-      return { ...prev, seniorityLevels: updated };
-    });
-  };
-
   const openExportModal = (scope: 'all' | 'filtered' | 'selected', recordsToExport: EnrichmentRecord[]) => {
     setExportModalState({
       isOpen: true,
@@ -372,9 +319,6 @@ export const DecisionMakerFinder: React.FC = () => {
       records: recordsToExport,
     });
   };
-
-  const hasConfiguredGemini = serverConfig.hasGeminiKey || !!geminiKeyInput.trim();
-  const hasConfiguredAi = hasConfiguredGemini || serverConfig.hasOpenAiKey || !!openAiKeyInput.trim();
 
   return (
     <div className="space-y-6">
@@ -392,108 +336,36 @@ export const DecisionMakerFinder: React.FC = () => {
         totalRecordsCount={records.length}
       />
 
-      {/* Google Gemini AI API Status Banner / Expandable Config */}
-      <div className="p-4 rounded-2xl bg-white border border-slate-200/80 shadow-xs space-y-3">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5">
-            <div className={`p-2 rounded-xl ${hasConfiguredAi ? 'bg-indigo-50 text-indigo-600' : 'bg-amber-50 text-amber-600'}`}>
-              <Sparkles className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-bold text-slate-900">Google Gemini AI Reasoning Engine</span>
-                {hasConfiguredGemini ? (
-                  <Badge variant="success" className="text-[10px] font-semibold py-0.5 px-2">
-                    <CheckCircle2 className="w-3 h-3 mr-1 inline" />
-                    Gemini Active ({geminiModel} - Free Tier)
-                  </Badge>
-                ) : hasConfiguredAi ? (
-                  <Badge variant="success" className="text-[10px] font-semibold py-0.5 px-2">
-                    <CheckCircle2 className="w-3 h-3 mr-1 inline" />
-                    AI Ready (OpenAI)
-                  </Badge>
-                ) : (
-                  <Badge variant="warning" className="text-[10px] font-semibold py-0.5 px-2">
-                    <AlertCircle className="w-3 h-3 mr-1 inline" />
-                    Free Gemini Key Recommended
-                  </Badge>
-                )}
-              </div>
-              <p className="text-[11px] text-slate-500 mt-0.5">
-                {hasConfiguredGemini
-                  ? 'High-speed Gemini AI reasoning active. Extracts exact executive names and roles from web & LinkedIn snippets.'
-                  : 'Add your free Google Gemini API Key below for high-precision decision maker verification.'}
-              </p>
-            </div>
+      {/* SerpApi Status Banner */}
+      <div className="p-4 rounded-2xl bg-white border border-slate-200/80 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <div className={`p-2 rounded-xl ${serverConfig.hasSerpApiKey ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
+            <Sparkles className="w-5 h-5" />
           </div>
-
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => setShowKeyConfig(!showKeyConfig)}
-            className="text-xs shrink-0 self-start sm:self-auto"
-          >
-            <Key className="w-3.5 h-3.5 mr-1 text-slate-500" />
-            {showKeyConfig ? 'Hide API Key' : 'Configure Gemini API Key'}
-            {showKeyConfig ? <ChevronUp className="w-3.5 h-3.5 ml-1" /> : <ChevronDown className="w-3.5 h-3.5 ml-1" />}
-          </Button>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold text-slate-900">SerpApi Precision Decision Maker Algorithm</span>
+              {serverConfig.hasSerpApiKey ? (
+                <Badge variant="success" className="text-[10px] font-semibold py-0.5 px-2">
+                  <CheckCircle2 className="w-3 h-3 mr-1 inline" />
+                  SerpApi Connected ({serverConfig.keyPreview})
+                </Badge>
+              ) : (
+                <Badge variant="danger" className="text-[10px] font-semibold py-0.5 px-2">
+                  <AlertCircle className="w-3 h-3 mr-1 inline" />
+                  SERPAPI_KEY Missing in .env
+                </Badge>
+              )}
+            </div>
+            <p className="text-[11px] text-slate-500 mt-0.5">
+              Searches Google via SerpApi for LinkedIn profiles, verifies company matching, and selects the top executive (Owner, Founder, CEO, President, MD).
+            </p>
+          </div>
         </div>
 
-        {showKeyConfig && (
-          <div className="pt-3 border-t border-slate-100 space-y-3">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div className="md:col-span-2 space-y-1">
-                <div className="flex items-center justify-between">
-                  <label className="text-[11px] font-bold text-slate-700">Google Gemini API Key (Free)</label>
-                  <a
-                    href="https://aistudio.google.com/app/apikey"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-[11px] text-blue-600 hover:underline flex items-center gap-1 font-medium"
-                  >
-                    Get free Gemini key at Google AI Studio <ExternalLink className="w-3 h-3" />
-                  </a>
-                </div>
-                <input
-                  type="password"
-                  value={geminiKeyInput}
-                  onChange={(e) => setGeminiKeyInput(e.target.value)}
-                  placeholder={serverConfig.hasGeminiKey ? `Configured in .env (${serverConfig.geminiKeyPreview})` : 'AIzaSy...'}
-                  className="w-full h-9 px-3 text-xs font-mono rounded-lg border border-slate-300 focus:outline-hidden focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 bg-white"
-                />
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-[11px] font-bold text-slate-700">Gemini Model</label>
-                <select
-                  value={geminiModel}
-                  onChange={(e) => setGeminiModel(e.target.value)}
-                  className="w-full h-9 px-3 text-xs rounded-lg border border-slate-300 bg-white focus:outline-hidden focus:ring-2 focus:ring-indigo-500/20"
-                >
-                  <option value="gemini-1.5-flash">gemini-1.5-flash (Fast & Free Tier)</option>
-                  <option value="gemini-2.0-flash">gemini-2.0-flash (Latest Ultra-Fast)</option>
-                  <option value="gemini-1.5-pro">gemini-1.5-pro (Deep Reasoning)</option>
-                </select>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between pt-1">
-              <span className="text-[11px] text-slate-400">
-                Key is securely stored in local browser settings or server environment.
-              </span>
-              <div className="flex items-center gap-2">
-                {saveKeySuccess && (
-                  <span className="text-xs font-semibold text-emerald-600 flex items-center gap-1">
-                    <CheckCircle2 className="w-3.5 h-3.5" /> Key Saved!
-                  </span>
-                )}
-                <Button size="sm" onClick={handleSaveAiKeys} className="text-xs bg-indigo-600 hover:bg-indigo-700 text-white">
-                  Save Gemini Configuration
-                </Button>
-              </div>
-            </div>
-          </div>
-        )}
+        <div className="text-xs text-slate-400 self-start sm:self-auto font-mono">
+          Outputs: Decision Maker Name | Post | Linkedin
+        </div>
       </div>
 
       {/* Tabs Navigation */}
@@ -535,18 +407,6 @@ export const DecisionMakerFinder: React.FC = () => {
           >
             <UploadCloud className="w-3.5 h-3.5" />
             Upload Spreadsheet (.xlsx / .csv)
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveTab('config')}
-            className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-              activeTab === 'config'
-                ? 'bg-blue-50 text-blue-700 shadow-xs'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
-            }`}
-          >
-            Target Roles & Filters
           </button>
         </div>
 
@@ -598,7 +458,7 @@ export const DecisionMakerFinder: React.FC = () => {
                 Single Company Lookup
               </h3>
               <p className="text-xs text-slate-500">
-                Enter company name, website, and company LinkedIn URL to pinpoint the executive.
+                Enter company name, website, and LinkedIn URL to pinpoint the executive.
               </p>
             </div>
 
@@ -609,14 +469,14 @@ export const DecisionMakerFinder: React.FC = () => {
                   type="text"
                   value={quickForm.companyName}
                   onChange={(e) => setQuickForm({ ...quickForm, companyName: e.target.value })}
-                  placeholder="e.g. AppSumo, Stripe, Linear"
+                  placeholder="e.g. AppSumo, Stripe, Zapier"
                   className="w-full h-9 px-3 text-xs rounded-lg border border-slate-300 focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1 flex items-center gap-1">
-                  <Globe className="w-3.5 h-3.5 text-slate-400" /> Company Website
+                  <Globe className="w-3.5 h-3.5 text-slate-400" /> Company Website (optional)
                 </label>
                 <input
                   type="text"
@@ -629,7 +489,7 @@ export const DecisionMakerFinder: React.FC = () => {
 
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1 flex items-center gap-1">
-                  <Linkedin className="w-3.5 h-3.5 text-blue-600" /> Company LinkedIn URL
+                  <Linkedin className="w-3.5 h-3.5 text-blue-600" /> Company LinkedIn URL (optional)
                 </label>
                 <input
                   type="text"
@@ -644,9 +504,9 @@ export const DecisionMakerFinder: React.FC = () => {
                 <Button
                   size="sm"
                   onClick={() => handleAddSingleQuick(true)}
-                  className="flex-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white"
+                  className="flex-1 text-xs bg-blue-600 hover:bg-blue-700 text-white"
                 >
-                  <Sparkles className="w-3.5 h-3.5 mr-1" /> Add & Discover via Gemini AI
+                  <Sparkles className="w-3.5 h-3.5 mr-1" /> Add & Find Decision Maker
                 </Button>
                 <Button
                   size="sm"
@@ -687,7 +547,7 @@ export const DecisionMakerFinder: React.FC = () => {
                   onClick={() => handleAddBulkPaste(true)}
                   className="flex-1 text-xs bg-emerald-600 hover:bg-emerald-700 text-white"
                 >
-                  <Sparkles className="w-3.5 h-3.5 mr-1" /> Add & Start Batch Discovery
+                  <Sparkles className="w-3.5 h-3.5 mr-1" /> Add & Start Batch Search
                 </Button>
                 <Button
                   size="sm"
@@ -711,7 +571,7 @@ export const DecisionMakerFinder: React.FC = () => {
               <div className="text-center space-y-1">
                 <h3 className="text-base font-bold text-slate-900">Upload Target Companies File</h3>
                 <p className="text-xs text-slate-500">
-                  Upload an Excel (.xlsx/.xls) or CSV containing company names, websites, and/or company LinkedIn URLs.
+                  Upload an Excel (.xlsx/.xls) or CSV containing: <strong>Name | Website | Linkedin</strong>.
                 </p>
               </div>
               <FileUploader onFileParsed={handleFileParsed} />
@@ -726,65 +586,22 @@ export const DecisionMakerFinder: React.FC = () => {
         </div>
       )}
 
-      {/* Tab: Target Roles & Config */}
-      {activeTab === 'config' && (
-        <div className="p-6 rounded-2xl bg-white border border-slate-200/80 shadow-xs space-y-6">
-          <div className="border-b border-slate-100 pb-3">
-            <h3 className="text-sm font-bold text-slate-900">Target Executive Seniority & Titles</h3>
-            <p className="text-xs text-slate-500">
-              Select which decision maker titles should be prioritized during Gemini AI discovery.
-            </p>
-          </div>
-
-          <div className="space-y-4">
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-2">Priority Titles:</label>
-              <div className="flex flex-wrap gap-2">
-                {AVAILABLE_SENIORITY.map((role) => {
-                  const isSelected = config.seniorityLevels?.includes(role);
-                  return (
-                    <button
-                      key={role}
-                      type="button"
-                      onClick={() => handleToggleSeniority(role)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all border ${
-                        isSelected
-                          ? 'bg-blue-50 border-blue-600 text-blue-700 shadow-xs'
-                          : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
-                      }`}
-                    >
-                      {role} {isSelected && '✓'}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="pt-3 border-t border-slate-100 flex justify-end">
-              <Button size="sm" onClick={() => setActiveTab('table')} className="text-xs bg-blue-600 hover:bg-blue-700 text-white">
-                Apply & Return to Table
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Tab: Data Table */}
       {activeTab === 'table' && (
         <div>
           {records.length === 0 ? (
             <div className="p-12 text-center rounded-2xl bg-white border border-slate-200/80 shadow-xs space-y-4">
-              <div className="w-14 h-14 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mx-auto">
+              <div className="w-14 h-14 bg-blue-50 text-blue-600 rounded-2xl flex items-center justify-center mx-auto">
                 <UserCheck className="w-7 h-7" />
               </div>
               <div className="max-w-md mx-auto space-y-1">
                 <h3 className="text-base font-bold text-slate-900">No Target Companies Loaded</h3>
                 <p className="text-xs text-slate-500 leading-relaxed">
-                  Provide company details (Company Name, Website, or Company LinkedIn URL) to discover verified decision makers and executive leadership using Google Gemini AI.
+                  Provide company details (Name, Website, or Company LinkedIn URL) to discover verified decision makers and executive leadership.
                 </p>
               </div>
               <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
-                <Button size="sm" onClick={() => setActiveTab('quick')} className="text-xs bg-indigo-600 hover:bg-indigo-700 text-white">
+                <Button size="sm" onClick={() => setActiveTab('quick')} className="text-xs bg-blue-600 hover:bg-blue-700 text-white">
                   <Plus className="w-3.5 h-3.5 mr-1" /> Quick Paste Accounts
                 </Button>
                 <Button size="sm" variant="outline" onClick={() => setActiveTab('upload')} className="text-xs">
