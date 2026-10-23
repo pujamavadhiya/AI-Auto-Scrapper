@@ -48,6 +48,7 @@ from linkedin_collector import CollectorConfig, KeywordLinkedInCollector, clean_
 from social_media_scraper import SocialMediaScraper
 from decision_maker_finder import DecisionMakerFinder
 from leadocean_enricher import LeadOceanEnricher, load_config as load_leadocean_config
+from gemini_lead_auditor import audit_leads_with_gemini, get_gemini_api_key
 
 app = FastAPI(title="AI Auto Scrapper API", version="1.0.0")
 
@@ -334,9 +335,25 @@ class StartCollectorPayload(BaseModel):
     titles: Optional[List[str]] = None
     companySize: Optional[str] = "all"
     enrichCompany: Optional[bool] = True
+    verifyWithGemini: Optional[bool] = True
+    geminiApiKey: Optional[str] = None
 
 
-def _run_collector_thread(task_id: str, cfg: CollectorConfig):
+class VerifyGeminiPayload(BaseModel):
+    geminiApiKey: Optional[str] = None
+
+
+class VerifyRecordsPayload(BaseModel):
+    records: List[Dict[str, Any]]
+    geminiApiKey: Optional[str] = None
+
+
+def _run_collector_thread(
+    task_id: str,
+    cfg: CollectorConfig,
+    verify_with_gemini: bool = True,
+    gemini_api_key: Optional[str] = None,
+):
     task = COLLECTOR_TASKS[task_id]
 
     def on_event(event: Dict[str, Any]):
@@ -359,6 +376,12 @@ def _run_collector_thread(task_id: str, cfg: CollectorConfig):
             task["progressMessage"] = "Enriching company industry & size without guessing..."
         elif etype == "company_enriched":
             task["progressMessage"] = f"Enriched {event.get('company')}: {event.get('industry')}"
+        elif etype == "gemini_verification_start":
+            task["progressMessage"] = event.get("message", "Checking and cleaning details with Gemini AI...")
+        elif etype == "gemini_progress":
+            task["progressMessage"] = event.get("message", "Auditing leads with Gemini AI...")
+        elif etype == "gemini_verification_done":
+            task["progressMessage"] = event.get("message", "Gemini AI verified and cleaned all records.")
         elif etype == "completed":
             task["progressMessage"] = event.get("message", "Scraping completed.")
 
@@ -371,10 +394,36 @@ def _run_collector_thread(task_id: str, cfg: CollectorConfig):
         rows = rows[:cfg.target_count]
         for r in rows:
             r["Profile URL"] = clean_linkedin_url(r.get("Profile URL", ""), r.get("Full name", ""), r.get("Company name", ""))
+
+        # Gemini AI Verification & Column Normalization
+        if verify_with_gemini and rows:
+            g_key = (gemini_api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+            if g_key:
+                task["progressMessage"] = f"Auditing {len(rows)} leads with Gemini AI (Name, Title, Location)..."
+                on_event({
+                    "type": "gemini_verification_start",
+                    "message": f"Auditing {len(rows)} leads with Gemini AI (Name only in name, Title in designation, etc.)...",
+                })
+                try:
+                    cleaned_rows = audit_leads_with_gemini(
+                        rows,
+                        api_key=g_key,
+                        on_progress=lambda cur, tot, msg: on_event({"type": "gemini_progress", "current": cur, "total": tot, "message": msg}),
+                    )
+                    if cleaned_rows:
+                        rows = cleaned_rows
+                        task["geminiVerified"] = True
+                        on_event({
+                            "type": "gemini_verification_done",
+                            "message": f"Gemini AI verified and normalized all {len(rows)} records successfully.",
+                        })
+                except Exception as ge:
+                    logger.warning(f"Gemini verification error: {ge}")
+
         task["records"] = rows
         task["totalCollected"] = len(rows)
 
-        # Generate output Excel file with exact records
+        # Generate output Excel file with verified exact records
         temp_dir = tempfile.mkdtemp()
         kw_slug = re.sub(r"[^a-zA-Z0-9]+", "_", cfg.keywords[0] if cfg.keywords else "leads")[:20]
         out_filename = f"linkedin_profiles_{kw_slug}_{int(time.time())}.xlsx"
@@ -388,7 +437,11 @@ def _run_collector_thread(task_id: str, cfg: CollectorConfig):
         task["downloadUrl"] = f"/api/download/{file_id}"
         task["fileName"] = out_filename
         task["status"] = "stopped" if collector.stop_requested.is_set() else "completed"
-        task["progressMessage"] = f"Done! Exactly {len(rows)} verified profiles ready for download."
+        task["progressMessage"] = (
+            f"Done! Exactly {len(rows)} verified profiles cleaned with Gemini AI and ready for download."
+            if task.get("geminiVerified")
+            else f"Done! Exactly {len(rows)} verified profiles ready for download."
+        )
 
     except Exception as e:
         traceback.print_exc()
@@ -418,6 +471,9 @@ def start_keyword_collector(payload: StartCollectorPayload):
         delay_range=(0.4, 0.9),
     )
 
+    verify_gemini = bool(payload.verifyWithGemini) if payload.verifyWithGemini is not None else True
+    gemini_key = (payload.geminiApiKey or os.environ.get("GEMINI_API_KEY", "")).strip()
+
     task_id = f"task_{uuid.uuid4().hex[:10]}"
     COLLECTOR_TASKS[task_id] = {
         "id": task_id,
@@ -434,9 +490,14 @@ def start_keyword_collector(payload: StartCollectorPayload):
         "createdAt": time.time(),
         "error": None,
         "collector": None,
+        "geminiVerified": False,
     }
 
-    t = threading.Thread(target=_run_collector_thread, args=(task_id, cfg), daemon=True)
+    t = threading.Thread(
+        target=_run_collector_thread,
+        args=(task_id, cfg, verify_gemini, gemini_key),
+        daemon=True,
+    )
     t.start()
 
     return {
@@ -444,6 +505,7 @@ def start_keyword_collector(payload: StartCollectorPayload):
         "status": "running",
         "target": target,
         "keywords": clean_kws,
+        "verifyWithGemini": verify_gemini,
     }
 
 
@@ -548,6 +610,79 @@ def export_current_collector_data(task_id: str):
         "totalCollected": len(records),
         "status": task.get("status"),
     }
+
+
+@app.post("/api/collector/verify-gemini/{task_id}")
+def verify_collector_gemini(task_id: str, payload: Optional[VerifyGeminiPayload] = None):
+    """
+    On-demand Gemini AI verification for an existing collector task.
+    Audits Name, Title, Company, and Location so each column contains only clean, accurate data.
+    Regenerates the Excel download file and returns sanitized records.
+    """
+    task = COLLECTOR_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Collector task not found.")
+
+    records = list(task.get("records", []))
+    if not records:
+        raise HTTPException(status_code=400, detail="No records collected yet.")
+
+    api_key = (payload.geminiApiKey if payload else None) or os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in Settings or .env.")
+
+    cleaned = audit_leads_with_gemini(records, api_key=api_key)
+    task["records"] = cleaned
+    task["geminiVerified"] = True
+    task["progressMessage"] = f"Gemini AI verified and normalized all {len(cleaned)} records."
+
+    # Regenerate downloadable Excel with verified data
+    collector = task.get("collector")
+    temp_dir = tempfile.mkdtemp()
+    out_filename = f"linkedin_profiles_gemini_verified_{int(time.time())}.xlsx"
+    out_path = Path(temp_dir) / out_filename
+
+    if collector:
+        collector.collected_rows = cleaned
+        collector.write_excel(out_path)
+    else:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Verified Leads"
+        headers = list(cleaned[0].keys())
+        ws.append(headers)
+        for r in cleaned:
+            ws.append([r.get(h, "") for h in headers])
+        wb.save(out_path)
+
+    file_id = f"col_{uuid.uuid4().hex[:12]}"
+    TEMP_STORAGE[file_id] = out_path
+    task["fileId"] = file_id
+    task["downloadUrl"] = f"/api/download/{file_id}"
+    task["fileName"] = out_filename
+
+    return {
+        "status": "ok",
+        "message": f"Successfully verified {len(cleaned)} leads with Gemini AI.",
+        "records": cleaned,
+        "downloadUrl": f"/api/download/{file_id}",
+        "fileName": out_filename,
+        "geminiVerified": True,
+    }
+
+
+@app.post("/api/collector/verify-records")
+def verify_records_gemini(payload: VerifyRecordsPayload):
+    """Audits arbitrary lead records with Gemini AI and returns sanitized records."""
+    records = payload.records
+    if not records:
+        return {"status": "ok", "records": []}
+    api_key = payload.geminiApiKey or os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in Settings or .env.")
+    cleaned = audit_leads_with_gemini(records, api_key=api_key)
+    return {"status": "ok", "records": cleaned}
 
 
 @app.get("/api/collector/events/{task_id}")

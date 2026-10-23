@@ -51,6 +51,7 @@ export interface ScrapedProfile {
   'Profile URL'?: string;
   Location?: string;
   'Contact type'?: string;
+  'Gemini Verified'?: string;
 }
 
 const PRESET_KEYWORDS = [
@@ -105,6 +106,8 @@ export const KeywordLeadCollector: React.FC = () => {
   const [titleInput, setTitleInput] = useState('');
   const [companySize, setCompanySize] = useState('all');
   const [enrichCompany, setEnrichCompany] = useState(true);
+  const [verifyWithGemini, setVerifyWithGemini] = useState(true);
+  const [isVerifyingGemini, setIsVerifyingGemini] = useState(false);
 
   // Execution & Live Scraper State
   const [isRunning, setIsRunning] = useState(false);
@@ -215,6 +218,7 @@ export const KeywordLeadCollector: React.FC = () => {
           titles,
           companySize,
           enrichCompany,
+          verifyWithGemini,
         }),
       });
 
@@ -232,6 +236,55 @@ export const KeywordLeadCollector: React.FC = () => {
       setIsRunning(false);
       setStatus('error');
       setErrorMessage(err.message || 'Error launching scraper.');
+    }
+  };
+
+  // On-demand Gemini AI verification
+  const handleVerifyWithGemini = async () => {
+    if (records.length === 0) return;
+    setIsVerifyingGemini(true);
+    setProgressMessage('Auditing and verifying lead details with Gemini AI (Name, Title, Location)...');
+    try {
+      const apiBase = getApiBaseUrl();
+      if (!apiBase) {
+        throw new Error('Backend server URL is not configured.');
+      }
+      let res;
+      if (taskId) {
+        res = await fetch(`${apiBase}/api/collector/verify-gemini/${taskId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+      } else {
+        res = await fetch(`${apiBase}/api/collector/verify-records`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ records }),
+        });
+      }
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Gemini audit failed.');
+      }
+
+      const data = await res.json();
+      if (data.records && Array.isArray(data.records)) {
+        setRecords(data.records);
+      }
+      if (data.downloadUrl) {
+        setDownloadUrl(data.downloadUrl);
+      }
+      if (data.fileName) {
+        setFileName(data.fileName);
+      }
+      setProgressMessage(`Successfully verified and sanitized ${data.records?.length || records.length} leads with Gemini AI!`);
+      alert(`Gemini AI successfully verified all lead columns: Person Name only in Name, Title only in Title, Location in Location!`);
+    } catch (err: any) {
+      alert(`Gemini verification error: ${err.message}`);
+    } finally {
+      setIsVerifyingGemini(false);
     }
   };
 
@@ -660,35 +713,59 @@ export const KeywordLeadCollector: React.FC = () => {
             </div>
 
             {/* Company Size & Verified Enrichment Toggle */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-slate-100">
-              <div>
-                <label className="text-xs font-bold uppercase tracking-wider text-slate-600 block mb-1.5">
-                  5. Company Size Filter
-                </label>
-                <Select
-                  value={companySize}
-                  onChange={(e) => setCompanySize(e.target.value)}
-                >
-                  <option value="all">Any Size (All Companies)</option>
-                  <option value="1-10">1-10 employees (Micro)</option>
-                  <option value="11-50">11-50 employees (Small)</option>
-                  <option value="51-200">51-200 employees (Mid-Market)</option>
-                  <option value="201-500">201-500 employees (Medium)</option>
-                  <option value="501-1000">501-1000 employees (Upper Mid)</option>
-                  <option value="1000+">1000+ employees (Enterprise)</option>
-                </Select>
+            <div className="space-y-3 pt-2 border-t border-slate-100">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-bold uppercase tracking-wider text-slate-600 block mb-1.5">
+                    5. Company Size Filter
+                  </label>
+                  <Select
+                    value={companySize}
+                    onChange={(e) => setCompanySize(e.target.value)}
+                  >
+                    <option value="all">Any Size (All Companies)</option>
+                    <option value="1-10">1-10 employees (Micro)</option>
+                    <option value="11-50">11-50 employees (Small)</option>
+                    <option value="51-200">51-200 employees (Mid-Market)</option>
+                    <option value="201-500">201-500 employees (Medium)</option>
+                    <option value="501-1000">501-1000 employees (Upper Mid)</option>
+                    <option value="1000+">1000+ employees (Enterprise)</option>
+                  </Select>
+                </div>
+
+                <div className="flex items-center justify-between p-3 rounded-lg bg-slate-50 border border-slate-200/80">
+                  <div>
+                    <span className="text-xs font-semibold text-slate-800 block">Enrich Company & Industry</span>
+                    <span className="text-[11px] text-slate-500 block">Industry is never guessed; verified from company data</span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={enrichCompany}
+                    onChange={(e) => setEnrichCompany(e.target.checked)}
+                    className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
+                  />
+                </div>
               </div>
 
-              <div className="flex items-center justify-between p-3 rounded-lg bg-slate-50 border border-slate-200/80">
-                <div>
-                  <span className="text-xs font-semibold text-slate-800 block">Enrich Company & Industry</span>
-                  <span className="text-[11px] text-slate-500 block">Industry is never guessed; verified from company data</span>
+              {/* Gemini AI Verification Toggle */}
+              <div className="flex items-center justify-between p-3.5 rounded-xl bg-purple-50/70 border border-purple-200/80">
+                <div className="space-y-0.5">
+                  <div className="flex items-center gap-1.5">
+                    <Sparkles className="w-4 h-4 text-purple-600 shrink-0" />
+                    <span className="text-xs font-bold text-slate-900 block">Gemini AI Precision Audit & Column Sanitizer</span>
+                    <Badge variant="default" className="text-[9px] font-semibold bg-purple-600 text-white py-0 px-1.5">
+                      Recommended
+                    </Badge>
+                  </div>
+                  <span className="text-[11px] text-slate-600 block leading-relaxed">
+                    Uses Google Gemini API to strictly sanitize columns: person&apos;s name only in Name, designation only in Title, clean company in Company, and geographic city/country in Location.
+                  </span>
                 </div>
                 <input
                   type="checkbox"
-                  checked={enrichCompany}
-                  onChange={(e) => setEnrichCompany(e.target.checked)}
-                  className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
+                  checked={verifyWithGemini}
+                  onChange={(e) => setVerifyWithGemini(e.target.checked)}
+                  className="w-4 h-4 text-purple-600 rounded border-purple-300 focus:ring-purple-500 ml-3"
                 />
               </div>
             </div>
@@ -815,6 +892,20 @@ export const KeywordLeadCollector: React.FC = () => {
               <Button
                 variant="outline"
                 size="sm"
+                onClick={handleVerifyWithGemini}
+                disabled={isVerifyingGemini || isRunning}
+                className="text-xs border-indigo-500 text-indigo-700 hover:bg-indigo-50 font-semibold flex items-center gap-1.5 shadow-2xs"
+                title="Run Gemini AI audit to clean up Name, Designation, Company, and Location"
+              >
+                <Sparkles className={`w-3.5 h-3.5 text-indigo-600 ${isVerifyingGemini ? 'animate-spin' : ''}`} />
+                {isVerifyingGemini ? 'AI Auditing Columns...' : 'Verify with Gemini AI'}
+              </Button>
+            )}
+
+            {records.length > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
                 onClick={handleClientDownload}
                 className="text-xs border-emerald-600 text-emerald-700 hover:bg-emerald-50 font-semibold flex items-center gap-1.5"
               >
@@ -864,7 +955,15 @@ export const KeywordLeadCollector: React.FC = () => {
                   <tr key={`${r['Decision maker LinkedIn URL'] || r['Profile URL'] || r['Company LinkedIn URL']}-${i}`} className="hover:bg-slate-50/80 transition-colors">
                     <td className="py-3 px-4 font-mono text-slate-400 text-[11px]">{i + 1}</td>
                     <td className="py-3 px-4">
-                      <div className="font-semibold text-slate-900">{r['Decision maker name'] || r['Full name'] || r['Company name']}</div>
+                      <div className="font-semibold text-slate-900 flex items-center gap-1.5">
+                        <span>{r['Decision maker name'] || r['Full name'] || r['Company name']}</span>
+                        {r['Gemini Verified'] === 'Yes' && (
+                          <span className="inline-flex items-center px-1.5 py-0.5 text-[9px] font-bold rounded bg-indigo-50 text-indigo-700 border border-indigo-200" title="Cleaned & Verified with Gemini AI">
+                            <Sparkles className="w-2.5 h-2.5 mr-0.5 text-indigo-500" />
+                            AI Verified
+                          </span>
+                        )}
+                      </div>
                       <div className="text-[11px] text-slate-400">{r['DM confidence'] || r['Contact type'] || 'Verified'}</div>
                     </td>
                     <td className="py-3 px-4 text-slate-700 font-medium max-w-[200px] truncate" title={r['Decision maker title'] || r.Title}>
