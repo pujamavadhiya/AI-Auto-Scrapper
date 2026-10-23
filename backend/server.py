@@ -459,6 +459,11 @@ def start_keyword_collector(payload: StartCollectorPayload):
     target = max(1, min(int(payload.targetCount or 50), 2000))
     titles = payload.titles if payload.titles else ["CEO", "Founder", "COO", "Owner", "Director", "VP"]
 
+    verify_gemini = bool(payload.verifyWithGemini) if payload.verifyWithGemini is not None else True
+    gemini_key = (payload.geminiApiKey or os.environ.get("GEMINI_API_KEY", "")).strip()
+    serper_key = os.environ.get("SERPER_API_KEY", "").strip()
+    serpapi_key = os.environ.get("SERPAPI_KEY", "").strip()
+
     cfg = CollectorConfig(
         keywords=clean_kws,
         country=payload.country or "",
@@ -469,10 +474,10 @@ def start_keyword_collector(payload: StartCollectorPayload):
         company_size_filter=payload.companySize or "all",
         enrich_company=bool(payload.enrichCompany),
         delay_range=(0.4, 0.9),
+        gemini_api_key=gemini_key,
+        serper_api_key=serper_key,
+        serpapi_api_key=serpapi_key,
     )
-
-    verify_gemini = bool(payload.verifyWithGemini) if payload.verifyWithGemini is not None else True
-    gemini_key = (payload.geminiApiKey or os.environ.get("GEMINI_API_KEY", "")).strip()
 
     task_id = f"task_{uuid.uuid4().hex[:10]}"
     COLLECTOR_TASKS[task_id] = {

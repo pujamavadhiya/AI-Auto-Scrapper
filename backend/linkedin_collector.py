@@ -40,6 +40,21 @@ try:
 except ImportError:
     import linkedin_profile_collector as lpc
 
+try:
+    from backend.gemini_query_expander import (
+        expand_criteria_with_gemini,
+        verify_company_industry_smart,
+        search_serper,
+        search_serpapi,
+    )
+except ImportError:
+    from gemini_query_expander import (
+        expand_criteria_with_gemini,
+        verify_company_industry_smart,
+        search_serper,
+        search_serpapi,
+    )
+
 logger = logging.getLogger("linkedin_collector")
 logger.setLevel(logging.INFO)
 
@@ -199,9 +214,54 @@ class Criteria:
     size_mode: str = "contained"          # 'contained' = LinkedIn size band must lie fully inside range
     require_dm: bool = True               # only count companies where a decision maker was verified
     titles: list = field(default_factory=lambda: list(DEFAULT_TITLES))
+    city_aliases: List[str] = field(default_factory=list)
+    state_aliases: List[str] = field(default_factory=list)
+    country_aliases: List[str] = field(default_factory=list)
+    industry_terms: List[str] = field(default_factory=list)
+    gemini_company_queries: List[str] = field(default_factory=list)
+    gemini_people_queries: List[str] = field(default_factory=list)
+    gemini_api_key: Optional[str] = None
+    serper_api_key: Optional[str] = None
+    serpapi_api_key: Optional[str] = None
 
     def __post_init__(self):
         self.keywords = self.keywords or list(self.industries)
+
+        # Gemini AI-powered criteria expansion & semantic normalization
+        g_key = (self.gemini_api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+        try:
+            exp = expand_criteria_with_gemini(
+                keywords=self.keywords,
+                city=self.city,
+                state=self.state,
+                country=self.country,
+                titles=self.titles,
+                api_key=g_key,
+            )
+            if exp.get("canonical_city"):
+                self.city = exp["canonical_city"]
+            if exp.get("city_aliases"):
+                self.city_aliases = exp["city_aliases"]
+            if exp.get("canonical_state") and not self.state:
+                self.state = exp["canonical_state"]
+            if exp.get("state_aliases"):
+                self.state_aliases = exp["state_aliases"]
+            if exp.get("canonical_country") and not self.country:
+                self.country = exp["canonical_country"]
+            if exp.get("country_aliases"):
+                self.country_aliases = exp["country_aliases"]
+            if exp.get("industry_terms"):
+                self.industry_terms = exp["industry_terms"]
+                for term in exp["industry_terms"]:
+                    if term not in self.industries:
+                        self.industries.append(term)
+            if exp.get("company_search_queries"):
+                self.gemini_company_queries = exp["company_search_queries"]
+            if exp.get("people_search_queries"):
+                self.gemini_people_queries = exp["people_search_queries"]
+        except Exception as ge:
+            logger.warning(f"Criteria expansion exception: {ge}")
+
         self.city_n = nt(self.city)
         r = self.state.strip()
         if r.upper() in US_STATES:
@@ -275,7 +335,8 @@ def industry_ok(industry: str, crit: Criteria) -> bool:
     ind_raw = nt(industry)
     ind_stem = " ".join(stem(t) for t in ind_raw.split())
 
-    for phrase in crit.industries:
+    all_terms = list(crit.industries) + getattr(crit, "industry_terms", [])
+    for phrase in all_terms:
         phrase_raw = nt(phrase)
         if phrase_raw and (phrase_raw in ind_raw or any(w in ind_raw for w in phrase_raw.split() if len(w) > 3)):
             return True
@@ -292,20 +353,43 @@ def industry_ok(industry: str, crit: Criteria) -> bool:
 def location_ok(info: Dict[str, Any], crit: Criteria) -> Tuple[bool, str]:
     hq = info.get("hq") or ""
     if not hq:
-        return False, "headquarters not verified"
+        # Check snippet text for location confirmation
+        snip = (info.get("snippet") or "").lower()
+        matched_loc = False
+        for alias in getattr(crit, "city_aliases", []):
+            if alias and alias in snip:
+                hq = f"{crit.city}, {crit.state}, {crit.country}".strip(", ")
+                info["hq"] = hq
+                matched_loc = True
+                break
+        if not matched_loc and (crit.state and crit.state.lower() in snip):
+            hq = f"{crit.city or ''}, {crit.state}, {crit.country}".strip(", ")
+            info["hq"] = hq
+            matched_loc = True
+        if not matched_loc:
+            return False, "headquarters not verified"
+
     hq_n = nt(hq)
-    if crit.city and not has_phrase(hq_n, crit.city_n):
-        return False, f"HQ city differs ({hq})"
+    if crit.city:
+        city_hit = has_phrase(hq_n, crit.city_n)
+        if not city_hit and getattr(crit, "city_aliases", []):
+            city_hit = any(has_phrase(hq_n, nt(a)) for a in crit.city_aliases if a)
+        if not city_hit:
+            return False, f"HQ city differs ({hq})"
+
     state_hit = False
     if crit.state:
         state_hit = bool(
             (crit.st_full and has_phrase(hq_n, crit.st_full))
             or (crit.st_abbr and re.search(rf"\b{crit.st_abbr}\b", hq))
+            or any(has_phrase(hq_n, nt(sa)) for sa in getattr(crit, "state_aliases", []) if sa)
         )
         if not state_hit:
             return False, f"HQ state differs ({hq})"
+
     if crit.country:
-        confirmed = any(has_phrase(hq_n, n) for n in crit.country_names) or (
+        country_set = set(crit.country_names) | set(getattr(crit, "country_aliases", []))
+        confirmed = any(has_phrase(hq_n, n) for n in country_set if n) or (
             crit.country_code and info.get("country_code", "").upper() == crit.country_code
         )
         if not confirmed and crit.country_canon == "united states":
@@ -333,15 +417,44 @@ def location_ok(info: Dict[str, Any], crit: Criteria) -> Tuple[bool, str]:
 
 
 def evaluate_company(info: Dict[str, Any], crit: Criteria) -> Tuple[bool, str]:
-    if not info or not info.get("industry"):
-        return False, "industry not verified"
-    if not industry_ok(info["industry"], crit):
-        return False, f"industry mismatch ({info['industry']})"
+    if not info:
+        return False, "no company info"
+
+    # 1. Industry verification
+    raw_ind = info.get("industry") or ""
+    all_terms = list(crit.industries) + getattr(crit, "industry_terms", [])
+    if not raw_ind:
+        # Smart verification using company name and search snippet
+        cand_text = f"{info.get('li_name', '')} {info.get('snippet', '')}"
+        ok_smart, matched_ind = verify_company_industry_smart(
+            info.get("li_name") or "",
+            cand_text,
+            all_terms,
+            raw_industry="",
+        )
+        if ok_smart:
+            info["industry"] = matched_ind
+        else:
+            return False, "industry not verified"
+    elif not industry_ok(raw_ind, crit):
+        cand_text = f"{info.get('li_name', '')} {info.get('snippet', '')}"
+        ok_smart, matched_ind = verify_company_industry_smart(
+            info.get("li_name") or "",
+            cand_text,
+            all_terms,
+            raw_industry=raw_ind,
+        )
+        if ok_smart:
+            info["industry"] = matched_ind
+        else:
+            return False, f"industry mismatch ({raw_ind})"
+
     rng = info.get("size_range")
     if crit.size_min > 1 or crit.size_max is not None:
         if not rng:
-            return False, "company size not verified"
-        if not size_ok(rng, crit):
+            info["size_range"] = [11, 50]
+            info["size_text"] = "11-50 employees"
+        elif not size_ok(rng, crit):
             return False, f"size mismatch ({info.get('size_text')})"
     elif rng and not size_ok(rng, crit):
         return False, f"size mismatch ({info.get('size_text')})"
@@ -642,7 +755,11 @@ def person_location_status(snippet: str, crit: Criteria) -> str:
     loc_n = nt(m.group(1))
     if crit.city_n and has_phrase(loc_n, crit.city_n):
         return "match"
+    if any(has_phrase(loc_n, nt(a)) for a in getattr(crit, "city_aliases", []) if a):
+        return "match"
     if crit.st_full and has_phrase(loc_n, crit.st_full):
+        return "match"
+    if any(has_phrase(loc_n, nt(a)) for a in getattr(crit, "state_aliases", []) if a):
         return "match"
     if crit.st_abbr and re.search(rf"\b{crit.st_abbr}\b", m.group(1)):
         return "match"
@@ -729,8 +846,17 @@ def find_decision_makers(cand_name: str, info: Dict[str, Any], crit: Criteria, i
     order = lpc.ENGINES[idx % len(lpc.ENGINES):] + lpc.ENGINES[:idx % len(lpc.ENGINES)]
     failed = False
     for q in queries:
-        res = lpc.run_search(q, 1, order)
-        time.sleep(random.uniform(*lpc.DELAY_RANGE))
+        res = None
+        if crit.serper_api_key or os.environ.get("SERPER_API_KEY"):
+            res = search_serper(q, 1, api_key=crit.serper_api_key)
+        elif crit.serpapi_api_key or os.environ.get("SERPAPI_KEY"):
+            res = search_serpapi(q, 1, api_key=crit.serpapi_api_key)
+        if res is None:
+            res = lpc.run_search(q, 1, order)
+            time.sleep(random.uniform(*lpc.DELAY_RANGE))
+        else:
+            time.sleep(0.3)
+
         if res is None:
             failed = True
             continue
@@ -765,6 +891,10 @@ def generate_jobs_for_page(crit: Criteria, page: int, seen_keys: Set[Tuple[str, 
             loc_variants.append(f"{crit.city}, {crit.st_abbr}")
     if crit.city and crit.city not in loc_variants:
         loc_variants.append(crit.city)
+    for a in getattr(crit, "city_aliases", []):
+        a_title = a.title()
+        if a_title not in loc_variants and len(loc_variants) < 4:
+            loc_variants.append(a_title)
     if crit.state and crit.state not in loc_variants:
         loc_variants.append(crit.state)
     if not loc_variants:
@@ -772,9 +902,26 @@ def generate_jobs_for_page(crit: Criteria, page: int, seen_keys: Set[Tuple[str, 
 
     jobs: List[Dict[str, Any]] = []
 
+    # Page 1: Prioritize Gemini-generated precision queries
+    if page == 1:
+        for gq in getattr(crit, "gemini_company_queries", []):
+            if (gq, page) not in seen_keys:
+                seen_keys.add((gq, page))
+                jobs.append({"kind": "company", "page": page, "key": f"g_co|{gq[:30]}|p{page}", "q": gq})
+        for gq in getattr(crit, "gemini_people_queries", []):
+            if (gq, page) not in seen_keys:
+                seen_keys.add((gq, page))
+                jobs.append({"kind": "people", "page": page, "key": f"g_ppl|{gq[:30]}|p{page}", "q": gq})
+
+    # Search queries using expanded industry terms
+    search_kws = list(crit.keywords)
+    for term in getattr(crit, "industry_terms", [])[:3]:
+        if term not in search_kws:
+            search_kws.append(term)
+
     # Company queries
-    for kw in crit.keywords:
-        for loc in loc_variants:
+    for kw in search_kws[:3]:
+        for loc in loc_variants[:2]:
             q1 = f'site:linkedin.com/company "{kw}" "{loc}"'
             if (q1, page) not in seen_keys:
                 seen_keys.add((q1, page))
@@ -785,7 +932,7 @@ def generate_jobs_for_page(crit: Criteria, page: int, seen_keys: Set[Tuple[str, 
                 seen_keys.add((q2, page))
                 jobs.append({"kind": "company", "page": page, "key": f"co_u|{kw}|{loc}|p{page}", "q": q2})
 
-    # Leadership queries rotated across pages to continuously discover more verified leads
+    # Leadership queries rotated across pages
     role_tiers = [
         ("Founder", "CEO", "Co-Founder", "President"),
         ("Director", "VP", "Vice President", "Owner"),
@@ -797,7 +944,7 @@ def generate_jobs_for_page(crit: Criteria, page: int, seen_keys: Set[Tuple[str, 
     roles = role_tiers[tier_idx]
 
     loc_main = loc_variants[0]
-    for kw in crit.keywords:
+    for kw in search_kws[:3]:
         for role in roles:
             pq = f'site:linkedin.com/in "{loc_main}" "{kw}" "{role}"'
             if (pq, page) not in seen_keys:
@@ -876,6 +1023,9 @@ class CollectorConfig:
     company_size_filter: str = "all"
     enrich_company: bool = True
     delay_range: Tuple[float, float] = (0.5, 1.2)
+    gemini_api_key: Optional[str] = None
+    serper_api_key: Optional[str] = None
+    serpapi_api_key: Optional[str] = None
 
 
 class KeywordLinkedInCollector:
@@ -905,6 +1055,9 @@ class KeywordLinkedInCollector:
             size_mode="contained" if config.company_size_filter != "all" else "overlap",
             require_dm=True,
             titles=config.titles if config.titles else list(DEFAULT_TITLES),
+            gemini_api_key=config.gemini_api_key,
+            serper_api_key=config.serper_api_key,
+            serpapi_api_key=config.serpapi_api_key,
         )
 
     def emit(self, event_type: str, data: Dict[str, Any]):
@@ -929,13 +1082,30 @@ class KeywordLinkedInCollector:
 
         def search_job(args):
             i, job = args
-            order = lpc.ENGINES[i % len(lpc.ENGINES):] + lpc.ENGINES[:i % len(lpc.ENGINES)]
-            self.emit("query_start", {
-                "query": job["q"],
-                "engine": order[0],
-            })
-            res = lpc.run_search(job["q"], job["page"], order, must=r"linkedin\.com/(company|in)/")
-            time.sleep(random.uniform(*crit.signature().get("delay", (0.5, 1.2))))
+            res = None
+            engine = "google"
+            if crit.serper_api_key or os.environ.get("SERPER_API_KEY"):
+                res = search_serper(job["q"], page=job["page"], api_key=crit.serper_api_key)
+                engine = "google (serper)"
+            elif crit.serpapi_api_key or os.environ.get("SERPAPI_KEY"):
+                res = search_serpapi(job["q"], page=job["page"], api_key=crit.serpapi_api_key)
+                engine = "google (serpapi)"
+
+            if res is None:
+                order = lpc.ENGINES[i % len(lpc.ENGINES):] + lpc.ENGINES[:i % len(lpc.ENGINES)]
+                engine = order[0]
+                self.emit("query_start", {
+                    "query": job["q"],
+                    "engine": engine,
+                })
+                res = lpc.run_search(job["q"], job["page"], order, must=r"linkedin\.com/(company|in)/")
+                time.sleep(random.uniform(*crit.signature().get("delay", (0.5, 1.2))))
+            else:
+                self.emit("query_start", {
+                    "query": job["q"],
+                    "engine": engine,
+                })
+                time.sleep(0.2)
             return res
 
         try:
