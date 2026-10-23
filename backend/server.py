@@ -87,8 +87,17 @@ class SocialStartPayload(BaseModel):
 class DecisionMakerPayload(BaseModel):
     records: List[Dict[str, Any]]
     serpapiKey: Optional[str] = None
+    serperKey: Optional[str] = None
+    serperApiKey: Optional[str] = None
+    engine: Optional[str] = "serpapi"  # "serpapi" | "serper"
     maxQueries: Optional[int] = 2
     delay: Optional[float] = 0.5
+
+
+class UpdateDecisionMakerConfigPayload(BaseModel):
+    serpapiKey: Optional[str] = None
+    serperKey: Optional[str] = None
+    defaultEngine: Optional[str] = None
 
 
 class ContactEnrichPayload(BaseModel):
@@ -753,40 +762,94 @@ def export_social_media_data(task_id: str):
 
 
 # =====================================================================
-# Decision Maker Finder with OpenAI Intelligence & Web Dorking
+# Decision Maker Finder with SerpApi & Serper.dev Dual-Engine Intelligence
 # =====================================================================
 
 @app.get("/api/decision-makers/config")
 def get_decision_makers_config():
-    """Returns SerpApi configuration status for Decision Maker Finder."""
+    """Returns SerpApi and Serper.dev configuration status for Decision Maker Finder."""
     load_dotenv(ROOT_DIR / ".env", override=True)
-    api_key = os.environ.get("SERPAPI_KEY", "").strip()
-    is_set = bool(api_key and not api_key.startswith("your_"))
-    masked = (api_key[:4] + "..." + api_key[-4:]) if is_set and len(api_key) > 8 else ("configured" if is_set else "missing")
+    serp_key = os.environ.get("SERPAPI_KEY", "").strip()
+    serp_set = bool(serp_key and not serp_key.startswith("your_"))
+    serp_masked = (serp_key[:4] + "..." + serp_key[-4:]) if serp_set and len(serp_key) > 8 else ("configured" if serp_set else "missing")
+
+    serper_key = os.environ.get("SERPER_API_KEY", "").strip()
+    serper_set = bool(serper_key and not serper_key.startswith("your_"))
+    serper_masked = (serper_key[:4] + "..." + serper_key[-4:]) if serper_set and len(serper_key) > 8 else ("configured" if serper_set else "missing")
+
     return {
         "status": "ok",
-        "hasSerpApiKey": is_set,
-        "keyPreview": masked,
-        "engine": "SerpApi Decision Maker Finder",
+        "hasSerpApiKey": serp_set,
+        "serpApiKeyPreview": serp_masked,
+        "keyPreview": serp_masked,  # backwards compatibility
+        "hasSerperApiKey": serper_set,
+        "serperApiKeyPreview": serper_masked,
+        "defaultEngine": "serpapi",
+        "supportedEngines": ["serpapi", "serper"],
+        "engine": "Dual-Engine (SerpApi / Serper.dev)",
     }
+
+
+@app.post("/api/decision-makers/config")
+def update_decision_makers_config(payload: UpdateDecisionMakerConfigPayload):
+    """Updates SERPAPI_KEY or SERPER_API_KEY in .env."""
+    env_file = ROOT_DIR / ".env"
+    lines = []
+    if env_file.exists():
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+
+    updated_vars = {}
+    if payload.serpapiKey is not None:
+        clean = payload.serpapiKey.strip()
+        os.environ["SERPAPI_KEY"] = clean
+        updated_vars["SERPAPI_KEY"] = clean
+
+    if payload.serperKey is not None:
+        clean = payload.serperKey.strip()
+        os.environ["SERPER_API_KEY"] = clean
+        updated_vars["SERPER_API_KEY"] = clean
+
+    for var_name, var_val in updated_vars.items():
+        found = False
+        new_lines = []
+        for line in lines:
+            if line.startswith(f"{var_name}="):
+                new_lines.append(f"{var_name}={var_val}")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"{var_name}={var_val}")
+        lines = new_lines
+
+    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {"status": "ok", "message": "Decision Maker Finder keys saved successfully."}
 
 
 @app.post("/api/enrich/decision-makers")
 def enrich_decision_makers(payload: DecisionMakerPayload):
     """
     Enriches candidate records with verified Decision Maker Name, Position, and LinkedIn.
-    Uses precision SerpApi Google dorking and title ranking algorithm.
+    Supports selecting between SerpApi and Serper.dev engines.
+    Both produce identical output fields:
+        - Decision Maker Name (personName)
+        - Decision Maker Post (title)
+        - Decision Maker Linkedin (linkedinUrl)
+        - Decision Maker Confidence (confidenceScore / confidence)
     """
     records = payload.records
     if not records:
         return {"status": "ok", "results": []}
 
     load_dotenv(ROOT_DIR / ".env", override=True)
-    api_key = (payload.serpapiKey or os.environ.get("SERPAPI_KEY", "")).strip()
-    max_queries = payload.maxQueries or 2
-    delay = payload.delay or 0.5
+    engine = (payload.engine or "serpapi").lower().strip()
+    serpapi_key = (payload.serpapiKey or os.environ.get("SERPAPI_KEY", "")).strip()
+    serper_key = (payload.serperKey or payload.serperApiKey or os.environ.get("SERPER_API_KEY", "")).strip()
 
-    finder = DecisionMakerFinder(serpapi_key=api_key)
+    max_queries = payload.maxQueries or 2
+    delay = payload.delay if payload.delay is not None else (0.6 if engine == "serper" else 0.5)
+
+    finder = DecisionMakerFinder(serpapi_key=serpapi_key, serper_key=serper_key, engine=engine)
     enriched_results: List[Dict[str, Any]] = []
 
     for r in records:
@@ -829,8 +892,9 @@ def enrich_decision_makers(payload: DecisionMakerPayload):
             company=str(comp_name).strip(),
             website=str(comp_site).strip(),
             company_li=str(comp_li).strip(),
-            api_key=api_key,
+            api_key=serper_key if engine == "serper" else serpapi_key,
             max_queries=max_queries,
+            engine=engine,
         )
 
         out_record = dict(r)
@@ -848,7 +912,7 @@ def enrich_decision_makers(payload: DecisionMakerPayload):
             out_record["notes"] = res.evidence
             out_record["lastEnrichedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-            # Also populate user's expected columns: Decision Maker Name | Decision Maker Post | Decision Maker Linkedin
+            # Populate standard columns: Decision Maker Name | Decision Maker Post | Decision Maker Linkedin
             if "customFields" not in out_record or not isinstance(out_record["customFields"], dict):
                 out_record["customFields"] = {}
             out_record["customFields"]["Decision Maker Name"] = res.decision_maker_name
@@ -856,8 +920,8 @@ def enrich_decision_makers(payload: DecisionMakerPayload):
             out_record["customFields"]["Decision Maker Linkedin"] = res.personal_linkedin_url
             out_record["customFields"]["Decision Maker Confidence"] = res.confidence
         else:
-            out_record["enrichmentStatus"] = "not_found"
-            out_record["notes"] = res.evidence or "No verified decision maker found."
+            out_record["enrichmentStatus"] = "error" if res.status == "error" else "not_found"
+            out_record["notes"] = res.error_message or res.evidence or "No verified decision maker found."
             out_record["confidenceScore"] = 0
             out_record["confidence"] = "none"
 

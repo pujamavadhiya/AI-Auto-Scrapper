@@ -44,16 +44,29 @@ export const DecisionMakerFinder: React.FC = () => {
   // Bulk paste text state
   const [bulkPasteText, setBulkPasteText] = useState('');
 
-  // SerpApi status from backend server
+  // Engine selection state: 'serpapi' | 'serper'
+  const [selectedEngine, setSelectedEngine] = useState<'serpapi' | 'serper'>(() => {
+    return storageService.getSettings()?.defaultDecisionMakerEngine || 'serpapi';
+  });
+
+  // Backend config status for both SerpApi and Serper
   const [serverConfig, setServerConfig] = useState<{
     hasSerpApiKey: boolean;
-    keyPreview: string;
-    engine: string;
+    serpApiKeyPreview: string;
+    hasSerperApiKey: boolean;
+    serperApiKeyPreview: string;
+    defaultEngine: string;
   }>({
     hasSerpApiKey: false,
-    keyPreview: 'checking...',
-    engine: 'SerpApi Decision Maker Finder',
+    serpApiKeyPreview: 'checking...',
+    hasSerperApiKey: false,
+    serperApiKeyPreview: 'checking...',
+    defaultEngine: 'serpapi',
   });
+
+  // Inline API key entry state if selected engine is missing a key
+  const [inlineKeyInput, setInlineKeyInput] = useState('');
+  const [isSavingInlineKey, setIsSavingInlineKey] = useState(false);
 
   const [config, setConfig] = useState<ResearchConfig>({
     seniorityLevels: ['Owner', 'Founder', 'CEO', 'Managing Director'],
@@ -84,7 +97,7 @@ export const DecisionMakerFinder: React.FC = () => {
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Check backend SerpApi config on mount
+  // Check backend engine config on mount
   useEffect(() => {
     const checkServerConfig = async () => {
       const apiBase = getApiBaseUrl();
@@ -95,8 +108,10 @@ export const DecisionMakerFinder: React.FC = () => {
           const data = await res.json();
           setServerConfig({
             hasSerpApiKey: !!data.hasSerpApiKey,
-            keyPreview: data.keyPreview || 'missing',
-            engine: data.engine || 'SerpApi Decision Maker Finder',
+            serpApiKeyPreview: data.serpApiKeyPreview || data.keyPreview || 'missing',
+            hasSerperApiKey: !!data.hasSerperApiKey,
+            serperApiKeyPreview: data.serperApiKeyPreview || 'missing',
+            defaultEngine: data.defaultEngine || 'serpapi',
           });
         }
       } catch (e) {
@@ -105,6 +120,47 @@ export const DecisionMakerFinder: React.FC = () => {
     };
     checkServerConfig();
   }, []);
+
+  const handleSaveInlineKey = async () => {
+    const cleanKey = inlineKeyInput.trim();
+    if (!cleanKey) return;
+    setIsSavingInlineKey(true);
+    try {
+      const apiBase = getApiBaseUrl();
+      if (apiBase) {
+        await fetch(`${apiBase}/api/decision-makers/config`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(
+            selectedEngine === 'serper'
+              ? { serperKey: cleanKey }
+              : { serpapiKey: cleanKey }
+          ),
+        });
+      }
+      if (selectedEngine === 'serper') {
+        storageService.saveSettings({ serperApiKey: cleanKey });
+        setServerConfig((prev) => ({
+          ...prev,
+          hasSerperApiKey: true,
+          serperApiKeyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
+        }));
+      } else {
+        storageService.saveSettings({ serpApiKey: cleanKey });
+        setServerConfig((prev) => ({
+          ...prev,
+          hasSerpApiKey: true,
+          serpApiKeyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
+        }));
+      }
+      setInlineKeyInput('');
+      alert(`${selectedEngine === 'serper' ? 'Serper.dev' : 'SerpApi'} key saved successfully!`);
+    } catch (e: any) {
+      alert(`Failed to save key: ${e.message}`);
+    } finally {
+      setIsSavingInlineKey(false);
+    }
+  };
 
   const handleFileParsed = (parsed: ParsedFileResult) => {
     setParsedFile(parsed);
@@ -282,9 +338,14 @@ export const DecisionMakerFinder: React.FC = () => {
     abortControllerRef.current = new AbortController();
 
     try {
+      const activeSettings = storageService.getSettings();
       await decisionMakerService.enrichBatch(
         targets,
-        config,
+        {
+          ...config,
+          decisionMakerEngine: selectedEngine,
+          serperApiKey: config.serperApiKey || activeSettings?.serperApiKey,
+        },
         (p) => setProgress(p),
         abortControllerRef.current.signal,
         (chunkResults) => {
@@ -336,36 +397,135 @@ export const DecisionMakerFinder: React.FC = () => {
         totalRecordsCount={records.length}
       />
 
-      {/* SerpApi Status Banner */}
-      <div className="p-4 rounded-2xl bg-white border border-slate-200/80 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div className="flex items-center gap-2.5">
-          <div className={`p-2 rounded-xl ${serverConfig.hasSerpApiKey ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
-            <Sparkles className="w-5 h-5" />
+      {/* Dual Engine Selector: SerpApi vs Serper.dev */}
+      <div className="p-4 rounded-2xl bg-white border border-slate-200/80 shadow-xs space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-slate-100">
+          <div className="flex items-center gap-2">
+            <div className="p-1.5 rounded-lg bg-blue-50 text-blue-600">
+              <Sparkles className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-xs font-bold text-slate-900 tracking-tight">
+                Search Engine Engine: Choose SerpApi or Serper.dev
+              </h3>
+              <p className="text-[11px] text-slate-500">
+                Select which API to use for finding decision makers. Both engines return identical fields: <span className="font-semibold text-slate-700">Decision Maker Name</span>, <span className="font-semibold text-slate-700">Decision Maker Post</span>, and <span className="font-semibold text-slate-700">Decision Maker Linkedin</span>.
+              </p>
+            </div>
           </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-bold text-slate-900">SerpApi Precision Decision Maker Algorithm</span>
+          <div className="text-[11px] font-mono text-slate-400 shrink-0">
+            Active: <span className="font-bold text-blue-600">{selectedEngine === 'serper' ? 'Serper.dev' : 'SerpApi'}</span>
+          </div>
+        </div>
+
+        {/* Engine Toggle Buttons */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {/* SerpApi Option */}
+          <button
+            type="button"
+            onClick={() => setSelectedEngine('serpapi')}
+            className={`p-3.5 rounded-xl border text-left transition-all relative ${
+              selectedEngine === 'serpapi'
+                ? 'border-blue-600 bg-blue-50/40 ring-2 ring-blue-600/20 shadow-xs'
+                : 'border-slate-200 hover:border-slate-300 bg-white hover:bg-slate-50/50'
+            }`}
+          >
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-slate-900">SerpApi (Google Engine)</span>
+                {selectedEngine === 'serpapi' && (
+                  <Badge variant="default" className="text-[9px] font-semibold py-0 px-1.5 bg-blue-600 text-white">
+                    Selected
+                  </Badge>
+                )}
+              </div>
               {serverConfig.hasSerpApiKey ? (
                 <Badge variant="success" className="text-[10px] font-semibold py-0.5 px-2">
                   <CheckCircle2 className="w-3 h-3 mr-1 inline" />
-                  SerpApi Connected ({serverConfig.keyPreview})
+                  Connected ({serverConfig.serpApiKeyPreview})
                 </Badge>
               ) : (
                 <Badge variant="danger" className="text-[10px] font-semibold py-0.5 px-2">
                   <AlertCircle className="w-3 h-3 mr-1 inline" />
-                  SERPAPI_KEY Missing in .env
+                  Key Missing
                 </Badge>
               )}
             </div>
-            <p className="text-[11px] text-slate-500 mt-0.5">
-              Searches Google via SerpApi for LinkedIn profiles, verifies company matching, and selects the top executive (Owner, Founder, CEO, President, MD).
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              Hierarchical Boolean queries with executive seniority ranks (Owner, Founder, CEO, MD, VP).
             </p>
-          </div>
+          </button>
+
+          {/* Serper.dev Option */}
+          <button
+            type="button"
+            onClick={() => setSelectedEngine('serper')}
+            className={`p-3.5 rounded-xl border text-left transition-all relative ${
+              selectedEngine === 'serper'
+                ? 'border-blue-600 bg-blue-50/40 ring-2 ring-blue-600/20 shadow-xs'
+                : 'border-slate-200 hover:border-slate-300 bg-white hover:bg-slate-50/50'
+            }`}
+          >
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-slate-900">Serper.dev (Google Serper API)</span>
+                {selectedEngine === 'serper' && (
+                  <Badge variant="default" className="text-[9px] font-semibold py-0 px-1.5 bg-blue-600 text-white">
+                    Selected
+                  </Badge>
+                )}
+              </div>
+              {serverConfig.hasSerperApiKey ? (
+                <Badge variant="success" className="text-[10px] font-semibold py-0.5 px-2">
+                  <CheckCircle2 className="w-3 h-3 mr-1 inline" />
+                  Connected ({serverConfig.serperApiKeyPreview})
+                </Badge>
+              ) : (
+                <Badge variant="danger" className="text-[10px] font-semibold py-0.5 px-2">
+                  <AlertCircle className="w-3 h-3 mr-1 inline" />
+                  Key Missing
+                </Badge>
+              )}
+            </div>
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              Fast JSON Google search with n8n keyword weighting and company token matching (+20 boost).
+            </p>
+          </button>
         </div>
 
-        <div className="text-xs text-slate-400 self-start sm:self-auto font-mono">
-          Outputs: Decision Maker Name | Post | Linkedin
-        </div>
+        {/* If active engine is missing an API key, show an inline key entry */}
+        {((selectedEngine === 'serpapi' && !serverConfig.hasSerpApiKey) ||
+          (selectedEngine === 'serper' && !serverConfig.hasSerperApiKey)) && (
+          <div className="p-3 bg-amber-50/70 border border-amber-200 rounded-xl flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 animate-in fade-in">
+            <div className="text-xs text-amber-900 space-y-0.5">
+              <div className="font-semibold flex items-center gap-1.5">
+                <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                Missing {selectedEngine === 'serper' ? 'Serper.dev API Key' : 'SerpApi Key'}
+              </div>
+              <p className="text-[11px] text-amber-700">
+                Paste your key below to save it to your local environment.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="password"
+                value={inlineKeyInput}
+                onChange={(e) => setInlineKeyInput(e.target.value)}
+                placeholder={selectedEngine === 'serper' ? 'Enter Serper API Key...' : 'Enter SerpApi Key...'}
+                className="px-2.5 py-1.5 text-xs font-mono rounded-lg border border-amber-300 bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 w-48 sm:w-60"
+              />
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleSaveInlineKey}
+                disabled={isSavingInlineKey || !inlineKeyInput.trim()}
+                className="text-xs shrink-0"
+              >
+                {isSavingInlineKey ? 'Saving...' : 'Save Key'}
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Tabs Navigation */}

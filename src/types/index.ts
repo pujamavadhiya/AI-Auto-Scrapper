@@ -81,6 +81,8 @@ export interface ResearchConfig {
   geminiModel?: string;
   openAiApiKey?: string;
   openAiModel?: string;
+  decisionMakerEngine?: 'serpapi' | 'serper';
+  serperApiKey?: string;
 }
 
 export interface Project {
@@ -149,6 +151,8 @@ export interface AppSettings {
   openAiApiKey?: string;
   openAiModel?: string;
   serpApiKey?: string;
+  serperApiKey?: string;
+  defaultDecisionMakerEngine?: 'serpapi' | 'serper';
   leadoceanApiKey?: string;
   leadoceanEndpoint?: string;
 }

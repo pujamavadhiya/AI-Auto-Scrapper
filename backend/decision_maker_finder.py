@@ -70,6 +70,17 @@ COL_DM_LI = "Decision Maker Linkedin"
 COL_DM_CONF = "Decision Maker Confidence"     # optional; skipped if not in sheet
 
 SERPAPI_URL = "https://serpapi.com/search.json"
+SERPER_URL = "https://google.serper.dev/search"
+SERPER_INTERVAL = 0.6                         # Batch interval between Serper calls
+
+# Serper keyword weights (same as n8n / Serper script)
+SERPER_PRIORITY: List[Tuple[str, int]] = [
+    ("co-founder", 10), ("founder", 10), ("ceo", 10), ("chief executive", 10),
+    ("owner", 9), ("president", 8), ("managing director", 8), ("managing partner", 8),
+    ("principal", 7), ("partner", 7), ("cmo", 6), ("coo", 6), ("cto", 6),
+    ("chief", 5), ("vice president", 4), ("vp ", 4), ("director", 3),
+    ("head of", 3), ("manager", 1),
+]
 
 # Most senior first. Lower index = better.
 TITLE_PRIORITY = [
@@ -96,6 +107,13 @@ COMPANY_SUFFIXES = {
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def title_case(s: str) -> str:
+    """'acme-tobacco-123' -> 'Acme Tobacco' (drops numeric / long-hex parts)."""
+    words = [w for w in re.split(r"[-_]+", str(s or ""))
+             if w and not re.fullmatch(r"\d+", w) and not re.fullmatch(r"[0-9a-fA-F]{8,}", w)]
+    return " ".join(w[:1].upper() + w[1:] for w in words)
+
+
 def norm(text: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9 ]", " ", (text or "").lower())
 
@@ -220,7 +238,7 @@ def serp_search(query: str, api_key: str, num: int = 10, retries: int = 2) -> Li
     return []
 
 
-def find_decision_maker(
+def find_decision_maker_serpapi(
     company: str,
     website: str = "",
     company_li: str = "",
@@ -229,7 +247,7 @@ def find_decision_maker(
 ) -> Optional[Dict[str, Any]]:
     """
     Returns dict(name, title, url, confidence) or None.
-    Uses user's precision SerpApi search groups, seniority rank, and company matching.
+    Uses precision SerpApi search groups, seniority rank, and company matching.
     """
     key = (api_key or os.environ.get("SERPAPI_KEY", "")).strip()
     if not key or not company:
@@ -274,6 +292,194 @@ def find_decision_maker(
 
 
 # --------------------------------------------------------------------------- #
+# Serper.dev API Engine
+# --------------------------------------------------------------------------- #
+_SERPER_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def build_serper_query(company_name: str) -> str:
+    return ('site:linkedin.com/in ("CEO" OR "Founder" OR "Co-Founder" OR "Owner" OR "President" '
+            'OR "Managing Director" OR "Managing Partner") "' + company_name + '"')
+
+
+def serper_search(query: str, api_key: str, num: int = 10, retries: int = 2) -> List[Dict[str, Any]]:
+    cache_key = f"{query.strip()}:{api_key[:6]}"
+    if cache_key in _SERPER_CACHE:
+        return _SERPER_CACHE[cache_key]
+
+    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(SERPER_URL, headers=headers, json={"q": query, "num": num}, timeout=40)
+            if r.status_code == 200:
+                results = r.json().get("organic", []) or []
+                _SERPER_CACHE[cache_key] = results
+                return results
+            if r.status_code in (401, 403):
+                logger.error(f"Serper auth error (HTTP {r.status_code}). Check SERPER_API_KEY.")
+                return []
+            if r.status_code == 400 and "credit" in r.text.lower():
+                logger.error("Serper: out of credits.")
+                return []
+            logger.warning(f"    Serper HTTP {r.status_code} (attempt {attempt + 1})")
+        except requests.RequestException as e:
+            logger.warning(f"    Serper network error: {e} (attempt {attempt + 1})")
+        time.sleep(1.5 * (attempt + 1))
+    return []
+
+
+def pick_decision_maker_serper(
+    company_name: str,
+    results: List[Dict[str, Any]],
+    company_li: str = "",
+    website: str = "",
+) -> Optional[Dict[str, Any]]:
+    """
+    Picks top decision maker from Serper organic results using keyword priority
+    and company name token verification (+20 boost for matching company).
+    """
+    toks, slug, domain = company_tokens(company_name, company_li, website)
+    name_words = [w for w in (norm(company_name).split() + toks) if len(w) > 2 and w not in COMPANY_SUFFIXES]
+
+    cands = []
+    for r in results:
+        link = clean_linkedin_url(r.get("link", ""))
+        if not link:
+            continue
+        raw_title = r.get("title", "") or ""
+        title = re.sub(r"\s*[|·]\s*LinkedIn.*$", "", raw_title, flags=re.I).strip()
+        parts = re.split(r"\s+[-–—]\s+|(?<=\s)[|•·/](?=\s)|[⚡️👑🚀💼]\s*", title)
+        name = (parts[0] if parts else "").strip()
+        name = re.sub(r",.*$", "", name).strip()
+        name = re.sub(r"[^\w\s.'’-]", "", name).strip()
+
+        role = " - ".join(parts[1:]).strip() if len(parts) > 1 else ""
+        if not role and len(name.split()) > 2:
+            m_title = re.search(r"\b(founder|co-founder|ceo|owner|director|president|partner|manager|chief|head of|vp|ex)\b", name, re.I)
+            if m_title and m_title.start() > 3:
+                role = name[m_title.start():].strip()
+                name = name[:m_title.start()].strip()
+
+        snippet = r.get("snippet", "") or ""
+        if not role:
+            m = re.search(r"([^·.|]+?)\s+(?:at|@)\s+", snippet)
+            if m:
+                role = m.group(1).strip()
+
+        if not name or "linkedin member" in name.lower() or len(name.split()) < 2:
+            continue
+
+        hay = (title + " " + snippet).lower()
+        score = 0
+        for k, v in SERPER_PRIORITY:
+            if k in hay:
+                score = max(score, v)
+
+        # Company match check
+        company_matched = False
+        if name_words and all(w in hay for w in name_words):
+            company_matched = True
+        elif slug and slug in hay:
+            company_matched = True
+        elif domain and len(domain) > 3 and domain in hay.replace(" ", ""):
+            company_matched = True
+
+        final_score = score + (20 if company_matched else 0)
+        cands.append({
+            "name": name,
+            "role": role,
+            "profile": link,
+            "score": final_score,
+            "companyMatch": company_matched,
+        })
+
+    cands = [c for c in cands if c["companyMatch"] or c["score"] >= 8]
+    cands.sort(key=lambda c: c["score"], reverse=True)
+    if not cands:
+        return None
+
+    top = cands[0]
+    conf = "high" if top["companyMatch"] or top["score"] >= 20 else "medium"
+    return {
+        "name": top["name"],
+        "title": top["role"],
+        "url": top["profile"],
+        "confidence": conf,
+        "score": top["score"],
+    }
+
+
+def find_decision_maker_serper(
+    company: str,
+    website: str = "",
+    company_li: str = "",
+    api_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    key = (api_key or os.environ.get("SERPER_API_KEY", "")).strip()
+    if not key:
+        logger.error("SERPER_API_KEY is not set.")
+        return None
+
+    comp = (company or "").strip()
+    # 1. If company_li is already a personal profile URL, extract person directly
+    m_person = re.search(r"linkedin\.com/(?:in|pub)/([^/?#]+)", company_li or "", re.I)
+    if m_person:
+        slug = m_person.group(1)
+        return {
+            "name": title_case(slug),
+            "title": "Executive",
+            "url": f"https://www.linkedin.com/in/{slug}",
+            "confidence": "high",
+            "score": 25,
+        }
+
+    # 2. Derive company name from company LinkedIn slug if company name is empty
+    if not comp and company_li:
+        m_comp = re.search(r"linkedin\.com/(?:company|showcase)/([^/?#]+)", company_li, re.I)
+        if m_comp:
+            slug = m_comp.group(1)
+            if not re.fullmatch(r"\d+", slug):
+                comp = title_case(re.sub(r"\.com$", "", slug, flags=re.I))
+
+    if not comp:
+        return None
+
+    query = build_serper_query(comp)
+    results = serper_search(query, key)
+    time.sleep(SERPER_INTERVAL)
+    top = pick_decision_maker_serper(comp, results, company_li=company_li, website=website)
+    return top
+
+
+def find_decision_maker(
+    company: str,
+    website: str = "",
+    company_li: str = "",
+    api_key: Optional[str] = None,
+    max_queries: int = 2,
+    engine: str = "serpapi",
+) -> Optional[Dict[str, Any]]:
+    """
+    Unified entry point supporting both 'serpapi' and 'serper'.
+    Outputs identical dict(name, title, url, confidence).
+    """
+    if (engine or "").lower() == "serper":
+        return find_decision_maker_serper(
+            company=company,
+            website=website,
+            company_li=company_li,
+            api_key=api_key,
+        )
+    return find_decision_maker_serpapi(
+        company=company,
+        website=website,
+        company_li=company_li,
+        api_key=api_key,
+        max_queries=max_queries,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Dataclass & Class Wrapper for FastAPI Server / Web Application
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -307,8 +513,15 @@ class DecisionMakerResult:
 
 
 class DecisionMakerFinder:
-    def __init__(self, serpapi_key: Optional[str] = None):
+    def __init__(
+        self,
+        serpapi_key: Optional[str] = None,
+        serper_key: Optional[str] = None,
+        engine: str = "serpapi",
+    ):
         self.serpapi_key = (serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
+        self.serper_key = (serper_key or os.environ.get("SERPER_API_KEY", "")).strip()
+        self.engine = (engine or "serpapi").lower().strip()
 
     def find_decision_maker(
         self,
@@ -317,27 +530,49 @@ class DecisionMakerFinder:
         company_li: str = "",
         api_key: Optional[str] = None,
         max_queries: int = 2,
+        engine: Optional[str] = None,
     ) -> DecisionMakerResult:
-        key = (api_key or self.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
+        active_engine = (engine or self.engine or "serpapi").lower().strip()
         comp = (company or "").strip()
         web = (website or "").strip()
         li = (company_li or "").strip()
 
-        if not comp:
+        # If company name is empty but company_li is given, resolve title
+        if not comp and li:
+            m_comp = re.search(r"linkedin\.com/(?:company|showcase)/([^/?#]+)", li, re.I)
+            if m_comp and not re.fullmatch(r"\d+", m_comp.group(1)):
+                comp = title_case(re.sub(r"\.com$", "", m_comp.group(1), flags=re.I))
+            elif re.search(r"linkedin\.com/(?:in|pub)/([^/?#]+)", li, re.I):
+                comp = "Profile Target"
+
+        if not comp and not li:
             return DecisionMakerResult(
                 company_name=comp,
                 status="error",
-                error_message="Company name is required.",
+                error_message="Company name or LinkedIn URL is required.",
             )
 
-        if not key:
-            return DecisionMakerResult(
-                company_name=comp,
-                status="error",
-                error_message="SERPAPI_KEY is missing. Please configure SERPAPI_KEY in .env or Settings.",
-            )
+        if active_engine == "serper":
+            key = (api_key or self.serper_key or os.environ.get("SERPER_API_KEY", "")).strip()
+            if not key:
+                return DecisionMakerResult(
+                    company_name=comp,
+                    status="error",
+                    error_message="SERPER_API_KEY is missing. Please configure SERPER_API_KEY in Settings or .env.",
+                )
+            dm = find_decision_maker_serper(comp, web, li, key)
+            engine_label = "Serper API"
+        else:
+            key = (api_key or self.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
+            if not key:
+                return DecisionMakerResult(
+                    company_name=comp,
+                    status="error",
+                    error_message="SERPAPI_KEY is missing. Please configure SERPAPI_KEY in Settings or .env.",
+                )
+            dm = find_decision_maker_serpapi(comp, web, li, key, max_queries)
+            engine_label = "SerpApi"
 
-        dm = find_decision_maker(comp, web, li, key, max_queries)
         if not dm:
             return DecisionMakerResult(
                 company_name=comp,
@@ -345,7 +580,7 @@ class DecisionMakerFinder:
                 company_linkedin_url=li,
                 confidence="none",
                 confidence_score=0,
-                evidence="No verified decision maker match found on Google/LinkedIn.",
+                evidence=f"No verified decision maker match found on Google/LinkedIn via {engine_label}.",
                 status="not_found",
             )
 
@@ -361,7 +596,7 @@ class DecisionMakerFinder:
             personal_linkedin_url=dm.get("url", ""),
             confidence=conf,
             confidence_score=conf_score,
-            evidence=f"Matched via SerpApi: {dm.get('name')} ({dm.get('title')}) with {conf} confidence.",
+            evidence=f"Matched via {engine_label}: {dm.get('name')} ({dm.get('title')}) with {conf} confidence.",
             status="enriched",
         )
 
@@ -404,13 +639,15 @@ def write_row(ws, header: List[str], row_number: int, values: Dict[str, Any]):
 # Main CLI
 # --------------------------------------------------------------------------- #
 def main():
-    ap = argparse.ArgumentParser(description="Find company decision makers + LinkedIn URLs via SerpApi.")
+    ap = argparse.ArgumentParser(description="Find company decision makers + LinkedIn URLs via SerpApi or Serper.dev.")
+    ap.add_argument("--engine", choices=["serpapi", "serper"], default="serpapi", help="Which search engine API to use: serpapi or serper")
     ap.add_argument("--creds", help="Google service-account JSON key (for Google Sheets)")
     ap.add_argument("--input", help="Local CSV or Excel file to process")
     ap.add_argument("--company", help="Single company name to test directly")
     ap.add_argument("--website", default="", help="Company website for --company test")
     ap.add_argument("--linkedin", default="", help="Company LinkedIn URL for --company test")
     ap.add_argument("--serpapi-key", default=os.getenv("SERPAPI_KEY"), help="SerpApi key (or env SERPAPI_KEY)")
+    ap.add_argument("--serper-key", default=os.getenv("SERPER_API_KEY"), help="Serper.dev key (or env SERPER_API_KEY)")
     ap.add_argument("--limit", type=int, default=0, help="max rows to process (0 = all)")
     ap.add_argument("--max-queries", type=int, default=2, choices=[1, 2], help="searches per company")
     ap.add_argument("--delay", type=float, default=1.0, help="seconds between companies")
@@ -419,14 +656,20 @@ def main():
     ap.add_argument("--log", default="decision_makers_log.csv", help="CSV log path")
     args = ap.parse_args()
 
-    api_key = (args.serpapi_key or os.getenv("SERPAPI_KEY", "")).strip()
-    if not api_key:
-        sys.exit("Provide a SerpApi key via --serpapi-key or SERPAPI_KEY env var.")
+    engine = args.engine.lower()
+    if engine == "serper":
+        api_key = (args.serper_key or os.getenv("SERPER_API_KEY", "")).strip()
+        if not api_key:
+            sys.exit("Provide a Serper key via --serper-key or SERPER_API_KEY env var.")
+    else:
+        api_key = (args.serpapi_key or os.getenv("SERPAPI_KEY", "")).strip()
+        if not api_key:
+            sys.exit("Provide a SerpApi key via --serpapi-key or SERPAPI_KEY env var.")
 
     # 1. Single company mode
     if args.company:
-        print(f"Finding decision maker for '{args.company}'...")
-        dm = find_decision_maker(args.company, args.website, args.linkedin, api_key, args.max_queries)
+        print(f"Finding decision maker for '{args.company}' using {engine.upper()}...")
+        dm = find_decision_maker(args.company, args.website, args.linkedin, api_key, args.max_queries, engine=engine)
         if dm:
             print(f"FOUND: {dm['name']} | {dm['title']} | {dm['url']} ({dm['confidence']} confidence)")
         else:
@@ -464,7 +707,7 @@ def main():
         log, found = [], 0
         for i, r in enumerate(todo, 1):
             company = r.get(COL_COMPANY, "").strip()
-            dm = find_decision_maker(company, r.get(COL_WEBSITE, ""), r.get(COL_COMPANY_LI, ""), api_key, args.max_queries)
+            dm = find_decision_maker(company, r.get(COL_WEBSITE, ""), r.get(COL_COMPANY_LI, ""), api_key, args.max_queries, engine=engine)
             if dm:
                 found += 1
                 print(f"[{i}/{len(todo)}] {company}: {dm['name']} | {dm['title']} | {dm['url']} ({dm['confidence']})")
@@ -519,6 +762,7 @@ def main():
             r.get(COL_COMPANY_LI, ""),
             api_key,
             args.max_queries,
+            engine=engine,
         )
         if dm:
             found += 1

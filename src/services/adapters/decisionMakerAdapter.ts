@@ -6,12 +6,12 @@ export class DecisionMakerAdapter implements IResearchAdapter {
   readonly metadata: ModuleMetadata = {
     id: 'decision-maker',
     name: 'Decision Maker Finder',
-    description: "Searches Google via SerpApi for LinkedIn profiles of the company's top people, picks the most senior verified executive matching the company, and extracts Name, Post, and LinkedIn URL.",
-    badge: 'SerpApi Engine',
+    description: "Searches Google via SerpApi or Serper.dev for LinkedIn profiles of the company's top people, picks the most senior verified executive matching the company, and extracts Name, Post, and LinkedIn URL.",
+    badge: 'Dual Engine: SerpApi / Serper',
     category: 'People Intelligence',
     inputRequirements: ['Company Name', 'Website (optional)', 'Company LinkedIn URL (optional)'],
     outputFields: ['Decision Maker Name', 'Decision Maker Post', 'Decision Maker Linkedin', 'Decision Maker Confidence'],
-    integrationNote: 'Directly executes precision SerpApi Google dorking and hierarchical executive title ranking.',
+    integrationNote: 'Directly executes Google dorking and hierarchical executive title ranking via SerpApi or Serper.dev.',
   };
 
   async enrichSingle(record: EnrichmentRecord, config: ResearchConfig): Promise<EnrichmentRecord> {
@@ -49,13 +49,16 @@ export class DecisionMakerAdapter implements IResearchAdapter {
       const currentItem = chunk[0];
       const displayName = currentItem.companyName || currentItem.companyWebsite || `Record #${i + 1}`;
 
+      const engine = config.decisionMakerEngine || 'serpapi';
+      const engineLabel = engine === 'serper' ? 'Serper.dev' : 'SerpApi';
+
       onProgress?.({
         isActive: true,
         currentIndex: i + 1,
         totalCount,
         percentage: Math.round(((i + 0.3) / totalCount) * 100),
         status: 'running',
-        stageMessage: `Querying SerpApi Google LinkedIn registry for "${displayName}"...`,
+        stageMessage: `Querying ${engineLabel} Google LinkedIn registry for "${displayName}"...`,
         currentItemName: displayName,
         leadsFound: enrichedList.filter((r) => r.enrichmentStatus === 'enriched').length,
         leadsProcessed: i,
@@ -105,8 +108,10 @@ export class DecisionMakerAdapter implements IResearchAdapter {
           },
           body: JSON.stringify({
             records: payloadRecords,
+            engine: engine,
+            serperKey: config.serperApiKey,
             maxQueries: 2,
-            delay: 0.5,
+            delay: engine === 'serper' ? 0.6 : 0.5,
           }),
           signal,
         });
