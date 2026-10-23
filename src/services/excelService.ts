@@ -74,6 +74,7 @@ export const excelService = {
       domain: '',
       country: '',
       industry: '',
+      linkedinUrl: '',
     };
 
     const normalize = (str: string) => str.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -81,25 +82,96 @@ export const excelService = {
     for (const header of headers) {
       const norm = normalize(header);
 
-      // Check URL / Website / Domain FIRST so "Company URL" or "Company Website" maps to domain, NOT companyName
-      if (!mapping.domain && (norm.includes('domain') || norm.includes('url') || norm.includes('website') || norm.includes('homepage') || norm === 'web' || norm === 'site')) {
-        mapping.domain = header;
-      } else if (!mapping.companyName && !norm.includes('url') && !norm.includes('website') && !norm.includes('domain') && (norm.includes('company') || norm.includes('organization') || norm.includes('account') || norm.includes('business') || norm === 'name')) {
-        mapping.companyName = header;
-      } else if (!mapping.personName && (norm.includes('contact') || norm.includes('fullname') || norm.includes('person') || norm.includes('lead') || norm.includes('decisionmaker'))) {
+      // 1. Detect LinkedIn URL FIRST to prevent it being mistakenly grabbed by generic 'url' check
+      if (
+        !mapping.linkedinUrl &&
+        (norm.includes('linkedin') || norm.includes('profileurl') || norm.includes('dmurl'))
+      ) {
+        mapping.linkedinUrl = header;
+      }
+      // 2. Detect Person / Decision Maker Name (exclude if it mentions linkedin or url)
+      else if (
+        !mapping.personName &&
+        !norm.includes('linkedin') &&
+        !norm.includes('url') &&
+        (norm.includes('decisionmaker') ||
+          norm.includes('contactname') ||
+          norm.includes('fullname') ||
+          norm.includes('personname') ||
+          norm === 'person' ||
+          norm === 'contact' ||
+          norm === 'lead' ||
+          norm === 'name')
+      ) {
         mapping.personName = header;
-      } else if (!mapping.title && (norm.includes('title') || norm.includes('job') || norm.includes('role') || norm.includes('position') || norm.includes('designation'))) {
+      }
+      // 3. Detect Domain / Company Website (only if not a linkedin column)
+      else if (
+        !mapping.domain &&
+        !norm.includes('linkedin') &&
+        (norm.includes('domain') ||
+          norm.includes('website') ||
+          norm.includes('companyurl') ||
+          norm.includes('homepage') ||
+          norm === 'web' ||
+          norm === 'site' ||
+          norm === 'url')
+      ) {
+        mapping.domain = header;
+      }
+      // 4. Detect Company Name
+      else if (
+        !mapping.companyName &&
+        !norm.includes('linkedin') &&
+        !norm.includes('decisionmaker') &&
+        (norm.includes('company') ||
+          norm.includes('organization') ||
+          norm.includes('organisation') ||
+          norm.includes('business') ||
+          norm.includes('account'))
+      ) {
+        mapping.companyName = header;
+      }
+      // 5. Job Title / Role
+      else if (
+        !mapping.title &&
+        (norm.includes('title') ||
+          norm.includes('job') ||
+          norm.includes('role') ||
+          norm.includes('position') ||
+          norm.includes('post') ||
+          norm.includes('designation'))
+      ) {
         mapping.title = header;
-      } else if (!mapping.country && (norm.includes('country') || norm.includes('location') || norm.includes('nation') || norm.includes('region') || norm.includes('city') || norm.includes('state'))) {
+      }
+      // 6. Country / Location
+      else if (
+        !mapping.country &&
+        (norm.includes('country') ||
+          norm.includes('location') ||
+          norm.includes('nation') ||
+          norm.includes('region') ||
+          norm.includes('city') ||
+          norm.includes('state'))
+      ) {
         mapping.country = header;
-      } else if (!mapping.industry && (norm.includes('industry') || norm.includes('sector') || norm.includes('vertical') || norm.includes('category'))) {
+      }
+      // 7. Industry
+      else if (
+        !mapping.industry &&
+        (norm.includes('industry') ||
+          norm.includes('sector') ||
+          norm.includes('vertical') ||
+          norm.includes('category'))
+      ) {
         mapping.industry = header;
       }
     }
 
-    // Fallback if companyName still empty: take the first non-domain column
+    // Fallback if companyName still empty: take the first non-domain/non-linkedin column
     if (!mapping.companyName && headers.length > 0) {
-      const firstNonDomain = headers.find((h) => h !== mapping.domain) || headers[0];
+      const firstNonDomain =
+        headers.find((h) => h !== mapping.domain && h !== mapping.linkedinUrl) || headers[0];
       mapping.companyName = firstNonDomain;
     }
 
@@ -116,11 +188,11 @@ export const excelService = {
       const titleVal = mapping.title ? String(row[mapping.title] || '').trim() : '';
       let rawDomain = mapping.domain ? String(row[mapping.domain] || '').trim() : '';
 
-      // If domain wasn't mapped, check if row contains 'Website' or 'Company URL' directly
+      // If domain wasn't mapped, check if row contains 'Website' or 'Company URL' or 'Domain'
       if (!rawDomain) {
         for (const [k, v] of Object.entries(row)) {
           const lk = k.toLowerCase();
-          if ((lk.includes('website') || lk.includes('url') || lk.includes('domain')) && v) {
+          if (!lk.includes('linkedin') && (lk.includes('website') || lk.includes('domain') || lk.includes('url')) && v) {
             rawDomain = String(v).trim();
             break;
           }
@@ -130,7 +202,6 @@ export const excelService = {
       // Clean and normalize website URL
       let cleanWebsite = rawDomain;
       if (cleanWebsite) {
-        // Strip repeated protocols like https://https://
         cleanWebsite = cleanWebsite.replace(/^(https?:\/\/)+/i, 'https://').trim();
         if (!cleanWebsite.startsWith('http://') && !cleanWebsite.startsWith('https://')) {
           cleanWebsite = `https://${cleanWebsite.replace(/^\/+/, '')}`;
@@ -148,6 +219,34 @@ export const excelService = {
             .trim()
         : '';
 
+      // Extract LinkedIn profile URL (decision maker LinkedIn)
+      let rawLinkedin = mapping.linkedinUrl ? String(row[mapping.linkedinUrl] || '').trim() : '';
+      if (!rawLinkedin) {
+        for (const [k, v] of Object.entries(row)) {
+          const lk = k.toLowerCase();
+          if (lk.includes('linkedin') && v) {
+            rawLinkedin = String(v).trim();
+            break;
+          }
+        }
+      }
+      // Also scan values in case column name is arbitrary but value contains linkedin.com/in/
+      if (!rawLinkedin) {
+        for (const v of Object.values(row)) {
+          const s = String(v || '').trim();
+          if (s.includes('linkedin.com/in/')) {
+            rawLinkedin = s;
+            break;
+          }
+        }
+      }
+
+      let cleanLinkedin = rawLinkedin;
+      const mLi = cleanLinkedin.match(/linkedin\.com\/in\/([^/?#\s]+)/i);
+      if (mLi) {
+        cleanLinkedin = `https://www.linkedin.com/in/${mLi[1]}`;
+      }
+
       const countryVal = mapping.country ? String(row[mapping.country] || '').trim() : '';
       const industryVal = mapping.industry ? String(row[mapping.industry] || '').trim() : '';
 
@@ -158,6 +257,18 @@ export const excelService = {
         if (!mappedHeaders.includes(key)) {
           customFields[key] = val;
         }
+      }
+
+      // Also ensure standard keys are present in customFields for export compatibility
+      if (cleanLinkedin) {
+        customFields['Decision Maker Linkedin'] = cleanLinkedin;
+        customFields['Decision Maker LinkedIn URL'] = cleanLinkedin;
+      }
+      if (personVal) {
+        customFields['Decision Maker Name'] = personVal;
+      }
+      if (companyVal) {
+        customFields['Company Name'] = companyVal;
       }
 
       // Extract existing social media URLs if present in the uploaded sheet
@@ -171,7 +282,7 @@ export const excelService = {
 
       const existingFb = getVal('Facebook', 'facebookUrl', 'Facebook URL', 'facebook');
       const existingIg = getVal('Instagram', 'instagramUrl', 'Instagram URL', 'instagram');
-      const existingLi = getVal('Linkedin', 'LinkedIn', 'companyLinkedinUrl', 'LinkedIn URL', 'Company LinkedIn', 'linkedin');
+      const existingLi = getVal('Company Linkedin', 'Company LinkedIn', 'companyLinkedinUrl');
       const existingTw = getVal('X', 'Twitter', 'twitterUrl', 'Twitter URL', 'Twitter / X URL', 'x', 'twitter');
 
       return {
@@ -181,6 +292,7 @@ export const excelService = {
         domain: cleanDomain || undefined,
         personName: personVal || undefined,
         title: titleVal || undefined,
+        linkedinUrl: cleanLinkedin || undefined,
         country: countryVal || undefined,
         industry: industryVal || undefined,
         facebookUrl: existingFb || undefined,

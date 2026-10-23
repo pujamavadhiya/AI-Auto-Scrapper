@@ -60,6 +60,7 @@ export interface ColumnMapping {
   domain?: string;
   country?: string;
   industry?: string;
+  linkedinUrl?: string;
   [key: string]: string | undefined;
 }
 

@@ -178,31 +178,87 @@ export const ContactFinder: React.FC = () => {
 
   const handleMappingConfirmed = (newRecords: EnrichmentRecord[], _mapping: ColumnMapping) => {
     const normalized = newRecords.map((r) => {
-      const comp =
+      // 1. Extract LinkedIn profile URL (most critical for LeadOcean)
+      let li = r.linkedinUrl || '';
+      if (!li && r.customFields) {
+        for (const [k, v] of Object.entries(r.customFields)) {
+          const lk = k.toLowerCase();
+          const sv = String(v || '').trim();
+          if (
+            (lk.includes('linkedin') || lk.includes('profile')) &&
+            sv.includes('linkedin.com/in/')
+          ) {
+            li = sv;
+            break;
+          }
+        }
+      }
+      if (!li && r.customFields) {
+        for (const [k, v] of Object.entries(r.customFields)) {
+          const sv = String(v || '').trim();
+          if (sv.includes('linkedin.com/in/')) {
+            li = sv;
+            break;
+          }
+        }
+      }
+      if (!li) {
+        li =
+          r.customFields?.['Decision Maker LinkedIn URL'] ||
+          r.customFields?.['Decision Maker Linkedin URL'] ||
+          r.customFields?.['Decision Maker LinkedIn'] ||
+          r.customFields?.['Decision Maker Linkedin'] ||
+          r.customFields?.['LinkedIn URL'] ||
+          r.customFields?.['Linkedin URL'] ||
+          r.customFields?.['LinkedIn Profile'] ||
+          r.customFields?.['Profile URL'] ||
+          r.customFields?.['linkedin'] ||
+          '';
+      }
+
+      // Normalize LinkedIn URL format
+      const mLi = String(li || '').match(/linkedin\.com\/in\/([^/?#\s]+)/i);
+      const cleanLi = mLi ? `https://www.linkedin.com/in/${mLi[1]}` : (li ? String(li).trim() : '');
+
+      // 2. Extract Company Name & Website
+      let comp =
         r.companyName ||
+        r.customFields?.['Company Name / Domain'] ||
+        r.customFields?.['Company / Domain'] ||
         r.customFields?.['Company Name'] ||
         r.customFields?.['Company'] ||
         r.customFields?.['Name'] ||
         '';
-      const web =
+
+      let web =
         r.companyWebsite ||
         r.domain ||
         r.customFields?.['Website'] ||
-        r.customFields?.['Company URL'] ||
         r.customFields?.['Domain'] ||
+        r.customFields?.['Company URL'] ||
         '';
+
+      // If 'Company Name / Domain' combined header was used:
+      if (!web && r.customFields?.['Company Name / Domain']) {
+        const rawCompDomain = String(r.customFields['Company Name / Domain']);
+        if (rawCompDomain.includes('.') && !rawCompDomain.includes(' ')) {
+          web = rawCompDomain;
+        } else if (rawCompDomain.includes('/') || rawCompDomain.includes('|')) {
+          const parts = rawCompDomain.split(/[/|]/).map((p) => p.trim());
+          comp = parts[0] || comp;
+          web = parts[1] || web;
+        }
+      }
+
+      // 3. Extract Decision Maker Name
       const name =
         r.personName ||
         r.customFields?.['Decision Maker Name'] ||
+        r.customFields?.['decision maker name'] ||
         r.customFields?.['Contact Name'] ||
         r.customFields?.['Full Name'] ||
+        r.customFields?.['Person Name'] ||
         r.customFields?.['name'] ||
-        '';
-      const li =
-        r.linkedinUrl ||
-        r.customFields?.['Decision Maker Linkedin'] ||
-        r.customFields?.['Decision Maker LinkedIn'] ||
-        r.customFields?.['Linkedin'] ||
         '';
 
       return {
@@ -211,12 +267,14 @@ export const ContactFinder: React.FC = () => {
         companyWebsite: web,
         domain: web ? web.replace(/^https?:\/\/(www\.)?/, '').split('/')[0] : r.domain,
         personName: name,
-        linkedinUrl: li,
+        linkedinUrl: cleanLi,
         enrichmentStatus: 'idle' as const,
         customFields: {
           ...(r.customFields || {}),
           'Decision Maker Name': name,
-          'Decision Maker Linkedin': li,
+          'Decision Maker Linkedin': cleanLi,
+          'Decision Maker LinkedIn URL': cleanLi,
+          'Company Name': comp,
           Email: r.email || r.customFields?.['Email'] || '',
           Phone: r.phone || r.customFields?.['Phone'] || '',
           'Enrich Status': 'idle',

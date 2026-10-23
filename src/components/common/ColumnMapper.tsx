@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Columns3, Check, Wand2, ArrowRight, Building2, User, Briefcase, Globe, MapPin } from 'lucide-react';
+import { Columns3, Check, Wand2, ArrowRight, Building2, User, Briefcase, Globe, MapPin, Linkedin } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Select } from '../ui/Select';
 import { ColumnMapping, EnrichmentRecord } from '../../types';
@@ -31,17 +31,17 @@ export const ColumnMapper: React.FC<ColumnMapperProps> = ({
     },
     {
       key: 'personName',
-      label: 'Person Full Name',
+      label: 'Person / Decision Maker Name',
       required: false,
       icon: User,
       description: 'Used for LinkedIn matching & direct dial lookups',
     },
     {
-      key: 'title',
-      label: 'Job Title / Role',
+      key: 'linkedinUrl',
+      label: 'Decision Maker LinkedIn URL',
       required: false,
-      icon: Briefcase,
-      description: 'Target seniority filter (e.g. CEO, VP Engineering)',
+      icon: Linkedin,
+      description: 'Primary personal profile URL required for LeadOcean email & phone enrichment',
     },
     {
       key: 'domain',
@@ -49,6 +49,13 @@ export const ColumnMapper: React.FC<ColumnMapperProps> = ({
       required: false,
       icon: Globe,
       description: 'Company website or email domain (e.g. stripe.com)',
+    },
+    {
+      key: 'title',
+      label: 'Job Title / Role',
+      required: false,
+      icon: Briefcase,
+      description: 'Target seniority filter (e.g. CEO, VP Engineering)',
     },
     {
       key: 'country',

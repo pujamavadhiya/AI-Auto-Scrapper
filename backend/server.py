@@ -953,47 +953,82 @@ def enrich_contacts(payload: ContactEnrichPayload):
             enriched_results.append(dict(r))
             continue
 
+        # 1. Search for LinkedIn profile URL across all fields & values
+        person_li = (
+            r.get("linkedinUrl")
+            or r.get("personalLinkedinUrl")
+            or r.get("Decision Maker LinkedIn URL")
+            or r.get("Decision Maker Linkedin URL")
+            or r.get("Decision Maker Linkedin")
+            or r.get("Decision Maker LinkedIn")
+            or r.get("decisionMakerLinkedin")
+            or r.get("LinkedIn URL")
+            or r.get("Linkedin URL")
+            or r.get("Profile URL")
+            or r.get("linkedin")
+            or (r.get("customFields", {}) or {}).get("Decision Maker LinkedIn URL")
+            or (r.get("customFields", {}) or {}).get("Decision Maker Linkedin URL")
+            or (r.get("customFields", {}) or {}).get("Decision Maker Linkedin")
+            or (r.get("customFields", {}) or {}).get("Decision Maker LinkedIn")
+            or (r.get("customFields", {}) or {}).get("LinkedIn URL")
+            or (r.get("customFields", {}) or {}).get("Linkedin URL")
+            or (r.get("customFields", {}) or {}).get("Profile URL")
+            or (r.get("customFields", {}) or {}).get("linkedin")
+            or ""
+        )
+
+        # Fallback: scan any custom field value containing 'linkedin.com/in/'
+        if not person_li:
+            for k, v in list(r.items()) + list((r.get("customFields", {}) or {}).items()):
+                sv = str(v or "").strip()
+                if "linkedin.com/in/" in sv:
+                    person_li = sv
+                    break
+
         comp_name = (
             r.get("companyName")
+            or r.get("Company Name / Domain")
+            or r.get("Company / Domain")
+            or r.get("Company Name")
             or r.get("Company")
             or r.get("company")
-            or r.get("Company Name")
             or r.get("Name")
+            or (r.get("customFields", {}) or {}).get("Company Name / Domain")
+            or (r.get("customFields", {}) or {}).get("Company / Domain")
             or (r.get("customFields", {}) or {}).get("Company Name")
             or (r.get("customFields", {}) or {}).get("Company")
             or (r.get("customFields", {}) or {}).get("Name")
             or ""
         )
+
         comp_site = (
             r.get("companyWebsite")
             or r.get("domain")
             or r.get("Website")
             or r.get("website")
             or r.get("Company URL")
+            or r.get("Company Name / Domain")
+            or (r.get("customFields", {}) or {}).get("Company Name / Domain")
             or (r.get("customFields", {}) or {}).get("Website")
             or (r.get("customFields", {}) or {}).get("domain")
+            or (r.get("customFields", {}) or {}).get("Company URL")
             or ""
         )
+
         person_name = (
             r.get("personName")
-            or r.get("decisionMakerName")
             or r.get("Decision Maker Name")
-            or r.get("contactName")
+            or r.get("decision maker name")
+            or r.get("decisionMakerName")
+            or r.get("Contact Name")
             or r.get("Full Name")
+            or r.get("Person Name")
             or r.get("name")
             or (r.get("customFields", {}) or {}).get("Decision Maker Name")
+            or (r.get("customFields", {}) or {}).get("decision maker name")
+            or (r.get("customFields", {}) or {}).get("Contact Name")
             or (r.get("customFields", {}) or {}).get("Full Name")
             or (r.get("customFields", {}) or {}).get("name")
-            or ""
-        )
-        person_li = (
-            r.get("linkedinUrl")
-            or r.get("personalLinkedinUrl")
-            or r.get("decisionMakerLinkedin")
-            or r.get("Decision Maker Linkedin")
-            or r.get("Decision Maker LinkedIn")
-            or (r.get("customFields", {}) or {}).get("Decision Maker Linkedin")
-            or (r.get("customFields", {}) or {}).get("Decision Maker LinkedIn")
             or ""
         )
 
