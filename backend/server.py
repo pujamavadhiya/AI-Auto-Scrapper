@@ -348,6 +348,11 @@ class VerifyRecordsPayload(BaseModel):
     geminiApiKey: Optional[str] = None
 
 
+class ParseIdeaPayload(BaseModel):
+    idea: str
+    geminiApiKey: Optional[str] = None
+
+
 def _run_collector_thread(
     task_id: str,
     cfg: CollectorConfig,
@@ -688,6 +693,29 @@ def verify_records_gemini(payload: VerifyRecordsPayload):
         raise HTTPException(status_code=400, detail="GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in Settings or .env.")
     cleaned = audit_leads_with_gemini(records, api_key=api_key)
     return {"status": "ok", "records": cleaned}
+
+
+@app.post("/api/collector/parse-idea")
+def parse_scraping_idea(payload: ParseIdeaPayload):
+    """
+    Parses a user's natural language scraping idea into structured
+    keywords, city, state, country, titles, and target count using Gemini AI.
+    """
+    idea = (payload.idea or "").strip()
+    if not idea:
+        raise HTTPException(status_code=400, detail="Please provide a description of the data you want to scrape.")
+
+    key = (payload.geminiApiKey or os.environ.get("GEMINI_API_KEY", "")).strip()
+    try:
+        from gemini_query_expander import parse_scraping_idea_with_gemini
+    except ImportError:
+        from backend.gemini_query_expander import parse_scraping_idea_with_gemini
+
+    result = parse_scraping_idea_with_gemini(idea, api_key=key)
+    return {
+        "status": "ok",
+        **result,
+    }
 
 
 @app.get("/api/collector/events/{task_id}")

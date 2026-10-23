@@ -22,6 +22,8 @@ import {
   Clock,
   ShieldCheck,
   TrendingUp,
+  Lightbulb,
+  Wand2,
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { Card } from '../components/ui/Card';
@@ -109,6 +111,11 @@ export const KeywordLeadCollector: React.FC = () => {
   const [verifyWithGemini, setVerifyWithGemini] = useState(true);
   const [isVerifyingGemini, setIsVerifyingGemini] = useState(false);
 
+  // Natural Language Idea State
+  const [ideaText, setIdeaText] = useState('');
+  const [isParsingIdea, setIsParsingIdea] = useState(false);
+  const [ideaSummary, setIdeaSummary] = useState<string | null>(null);
+
   // Execution & Live Scraper State
   const [isRunning, setIsRunning] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
@@ -180,9 +187,91 @@ export const KeywordLeadCollector: React.FC = () => {
     setTitles(titles.filter((item) => item !== t));
   };
 
+  // Parse Scraping Idea with Gemini AI
+  const handleParseIdea = async (): Promise<any | null> => {
+    const text = ideaText.trim();
+    if (!text) {
+      alert('Please describe what kind of data or leads you want to scrape.');
+      return null;
+    }
+
+    setIsParsingIdea(true);
+    setIdeaSummary(null);
+    const apiBase = getApiBaseUrl();
+    if (!apiBase) {
+      setIsParsingIdea(false);
+      alert('Backend server URL is not configured.');
+      return null;
+    }
+
+    try {
+      const res = await fetch(`${apiBase}/api/collector/parse-idea`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idea: text }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Failed to parse your scraping idea.');
+      }
+
+      const data = await res.json();
+      if (data.keywords && data.keywords.length > 0) {
+        setKeywords(data.keywords);
+      }
+      if (data.city !== undefined) setCity(data.city);
+      if (data.state !== undefined) setState(data.state);
+      if (data.country) setCountry(data.country);
+      if (data.titles && data.titles.length > 0) setTitles(data.titles);
+      if (data.company_size) setCompanySize(data.company_size);
+      if (data.target_count) setTargetCount(data.target_count);
+
+      const explanation = data.explanation || 'Idea parsed and form fields auto-configured successfully.';
+      setIdeaSummary(explanation);
+      return data;
+    } catch (err: any) {
+      alert(`Error analyzing idea: ${err.message || err}`);
+      return null;
+    } finally {
+      setIsParsingIdea(false);
+    }
+  };
+
+  const handleParseAndScrap = async () => {
+    const data = await handleParseIdea();
+    if (data && data.keywords && data.keywords.length > 0) {
+      handleStartScraping({
+        keywords: data.keywords,
+        city: data.city || '',
+        state: data.state || '',
+        country: data.country || 'United States',
+        titles: data.titles || DEFAULT_TITLES,
+        targetCount: data.target_count || 50,
+        companySize: data.company_size || 'all',
+      });
+    }
+  };
+
   // Start Scraping
-  const handleStartScraping = async () => {
-    if (keywords.length === 0) {
+  const handleStartScraping = async (overrides?: {
+    keywords?: string[];
+    country?: string;
+    state?: string;
+    city?: string;
+    targetCount?: number;
+    titles?: string[];
+    companySize?: string;
+  }) => {
+    const activeKeywords = overrides?.keywords || keywords;
+    const activeCountry = overrides?.country ?? country;
+    const activeState = overrides?.state ?? state;
+    const activeCity = overrides?.city ?? city;
+    const activeTargetCount = overrides?.targetCount ?? targetCount;
+    const activeTitles = overrides?.titles ?? titles;
+    const activeCompanySize = overrides?.companySize ?? companySize;
+
+    if (activeKeywords.length === 0) {
       alert('Please enter at least one keyword.');
       return;
     }
@@ -210,13 +299,13 @@ export const KeywordLeadCollector: React.FC = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          keywords,
-          country,
-          state,
-          city,
-          targetCount,
-          titles,
-          companySize,
+          keywords: activeKeywords,
+          country: activeCountry,
+          state: activeState,
+          city: activeCity,
+          targetCount: activeTargetCount,
+          titles: activeTitles,
+          companySize: activeCompanySize,
           enrichCompany,
           verifyWithGemini,
         }),
@@ -481,7 +570,7 @@ export const KeywordLeadCollector: React.FC = () => {
           {!isRunning ? (
             <Button
               variant="primary"
-              onClick={handleStartScraping}
+              onClick={() => handleStartScraping()}
               className="bg-blue-600 hover:bg-blue-700 text-white font-semibold flex items-center gap-2 shadow-sm"
             >
               <Play className="w-4 h-4 fill-white" />
@@ -525,6 +614,105 @@ export const KeywordLeadCollector: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Explain Your Idea with AI (Natural Language Prompt Section) */}
+      <Card className="p-5 border-indigo-200/90 bg-gradient-to-br from-indigo-50/70 via-white to-blue-50/50 shadow-sm relative overflow-hidden">
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center shadow-xs">
+                <Sparkles className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  Explain Your Idea & Auto-Configure
+                  <Badge variant="outline" className="text-[10px] bg-indigo-100/70 text-indigo-800 border-indigo-300 font-semibold uppercase tracking-wider">
+                    Gemini AI
+                  </Badge>
+                </h2>
+                <p className="text-xs text-slate-600">
+                  Describe what kind of data or leads you want to scrape in plain English. Gemini AI will analyze your idea, split it into exact keywords, location, roles, and company category, and configure your scraper automatically.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 space-y-3">
+          <div className="relative">
+            <textarea
+              value={ideaText}
+              onChange={(e) => setIdeaText(e.target.value)}
+              placeholder="e.g., I want to scrap founders and CEOs of tobacco manufacturing and FMCG companies in banglore city which is situated in karnataka india with 30 leads..."
+              rows={3}
+              className="w-full text-xs p-3 rounded-lg border border-indigo-200 bg-white/90 shadow-2xs focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none text-slate-800 placeholder:text-slate-400"
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+            <div className="flex items-center gap-1.5 flex-wrap text-[11px] text-slate-500">
+              <span className="font-semibold text-indigo-700 flex items-center gap-1">
+                <Lightbulb className="w-3.5 h-3.5 text-amber-500" />
+                Try examples:
+              </span>
+              <button
+                type="button"
+                onClick={() => setIdeaText("Tobacco manufacturers and cigarette producers in Bangalore Karnataka India, target founders and directors with 25 leads")}
+                className="px-2 py-0.5 rounded-full bg-white border border-slate-200 hover:border-indigo-400 text-slate-600 hover:text-indigo-700 transition-colors cursor-pointer text-[11px]"
+              >
+                Tobacco in Bangalore
+              </button>
+              <button
+                type="button"
+                onClick={() => setIdeaText("SaaS & AI startup founders and CTOs in San Francisco Bay Area with 11-50 employees")}
+                className="px-2 py-0.5 rounded-full bg-white border border-slate-200 hover:border-indigo-400 text-slate-600 hover:text-indigo-700 transition-colors cursor-pointer text-[11px]"
+              >
+                AI Startups in SF
+              </button>
+              <button
+                type="button"
+                onClick={() => setIdeaText("Boutique hotel owners and luxury resort general managers in Dubai, UAE")}
+                className="px-2 py-0.5 rounded-full bg-white border border-slate-200 hover:border-indigo-400 text-slate-600 hover:text-indigo-700 transition-colors cursor-pointer text-[11px]"
+              >
+                Hotels in Dubai
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                onClick={handleParseIdea}
+                disabled={isParsingIdea || !ideaText.trim()}
+                className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold px-3.5 py-2 flex items-center gap-1.5 shadow-xs"
+              >
+                <Wand2 className={`w-3.5 h-3.5 ${isParsingIdea ? 'animate-spin' : ''}`} />
+                {isParsingIdea ? "Gemini Parsing..." : "Analyze & Fill Form"}
+              </Button>
+              <Button
+                type="button"
+                onClick={handleParseAndScrap}
+                disabled={isParsingIdea || isRunning || !ideaText.trim()}
+                className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold px-3.5 py-2 flex items-center gap-1.5 shadow-xs"
+                title="Analyze idea with Gemini and immediately start scraping"
+              >
+                <Play className="w-3.5 h-3.5 fill-white" />
+                Analyze & Start Scraping
+              </Button>
+            </div>
+          </div>
+
+          {/* Idea Parse Feedback Banner */}
+          {ideaSummary && (
+            <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs flex items-start gap-2.5 animate-fadeIn">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="font-semibold text-emerald-950">Idea Analyzed & Configured with Gemini AI</p>
+                <p className="text-emerald-800 text-[11px] mt-0.5 leading-relaxed">{ideaSummary}</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </Card>
 
       {/* Main Grid: Config Form & Live Crawler Panel */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">

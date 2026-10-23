@@ -386,3 +386,95 @@ def verify_company_industry_smart(
                 return True, term
 
     return False, raw_industry or "Unverified Industry"
+
+
+def parse_scraping_idea_with_gemini(idea_text: str, api_key: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Parses a user's natural language scraping description (e.g.
+    'I want founders of tobacco companies in Bangalore with 50 leads')
+    and extracts structured keywords, location, roles, company size, and lead count.
+    """
+    text_clean = (idea_text or "").strip()
+    if not text_clean:
+        return {
+            "keywords": ["Technology"],
+            "city": "",
+            "state": "",
+            "country": "United States",
+            "titles": ["CEO", "Founder", "Director", "Owner", "VP"],
+            "company_size": "all",
+            "target_count": 50,
+            "explanation": "No description provided; standard parameters used.",
+        }
+
+    g_key = (api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+    if g_key:
+        prompt = f"""
+You are an expert scraping strategist. A user describes what kind of data they want to scrape in natural language:
+User Idea: "{text_clean}"
+
+Extract and structure into a STRICT JSON object with these EXACT keys:
+1. "keywords": list of 2-5 clean keyword strings for company/niche/product (e.g. ["tobacco manufacturing", "FMCG"]).
+2. "city": standardized official city name if mentioned (e.g. if user said "banglore" or "bangalore", output "Bengaluru"). If no city, empty string "".
+3. "state": standardized state/province if mentioned (e.g. "Karnataka"). If no state, empty string "".
+4. "country": standardized country name (e.g. "India"). Default to "United States" only if completely international or unknown.
+5. "titles": list of decision maker job titles (e.g. ["Founder", "CEO", "Director", "Owner", "Managing Director"]).
+6. "company_size": company size filter (one of: "all", "1-10", "11-50", "51-200", "201-500", "501-1000", "1001-5000", "5000+"). Default "all".
+7. "target_count": number of leads requested if mentioned (integer, e.g. 50). Default 50 if not specified.
+8. "explanation": short, friendly 1-2 sentence explanation of how the idea was parsed and configured.
+
+Only return valid JSON, no markdown.
+"""
+        parsed = call_gemini_json(prompt, g_key)
+        if parsed and isinstance(parsed, dict) and parsed.get("keywords"):
+            kws = [str(k).strip() for k in parsed.get("keywords", []) if str(k).strip()]
+            titles = [str(t).strip() for t in parsed.get("titles", []) if str(t).strip()]
+            city = str(parsed.get("city") or "").strip()
+            state = str(parsed.get("state") or "").strip()
+            country = str(parsed.get("country") or "").strip() or "United States"
+            size = str(parsed.get("company_size") or "all").strip().lower()
+            if size not in ("all", "1-10", "11-50", "51-200", "201-500", "501-1000", "1001-5000", "5000+"):
+                size = "all"
+            try:
+                count = int(parsed.get("target_count") or 50)
+                count = max(1, min(count, 2000))
+            except Exception:
+                count = 50
+
+            return {
+                "keywords": kws or ["Business"],
+                "city": city,
+                "state": state,
+                "country": country,
+                "titles": titles or ["CEO", "Founder", "Director", "Owner", "VP"],
+                "company_size": size,
+                "target_count": count,
+                "explanation": str(parsed.get("explanation") or f"Configured {len(kws)} keywords in {city or country}."),
+            }
+
+    # Rule-based fallback if Gemini key is absent
+    target_count = 50
+    cnt_match = re.search(r"\b(\d{1,4})\s*(?:leads|profiles|results|contacts|rows|people)?\b", text_clean, re.I)
+    if cnt_match:
+        try:
+            target_count = max(1, min(int(cnt_match.group(1)), 2000))
+        except Exception:
+            pass
+
+    rule_fallback = get_rule_based_fallback(
+        keywords=[text_clean[:40]],
+        city="",
+        state="",
+        country="",
+    )
+    return {
+        "keywords": rule_fallback.get("industry_terms")[:3] or [text_clean[:30]],
+        "city": rule_fallback.get("canonical_city") or "",
+        "state": rule_fallback.get("canonical_state") or "",
+        "country": rule_fallback.get("canonical_country") or "United States",
+        "titles": ["CEO", "Founder", "Director", "Owner", "VP"],
+        "company_size": "all",
+        "target_count": target_count,
+        "explanation": f"Parsed your description for {rule_fallback.get('canonical_city') or 'target region'}.",
+    }
+
