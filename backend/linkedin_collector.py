@@ -221,8 +221,6 @@ class Criteria:
     gemini_company_queries: List[str] = field(default_factory=list)
     gemini_people_queries: List[str] = field(default_factory=list)
     gemini_api_key: Optional[str] = None
-    serper_api_key: Optional[str] = None
-    serpapi_api_key: Optional[str] = None
 
     def __post_init__(self):
         self.keywords = self.keywords or list(self.industries)
@@ -846,17 +844,8 @@ def find_decision_makers(cand_name: str, info: Dict[str, Any], crit: Criteria, i
     order = lpc.ENGINES[idx % len(lpc.ENGINES):] + lpc.ENGINES[:idx % len(lpc.ENGINES)]
     failed = False
     for q in queries:
-        res = None
-        if crit.serper_api_key or os.environ.get("SERPER_API_KEY"):
-            res = search_serper(q, 1, api_key=crit.serper_api_key)
-        elif crit.serpapi_api_key or os.environ.get("SERPAPI_KEY"):
-            res = search_serpapi(q, 1, api_key=crit.serpapi_api_key)
-        if res is None:
-            res = lpc.run_search(q, 1, order)
-            time.sleep(random.uniform(*lpc.DELAY_RANGE))
-        else:
-            time.sleep(0.3)
-
+        res = lpc.run_search(q, 1, order)
+        time.sleep(random.uniform(*lpc.DELAY_RANGE))
         if res is None:
             failed = True
             continue
@@ -1024,14 +1013,13 @@ class CollectorConfig:
     enrich_company: bool = True
     delay_range: Tuple[float, float] = (0.5, 1.2)
     gemini_api_key: Optional[str] = None
-    serper_api_key: Optional[str] = None
-    serpapi_api_key: Optional[str] = None
 
 
 class KeywordLinkedInCollector:
     """
     Web API wrapper around targeted lead finder algorithm.
     Provides live real-time event streaming and cleanly formats Excel export.
+    Uses free search engines (Bing, Yahoo, DuckDuckGo) and Gemini API for intelligence.
     """
 
     def __init__(self, config: CollectorConfig, on_event: Optional[Callable[[Dict[str, Any]], None]] = None):
@@ -1056,8 +1044,6 @@ class KeywordLinkedInCollector:
             require_dm=True,
             titles=config.titles if config.titles else list(DEFAULT_TITLES),
             gemini_api_key=config.gemini_api_key,
-            serper_api_key=config.serper_api_key,
-            serpapi_api_key=config.serpapi_api_key,
         )
 
     def emit(self, event_type: str, data: Dict[str, Any]):
@@ -1082,30 +1068,13 @@ class KeywordLinkedInCollector:
 
         def search_job(args):
             i, job = args
-            res = None
-            engine = "google"
-            if crit.serper_api_key or os.environ.get("SERPER_API_KEY"):
-                res = search_serper(job["q"], page=job["page"], api_key=crit.serper_api_key)
-                engine = "google (serper)"
-            elif crit.serpapi_api_key or os.environ.get("SERPAPI_KEY"):
-                res = search_serpapi(job["q"], page=job["page"], api_key=crit.serpapi_api_key)
-                engine = "google (serpapi)"
-
-            if res is None:
-                order = lpc.ENGINES[i % len(lpc.ENGINES):] + lpc.ENGINES[:i % len(lpc.ENGINES)]
-                engine = order[0]
-                self.emit("query_start", {
-                    "query": job["q"],
-                    "engine": engine,
-                })
-                res = lpc.run_search(job["q"], job["page"], order, must=r"linkedin\.com/(company|in)/")
-                time.sleep(random.uniform(*crit.signature().get("delay", (0.5, 1.2))))
-            else:
-                self.emit("query_start", {
-                    "query": job["q"],
-                    "engine": engine,
-                })
-                time.sleep(0.2)
+            order = lpc.ENGINES[i % len(lpc.ENGINES):] + lpc.ENGINES[:i % len(lpc.ENGINES)]
+            self.emit("query_start", {
+                "query": job["q"],
+                "engine": order[0],
+            })
+            res = lpc.run_search(job["q"], job["page"], order, must=r"linkedin\.com/(company|in)/")
+            time.sleep(random.uniform(*crit.signature().get("delay", (0.5, 1.2))))
             return res
 
         try:
