@@ -325,7 +325,7 @@ def search_serpapi(query: str, page: int = 1, api_key: Optional[str] = None) -> 
     }
 
     try:
-        r = requests.get(url, params=params, timeout=30)
+        r = requests.get(url, params=params, timeout=8)
         if r.status_code == 200:
             data = r.json()
             organic = data.get("organic_results", [])

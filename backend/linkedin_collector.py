@@ -537,12 +537,12 @@ def parse_company_page(html: str) -> Dict[str, str]:
 def fetch_page(slug: str) -> Optional[Dict[str, str]]:
     global _fail
     with _lock:
-        if _fail >= 5:
+        if _fail >= 3:
             return None
     try:
         r = requests.get(
             f"https://www.linkedin.com/company/{slug}/",
-            timeout=25,
+            timeout=3,
             headers={"User-Agent": random.choice(lpc.UA), "Accept-Language": "en-US,en;q=0.9"},
         )
         ok = r.status_code == 200 and "authwall" not in r.url
@@ -587,20 +587,30 @@ def li_title_name(title: str) -> str:
 def find_company_page(name: str, crit: Criteria, order: List[str]) -> Tuple[str, str, str, bool, bool]:
     """-> (slug, li_name, snippet_text, ambiguous, failed)"""
     loc = crit.city or crit.state or ""
-    res = lpc.run_search(
-        f'site:linkedin.com/company "{display_company(name)}" {loc}'.strip(),
-        1,
-        order,
-        must=r"linkedin\.com/company/",
-    )
+    query = f'site:linkedin.com/company "{display_company(name)}" {loc}'.strip()
+    res = None
+    serper_k = (crit.serper_api_key or os.environ.get("SERPER_API_KEY", "")).strip()
+    serp_k = (crit.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
+    if serper_k:
+        try:
+            res = search_serper(query, page=1, api_key=serper_k)
+        except Exception:
+            res = None
+    elif serp_k:
+        try:
+            res = search_serpapi(query, page=1, api_key=serp_k)
+        except Exception:
+            res = None
+    if not res:
+        res = lpc.run_search(query, 1, order, must=r"linkedin\.com/company/")
     if res is None:
         return "", "", "", False, True
     hits = {}
     for x in res:
         m = re.search(r"linkedin\.com/company/([^/?#]+)", x.get("url", ""), re.I)
         nm = li_title_name(x.get("title", ""))
-        if m and same_company(nm, name):
-            hits.setdefault(m.group(1).lower(), (nm, f"{x.get('title', '')} . {x.get('snippet', '')}"))
+        if m and (same_company(nm, name) or not nm or same_company(name, nm) or m.group(1).lower() in lpc.norm_company(name)):
+            hits.setdefault(m.group(1).lower(), (nm or name, f"{x.get('title', '')} . {x.get('snippet', '')}"))
     if not hits:
         return "", "", "", False, False
     if len(hits) > 1:
@@ -782,10 +792,13 @@ def eval_dm(r: Dict[str, str], names: List[str], crit: Criteria, generic: bool) 
         return None
     snippet = str(r.get("snippet") or "")
     exp = re.search(r"Experience:\s*([^\u00b7|]+)", snippet, re.I)
-    hay = nt(after + " " + (exp.group(1) if exp else "") + " " + (parsed["company"] or ""))
+    hay = nt(after + " " + (exp.group(1) if exp else "") + " " + (parsed["company"] or "") + " " + snippet)
     how = ""
     if parsed["company"] and any(same_company(parsed["company"], n) for n in names):
         how = "field"
+    elif any(has_phrase(hay, nt(n)) for n in names):
+        how = "snippet"
+
     # Strict geographic validation to prevent cross-country mismatch
     url_low = (parsed["profile_url"] or "").lower()
     full_text = (head + " " + snippet).lower()
@@ -831,11 +844,12 @@ def find_decision_makers(cand_name: str, info: Dict[str, Any], crit: Criteria, i
     generic = is_generic_name(cand_name)
     loc = crit.city or crit.state or crit.country
 
+    titles_or = " OR ".join(f'"{t}"' for t in crit.titles[:5]) if crit.titles else '"CEO" OR "Founder" OR "Director" OR "VP"'
     queries = [
-        f'site:linkedin.com/in "{disp}" "Director"',
+        f'site:linkedin.com/in "{disp}" ({titles_or})',
         f'site:linkedin.com/in "{disp}" "CEO"',
         f'site:linkedin.com/in "{disp}" "Founder"',
-        f'site:linkedin.com/in "{disp}" "MD"',
+        f'site:linkedin.com/in "{disp}" "Director"',
         f'site:linkedin.com/in "{disp}" "{loc}"' if loc else None,
         f'site:linkedin.com/in "{disp}"',
     ]
@@ -855,7 +869,7 @@ def find_decision_makers(cand_name: str, info: Dict[str, Any], crit: Criteria, i
                 res = search_serper(q, page=1, api_key=serper_k)
             except Exception:
                 res = None
-        if not res and serp_k:
+        elif serp_k:
             try:
                 res = search_serpapi(q, page=1, api_key=serp_k)
             except Exception:
@@ -1094,6 +1108,7 @@ class KeywordLinkedInCollector:
             must = r"linkedin\.com/(company|in)/"
 
             serper_k = (crit.serper_api_key or os.environ.get("SERPER_API_KEY", "")).strip()
+            serp_k = (crit.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
             if serper_k:
                 try:
                     self.emit("query_start", {"query": query, "engine": "serper (google)"})
@@ -1104,9 +1119,7 @@ class KeywordLinkedInCollector:
                             return good
                 except Exception as e:
                     logger.warning(f"Serper error in collector: {e}")
-
-            serp_k = (crit.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
-            if serp_k:
+            elif serp_k:
                 try:
                     self.emit("query_start", {"query": query, "engine": "serpapi (google)"})
                     res = search_serpapi(query, page=page, api_key=serp_k)

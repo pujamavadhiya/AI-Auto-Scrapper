@@ -951,36 +951,42 @@ def _run_collector_thread(
         )
 
         # Commit final complete dataset to user's database history
-        if task.get("userId") and task.get("historyId"):
-            database.update_search_history(
-                history_id=task["historyId"],
-                user_id=task["userId"],
-                records=rows,
-                status=final_status,
-            )
-        elif task.get("userId"):
-            h = database.save_search_history(
-                user_id=task["userId"],
-                module_type="keyword-collector",
-                search_query=task.get("searchQuery", "Keyword Scraper"),
-                records=rows,
-                filters=task.get("filters", {}),
-                status=final_status,
-            )
-            task["historyId"] = h["id"]
+        try:
+            if task.get("userId") and task.get("historyId"):
+                database.update_search_history(
+                    history_id=task["historyId"],
+                    user_id=task["userId"],
+                    records=rows,
+                    status=final_status,
+                )
+            elif task.get("userId"):
+                h = database.save_search_history(
+                    user_id=task["userId"],
+                    module_type="keyword-collector",
+                    search_query=task.get("searchQuery", "Keyword Scraper"),
+                    records=rows,
+                    filters=task.get("filters", {}),
+                    status=final_status,
+                )
+                task["historyId"] = h["id"]
+        except Exception as db_err:
+            logger.warning(f"Error persisting final search history: {db_err}")
 
     except Exception as e:
         traceback.print_exc()
         task["status"] = "error"
         task["error"] = str(e)
         task["progressMessage"] = f"Error during scraping: {str(e)}"
-        if task.get("userId") and task.get("historyId"):
-            database.update_search_history(
-                history_id=task["historyId"],
-                user_id=task["userId"],
-                records=task.get("records", []),
-                status="error",
-            )
+        try:
+            if task.get("userId") and task.get("historyId"):
+                database.update_search_history(
+                    history_id=task["historyId"],
+                    user_id=task["userId"],
+                    records=task.get("records", []),
+                    status="error",
+                )
+        except Exception:
+            pass
 
 
 @app.post("/api/collector/start")

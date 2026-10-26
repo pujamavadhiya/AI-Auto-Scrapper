@@ -501,6 +501,38 @@ def save_search_history(
     }
 
 
+def update_search_history(
+    history_id: str,
+    user_id: str,
+    records: List[Dict[str, Any]],
+    status: str = "completed",
+    enriched_count: Optional[int] = None,
+) -> bool:
+    """Updates an existing search history entry with newly scraped/enriched records."""
+    now = datetime.now(timezone.utc).isoformat()
+    record_count = len(records)
+    if enriched_count is None:
+        enriched_count = sum(1 for r in records if r.get("enrichmentStatus") == "enriched" or r.get("linkedinUrl") or r.get("email") or r.get("Profile URL"))
+
+    results_json = json.dumps(records, ensure_ascii=False)
+
+    with get_db_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE search_history
+            SET record_count = ?,
+                enriched_count = ?,
+                results_json = ?,
+                status = ?,
+                updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (record_count, enriched_count, results_json, status, now, history_id, user_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def get_user_search_history(user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
     """
     Retrieves summary list of all search extractions for this user (most recent first).
