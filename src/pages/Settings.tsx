@@ -19,6 +19,13 @@ import {
   ExternalLink,
   Sparkles,
   Key,
+  Users,
+  UserPlus,
+  KeyRound,
+  Shield,
+  X,
+  Lock,
+  RefreshCw,
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -27,11 +34,22 @@ import { storageService } from '../services/storageService';
 import { AppSettings } from '../types';
 import { getApiBaseUrl } from '../config/api';
 import { useAuth } from '../context/AuthContext';
+import { authService } from '../services/authService';
 
 export const Settings: React.FC = () => {
   const { user, keys: authKeys, updateKeys } = useAuth();
   const [settings, setSettings] = useState<AppSettings>(() => storageService.getSettings());
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
+
+  // User Management State (No Shell Access Required)
+  const [teamUsers, setTeamUsers] = useState<any[]>([]);
+  const [loadingUsers, setLoadingUsers] = useState(false);
+  const [isCreateUserModalOpen, setIsCreateUserModalOpen] = useState(false);
+  const [newUserData, setNewUserData] = useState({ email: '', password: '', name: '', role: 'user' });
+  const [userActionError, setUserActionError] = useState<string | null>(null);
+  const [userActionSuccess, setUserActionSuccess] = useState<string | null>(null);
+  const [passwordModalUser, setPasswordModalUser] = useState<string | null>(null);
+  const [newPasswordValue, setNewPasswordValue] = useState('');
 
   // Synchronize initial settings if auth keys arrived
   useEffect(() => {
@@ -59,6 +77,66 @@ export const Settings: React.FC = () => {
     status: 'idle',
     message: '',
   });
+
+  const loadTeamUsers = async () => {
+    setLoadingUsers(true);
+    try {
+      const list = await authService.listUsers();
+      setTeamUsers(list);
+    } catch (e: any) {
+      console.warn('Could not load team users:', e);
+    } finally {
+      setLoadingUsers(false);
+    }
+  };
+
+  useEffect(() => {
+    loadTeamUsers();
+  }, []);
+
+  const handleCreateUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setUserActionError(null);
+    setUserActionSuccess(null);
+    try {
+      await authService.createUser(newUserData);
+      setUserActionSuccess(`User "${newUserData.email}" created successfully!`);
+      setIsCreateUserModalOpen(false);
+      setNewUserData({ email: '', password: '', name: '', role: 'user' });
+      loadTeamUsers();
+    } catch (err: any) {
+      setUserActionError(err.message || 'Failed to create user.');
+    }
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!passwordModalUser || !newPasswordValue) return;
+    setUserActionError(null);
+    setUserActionSuccess(null);
+    try {
+      await authService.changeUserPassword({ email: passwordModalUser, password: newPasswordValue });
+      setUserActionSuccess(`Password for "${passwordModalUser}" updated successfully!`);
+      setPasswordModalUser(null);
+      setNewPasswordValue('');
+      loadTeamUsers();
+    } catch (err: any) {
+      setUserActionError(err.message || 'Failed to update password.');
+    }
+  };
+
+  const handleDeleteUser = async (emailToDelete: string) => {
+    if (!confirm(`Are you sure you want to delete account "${emailToDelete}"?`)) return;
+    setUserActionError(null);
+    setUserActionSuccess(null);
+    try {
+      await authService.deleteUser(emailToDelete);
+      setUserActionSuccess(`User "${emailToDelete}" deleted.`);
+      loadTeamUsers();
+    } catch (err: any) {
+      setUserActionError(err.message || 'Failed to delete user.');
+    }
+  };
 
   const handleUpdate = async (updated: Partial<AppSettings>) => {
     const next = storageService.saveSettings(updated);
@@ -748,6 +826,306 @@ export const Settings: React.FC = () => {
           </div>
         </CardContent>
       </Card>
+
+      {/* User & Team Account Management (Web-Based Admin - No Shell Access Needed) */}
+      <Card className="border-blue-100 shadow-xs">
+        <CardHeader className="p-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <Users className="w-4 h-4 text-blue-600" />
+              <CardTitle className="text-base">Team & User Accounts</CardTitle>
+              <Badge variant="secondary" size="sm" className="font-mono text-[10px]">
+                {teamUsers.length} Registered
+              </Badge>
+            </div>
+            <CardDescription className="text-xs mt-0.5">
+              Create, update, and manage accounts directly in the database without cloud shell access.
+            </CardDescription>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={loadTeamUsers}
+              disabled={loadingUsers}
+              className="text-xs h-8 px-2.5"
+              title="Refresh users"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingUsers ? 'animate-spin text-blue-600' : ''}`} />
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                setUserActionError(null);
+                setUserActionSuccess(null);
+                setIsCreateUserModalOpen(true);
+              }}
+              className="bg-blue-600 hover:bg-blue-700 text-white text-xs h-8 px-3 font-semibold gap-1.5 shadow-xs"
+            >
+              <UserPlus className="w-3.5 h-3.5" />
+              <span>Create User</span>
+            </Button>
+          </div>
+        </CardHeader>
+
+        <CardContent className="p-5 space-y-4">
+          {userActionSuccess && (
+            <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>{userActionSuccess}</span>
+            </div>
+          )}
+
+          {userActionError && (
+            <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center gap-2">
+              <X className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{userActionError}</span>
+            </div>
+          )}
+
+          <div className="overflow-x-auto border border-slate-200/80 rounded-xl">
+            <table className="w-full text-left text-xs border-collapse">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold uppercase text-[10px] tracking-wider">
+                  <th className="p-3">User</th>
+                  <th className="p-3">Role</th>
+                  <th className="p-3">Configured API Keys</th>
+                  <th className="p-3">Created</th>
+                  <th className="p-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {teamUsers.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="p-6 text-center text-slate-400 text-xs">
+                      {loadingUsers ? 'Loading registered accounts...' : 'No users found.'}
+                    </td>
+                  </tr>
+                ) : (
+                  teamUsers.map((u) => {
+                    const isSelf = user?.email?.toLowerCase() === u.email?.toLowerCase();
+                    return (
+                      <tr key={u.id} className="hover:bg-slate-50/60 transition-colors">
+                        <td className="p-3">
+                          <div className="font-semibold text-slate-900 flex items-center gap-1.5">
+                            <span>{u.name || u.email.split('@')[0]}</span>
+                            {isSelf && (
+                              <Badge variant="outline" size="sm" className="text-[9px] py-0 px-1 border-blue-200 text-blue-700 bg-blue-50">
+                                You
+                              </Badge>
+                            )}
+                          </div>
+                          <div className="text-[11px] font-mono text-slate-500">{u.email}</div>
+                        </td>
+                        <td className="p-3">
+                          <Badge variant={u.role === 'admin' ? 'default' : 'secondary'} size="sm" className="capitalize text-[10px]">
+                            {u.role || 'user'}
+                          </Badge>
+                        </td>
+                        <td className="p-3">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${u.has_serpapi_key ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-400'}`}>
+                              SerpAPI: {u.has_serpapi_key ? '✓' : '—'}
+                            </span>
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${u.has_gemini_key ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' : 'bg-slate-100 text-slate-400'}`}>
+                              Gemini: {u.has_gemini_key ? '✓' : '—'}
+                            </span>
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${u.has_serper_key ? 'bg-sky-50 text-sky-700 border border-sky-200' : 'bg-slate-100 text-slate-400'}`}>
+                              Serper: {u.has_serper_key ? '✓' : '—'}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="p-3 text-[11px] text-slate-500">
+                          {u.created_at ? new Date(u.created_at).toLocaleDateString() : '—'}
+                        </td>
+                        <td className="p-3 text-right">
+                          <div className="flex items-center justify-end gap-1.5">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                setUserActionError(null);
+                                setUserActionSuccess(null);
+                                setPasswordModalUser(u.email);
+                                setNewPasswordValue('');
+                              }}
+                              className="h-7 px-2 text-[11px] text-slate-700 hover:text-blue-700 hover:border-blue-300"
+                              title="Reset Password"
+                            >
+                              <KeyRound className="w-3 h-3 mr-1" />
+                              Password
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => handleDeleteUser(u.email)}
+                              disabled={isSelf}
+                              className={`h-7 px-2 text-[11px] ${
+                                isSelf
+                                  ? 'opacity-30 cursor-not-allowed'
+                                  : 'text-rose-600 hover:bg-rose-50 hover:text-rose-700'
+                              }`}
+                              title={isSelf ? 'Cannot delete your active account' : 'Delete user'}
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Modal: Create User (Web-based Admin) */}
+      {isCreateUserModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <UserPlus className="w-5 h-5 text-blue-600" />
+                <h3 className="font-bold text-slate-900 text-sm">Create New Team User</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsCreateUserModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateUser} className="p-5 space-y-3.5 text-xs">
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">
+                  Email Address <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="email"
+                  required
+                  placeholder="colleague@company.com"
+                  value={newUserData.email}
+                  onChange={(e) => setNewUserData({ ...newUserData, email: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Display Name</label>
+                <input
+                  type="text"
+                  placeholder="Jane Doe"
+                  value={newUserData.name}
+                  onChange={(e) => setNewUserData({ ...newUserData, name: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">
+                  Password <span className="text-rose-500">*</span> (min 6 characters)
+                </label>
+                <input
+                  type="password"
+                  required
+                  minLength={6}
+                  placeholder="••••••••••••"
+                  value={newUserData.password}
+                  onChange={(e) => setNewUserData({ ...newUserData, password: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Role</label>
+                <select
+                  value={newUserData.role}
+                  onChange={(e) => setNewUserData({ ...newUserData, role: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
+                >
+                  <option value="user">User (Standard Access)</option>
+                  <option value="admin">Admin (User Management Access)</option>
+                </select>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setIsCreateUserModalOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" size="sm" className="bg-blue-600 hover:bg-blue-700 text-white font-semibold">
+                  Create Account
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Change Password (Web-based Admin) */}
+      {passwordModalUser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="w-full max-w-sm bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <KeyRound className="w-4 h-4 text-indigo-600" />
+                <h3 className="font-bold text-slate-900 text-sm">Reset Password</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPasswordModalUser(null)}
+                className="text-slate-400 hover:text-slate-600 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleChangePassword} className="p-5 space-y-3.5 text-xs">
+              <div>
+                <div className="text-slate-500 text-[11px] mb-2">
+                  Updating password for account:
+                  <div className="font-mono font-bold text-slate-800 text-xs">{passwordModalUser}</div>
+                </div>
+                <label className="block font-semibold text-slate-700 mb-1">
+                  New Password <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="password"
+                  required
+                  minLength={6}
+                  placeholder="Enter new password (min 6 chars)"
+                  value={newPasswordValue}
+                  onChange={(e) => setNewPasswordValue(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPasswordModalUser(null)}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" size="sm" className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold">
+                  Update Password
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* 4. Danger Zone / Reset */}
       <Card className="border-rose-200 bg-rose-50/20">

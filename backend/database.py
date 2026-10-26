@@ -89,40 +89,65 @@ def init_db():
             ON search_history (user_id, created_at DESC);
         """)
 
-        # Auto-seed default admin user if database is empty (e.g. fresh cloud deployment on Render)
+        # Auto-seed predefined admin/team users automatically without requiring shell access
+        seed_users = [
+            ("puja@gmail.com", "Puja@1234", "Puja", "admin"),
+            ("dhruv@gmail.com", "Dhruv@1234", "Dhruv", "admin"),
+            ("admin@example.com", "password123", "Admin User", "admin"),
+        ]
+
+        # Also support custom environment variable: INITIAL_USERS="email:pass:name:role,email2:pass2:name2"
+        extra_users_env = os.environ.get("INITIAL_USERS", "").strip()
+        if extra_users_env:
+            for item in extra_users_env.split(","):
+                parts = item.strip().split(":")
+                if len(parts) >= 2:
+                    u_email = parts[0].strip().lower()
+                    u_pass = parts[1].strip()
+                    u_name = parts[2].strip() if len(parts) >= 3 else u_email.split("@")[0].capitalize()
+                    u_role = parts[3].strip() if len(parts) >= 4 else "user"
+                    seed_users.append((u_email, u_pass, u_name, u_role))
+
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM users")
-        row = cur.fetchone()
-        user_count = row[0] if row else 0
-        if user_count == 0:
-            default_email = os.environ.get("DEFAULT_ADMIN_EMAIL", "admin@example.com").strip().lower()
-            default_password = os.environ.get("DEFAULT_ADMIN_PASSWORD", "password123").strip()
-            default_name = os.environ.get("DEFAULT_ADMIN_NAME", "Admin User").strip()
-            salt = secrets.token_hex(16)
-            p_hash, _ = hash_password(default_password, salt)
-            user_id = secrets.token_hex(12)
-            now_iso = datetime.now(timezone.utc).isoformat()
-            cur.execute(
-                """
-                INSERT INTO users (id, email, password_hash, salt, name, role, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'admin', ?, ?)
-                """,
-                (user_id, default_email, p_hash, salt, default_name, now_iso, now_iso),
-            )
-            cur.execute(
-                """
-                INSERT INTO user_keys (user_id, serpapi_key, serper_key, gemini_api_key, leadocean_api_key, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    os.environ.get("SERPAPI_KEY", ""),
-                    os.environ.get("SERPER_API_KEY", ""),
-                    os.environ.get("GEMINI_API_KEY", ""),
-                    os.environ.get("LEADOCEAN_API_KEY", ""),
-                    now_iso,
-                ),
-            )
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for u_email, u_pass, u_name, u_role in seed_users:
+            u_clean_email = u_email.strip().lower()
+            cur.execute("SELECT id FROM users WHERE email = ?", (u_clean_email,))
+            existing = cur.fetchone()
+            if not existing:
+                salt = secrets.token_hex(16)
+                p_hash, _ = hash_password(u_pass, salt)
+                user_id = secrets.token_hex(12)
+                cur.execute(
+                    """
+                    INSERT INTO users (id, email, password_hash, salt, name, role, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (user_id, u_clean_email, p_hash, salt, u_name, u_role, now_iso, now_iso),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO user_keys (user_id, serpapi_key, serper_key, gemini_api_key, leadocean_api_key, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        os.environ.get("SERPAPI_KEY", ""),
+                        os.environ.get("SERPER_API_KEY", ""),
+                        os.environ.get("GEMINI_API_KEY", ""),
+                        os.environ.get("LEADOCEAN_API_KEY", ""),
+                        now_iso,
+                    ),
+                )
+            else:
+                # User exists: update password to match seed password so changing it here or via env works immediately
+                salt = secrets.token_hex(16)
+                p_hash, _ = hash_password(u_pass, salt)
+                cur.execute(
+                    "UPDATE users SET password_hash = ?, salt = ?, updated_at = ? WHERE email = ?",
+                    (p_hash, salt, now_iso, u_clean_email),
+                )
 
         conn.commit()
 

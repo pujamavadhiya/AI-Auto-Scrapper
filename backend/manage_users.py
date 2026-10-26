@@ -50,7 +50,12 @@ def cmd_create(args):
         print("\nThe user can now log into the web application using this email and password.")
         print("Each user configures their own SerpAPI, Serper, and Gemini keys via Platform Settings.")
     except Exception as e:
-        print(f"❌ Error creating user: {e}")
+        if "UNIQUE constraint failed" in str(e):
+            print(f"❌ User with email '{email}' already exists.")
+            print(f"   To update this user's password, run:")
+            print(f"   python3 backend/manage_users.py change-password --email {email} --password <new_password>")
+        else:
+            print(f"❌ Error creating user: {e}")
         sys.exit(1)
 
 

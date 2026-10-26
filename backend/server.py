@@ -143,6 +143,22 @@ class AssistantChatPayload(BaseModel):
     geminiApiKey: Optional[str] = None
 
 
+class AdminCreateUserPayload(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = ""
+    role: Optional[str] = "user"
+
+
+class AdminChangePasswordPayload(BaseModel):
+    email: str
+    password: str
+
+
+class AdminDeleteUserPayload(BaseModel):
+    email: str
+
+
 def get_current_user_optional(authorization: Optional[str] = Header(None)) -> Optional[Dict[str, Any]]:
     """Resolves authenticated user from Bearer token if present."""
     if not authorization:
@@ -232,6 +248,54 @@ def update_user_keys_endpoint(payload: UserKeyUpdatePayload, authorization: Opti
         "message": f"API keys updated successfully for {user['email']}.",
         "keys": updated,
     }
+
+
+@app.get("/api/admin/users")
+def admin_list_users(authorization: Optional[str] = Header(None)):
+    """Lists all users for team management."""
+    get_current_user(authorization)
+    return {"status": "ok", "users": database.list_users()}
+
+
+@app.post("/api/admin/users/create")
+def admin_create_user(payload: AdminCreateUserPayload, authorization: Optional[str] = Header(None)):
+    """Creates a new user directly from the web interface without shell access."""
+    get_current_user(authorization)
+    try:
+        new_user = database.create_user(
+            email=payload.email,
+            password=payload.password,
+            name=payload.name or "",
+            role=payload.role or "user"
+        )
+        return {"status": "ok", "user": new_user}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/admin/users/change-password")
+def admin_change_password(payload: AdminChangePasswordPayload, authorization: Optional[str] = Header(None)):
+    """Updates password for a user from the web interface without shell access."""
+    get_current_user(authorization)
+    try:
+        ok = database.update_user_password(payload.email, payload.password)
+        if not ok:
+            raise HTTPException(status_code=404, detail="User not found.")
+        return {"status": "ok", "message": f"Password for {payload.email} updated successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/admin/users/delete")
+def admin_delete_user(payload: AdminDeleteUserPayload, authorization: Optional[str] = Header(None)):
+    """Deletes a user account from the web interface without shell access."""
+    curr = get_current_user(authorization)
+    if curr["email"].lower() == payload.email.lower():
+        raise HTTPException(status_code=400, detail="Cannot delete your own active account.")
+    ok = database.delete_user(payload.email)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"status": "ok", "message": f"User {payload.email} deleted successfully."}
 
 
 class SaveHistoryPayload(BaseModel):

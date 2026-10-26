@@ -108,4 +108,60 @@ export const authService = {
     const data = await res.json();
     return data.keys;
   },
+
+  async listUsers(): Promise<any[]> {
+    const apiBase = getApiBaseUrl() || (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? 'http://127.0.0.1:8000' : '');
+    const res = await fetch(`${apiBase}/api/admin/users`, {
+      method: 'GET',
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to list users.');
+    }
+    const data = await res.json();
+    return data.users || [];
+  },
+
+  async createUser(payload: { email: string; password: string; name?: string; role?: string }): Promise<any> {
+    const apiBase = getApiBaseUrl() || (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? 'http://127.0.0.1:8000' : '');
+    const res = await fetch(`${apiBase}/api/admin/users/create`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to create user.');
+    }
+    return res.json();
+  },
+
+  async changeUserPassword(payload: { email: string; password: string }): Promise<any> {
+    const apiBase = getApiBaseUrl() || (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? 'http://127.0.0.1:8000' : '');
+    const res = await fetch(`${apiBase}/api/admin/users/change-password`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to change password.');
+    }
+    return res.json();
+  },
+
+  async deleteUser(email: string): Promise<any> {
+    const apiBase = getApiBaseUrl() || (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? 'http://127.0.0.1:8000' : '');
+    const res = await fetch(`${apiBase}/api/admin/users/delete`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ email }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to delete user.');
+    }
+    return res.json();
+  },
 };
