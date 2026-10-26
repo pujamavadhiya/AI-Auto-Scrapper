@@ -78,7 +78,15 @@ export const Settings: React.FC = () => {
     message: '',
   });
 
+  // User management is strictly restricted to user Puja
+  const isPuja = !!(
+    user &&
+    (user.email?.trim().toLowerCase() === 'puja@gmail.com' ||
+     user.name?.trim().toLowerCase() === 'puja')
+  );
+
   const loadTeamUsers = async () => {
+    if (!isPuja) return;
     setLoadingUsers(true);
     try {
       const list = await authService.listUsers();
@@ -91,8 +99,10 @@ export const Settings: React.FC = () => {
   };
 
   useEffect(() => {
-    loadTeamUsers();
-  }, []);
+    if (isPuja) {
+      loadTeamUsers();
+    }
+  }, [isPuja]);
 
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -827,8 +837,9 @@ export const Settings: React.FC = () => {
         </CardContent>
       </Card>
 
-      {/* User & Team Account Management (Web-Based Admin - No Shell Access Needed) */}
-      <Card className="border-blue-100 shadow-xs">
+      {/* User & Team Account Management (Strictly restricted to user Puja) */}
+      {isPuja && (
+        <Card className="border-blue-100 shadow-xs">
         <CardHeader className="p-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <div className="flex items-center gap-2">
@@ -981,9 +992,10 @@ export const Settings: React.FC = () => {
           </div>
         </CardContent>
       </Card>
+      )}
 
-      {/* Modal: Create User (Web-based Admin) */}
-      {isCreateUserModalOpen && (
+      {/* Modal: Create User (Web-based Admin - Strictly Puja) */}
+      {isPuja && isCreateUserModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
           <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
             <div className="p-5 border-b border-slate-100 flex items-center justify-between">
@@ -1071,8 +1083,8 @@ export const Settings: React.FC = () => {
         </div>
       )}
 
-      {/* Modal: Change Password (Web-based Admin) */}
-      {passwordModalUser && (
+      {/* Modal: Change Password (Web-based Admin - Strictly Puja) */}
+      {isPuja && passwordModalUser && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
           <div className="w-full max-w-sm bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
             <div className="p-5 border-b border-slate-100 flex items-center justify-between">

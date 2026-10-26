@@ -8,19 +8,14 @@ import {
   ShieldCheck,
   Sparkles,
   ArrowRight,
-  AlertCircle,
-  KeyRound,
   CheckCircle2,
   Server,
   Layers,
-  ChevronDown,
-  ChevronUp,
-  RefreshCw,
-  Globe,
+  KeyRound,
+  AlertCircle,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { Button } from '../components/ui/Button';
-import { getApiBaseUrl, setCustomApiBaseUrl } from '../config/api';
 
 export const Login: React.FC = () => {
   const [email, setEmail] = useState('');
@@ -28,15 +23,6 @@ export const Login: React.FC = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-
-  // Backend connection drawer state for production/Vercel
-  const [currentApiBase, setCurrentApiBase] = useState(() => getApiBaseUrl());
-  const [showConfigDrawer, setShowConfigDrawer] = useState(() => !getApiBaseUrl() && typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1');
-  const [inputApiUrl, setInputApiUrl] = useState(() => getApiBaseUrl());
-  const [testingConnection, setTestingConnection] = useState(false);
-  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
-
-  const isLocal = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
 
   const { login } = useAuth();
   const navigate = useNavigate();
@@ -66,29 +52,6 @@ export const Login: React.FC = () => {
       setErrorMessage(err.message || 'Unable to connect to server. Ensure backend is running.');
     } finally {
       setIsSubmitting(false);
-    }
-  };
-
-  const handleTestAndSaveBackend = async () => {
-    setTestingConnection(true);
-    setTestResult(null);
-    const cleanUrl = inputApiUrl.trim().replace(/\/+$/, '');
-    try {
-      const target = cleanUrl || (isLocal ? 'http://127.0.0.1:8000' : '');
-      if (!target) {
-        throw new Error('Please enter a Backend URL (e.g. https://your-backend.onrender.com)');
-      }
-      const res = await fetch(`${target}/api/health`, { method: 'GET' });
-      if (!res.ok) {
-        throw new Error(`Server responded with HTTP ${res.status}`);
-      }
-      setCustomApiBaseUrl(cleanUrl);
-      setCurrentApiBase(cleanUrl);
-      setTestResult({ ok: true, message: 'Connected! Backend API is active.' });
-    } catch (e: any) {
-      setTestResult({ ok: false, message: e.message || 'Could not connect to backend endpoint.' });
-    } finally {
-      setTestingConnection(false);
     }
   };
 
@@ -222,82 +185,6 @@ export const Login: React.FC = () => {
             </Button>
           </form>
 
-          {/* Backend Connection Drawer (Critical for Vercel) */}
-          <div className="pt-2 border-t border-slate-800/80">
-            <div className="flex items-center justify-between text-xs">
-              <div className="flex items-center gap-2 text-slate-300">
-                <span className={`w-2 h-2 rounded-full ${currentApiBase || isLocal ? 'bg-emerald-400' : 'bg-amber-400 animate-ping'}`} />
-                <span className="text-[11px] font-medium text-slate-400">
-                  {currentApiBase ? (
-                    <span className="font-mono text-emerald-300">{currentApiBase.replace(/^https?:\/\//, '')}</span>
-                  ) : isLocal ? (
-                    <span className="text-slate-300">Localhost (127.0.0.1:8000)</span>
-                  ) : (
-                    <span className="text-amber-300 font-semibold">Backend URL Not Set</span>
-                  )}
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowConfigDrawer(!showConfigDrawer)}
-                className="text-[11px] text-blue-400 hover:text-blue-300 flex items-center gap-1 font-medium cursor-pointer"
-              >
-                <span>{showConfigDrawer ? 'Hide Settings' : 'Change Backend URL'}</span>
-                {showConfigDrawer ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-              </button>
-            </div>
-
-            {showConfigDrawer && (
-              <div className="mt-3 p-3.5 rounded-xl bg-slate-950/70 border border-slate-800 space-y-2.5 text-xs">
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                    Backend API Server URL (e.g. Render, Railway, or Tunnel)
-                  </label>
-                  <div className="flex gap-2">
-                    <input
-                      type="url"
-                      value={inputApiUrl}
-                      onChange={(e) => setInputApiUrl(e.target.value)}
-                      placeholder="https://ai-auto-scrapper-backend.onrender.com"
-                      className="flex-1 px-2.5 py-1.5 text-xs rounded-lg bg-slate-900 border border-slate-700 text-slate-100 placeholder-slate-500 font-mono focus:outline-hidden focus:border-blue-500"
-                    />
-                    <Button
-                      type="button"
-                      size="sm"
-                      onClick={handleTestAndSaveBackend}
-                      disabled={testingConnection}
-                      className="bg-blue-600 hover:bg-blue-500 text-white text-[11px] px-3 h-8 shrink-0 font-semibold cursor-pointer"
-                    >
-                      {testingConnection ? <RefreshCw className="w-3 h-3 animate-spin" /> : 'Connect'}
-                    </Button>
-                  </div>
-                </div>
-
-                {testResult && (
-                  <div
-                    className={`p-2 rounded-lg text-[11px] flex items-center gap-1.5 ${
-                      testResult.ok
-                        ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300'
-                        : 'bg-rose-500/10 border border-rose-500/30 text-rose-300'
-                    }`}
-                  >
-                    {testResult.ok ? (
-                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                    ) : (
-                      <AlertCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                    )}
-                    <span>{testResult.message}</span>
-                  </div>
-                )}
-
-                <div className="text-[10px] text-slate-400 leading-normal">
-                  <span className="font-semibold text-slate-300">Permanent Vercel setup:</span> Add{' '}
-                  <code className="text-blue-300 bg-slate-900 px-1 py-0.5 rounded font-mono">VITE_API_URL</code> to{' '}
-                  <span className="text-slate-300">Vercel &rarr; Settings &rarr; Environment Variables</span>, then redeploy.
-                </div>
-              </div>
-            )}
-          </div>
 
           {/* Backend Provisioned Notice (No Sign-up Form) */}
           <div className="p-3.5 rounded-xl bg-slate-950/50 border border-slate-800/80 text-[11px] text-slate-400 space-y-1.5">

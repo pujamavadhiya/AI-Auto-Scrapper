@@ -250,17 +250,35 @@ def update_user_keys_endpoint(payload: UserKeyUpdatePayload, authorization: Opti
     }
 
 
+def require_puja_admin(user: Dict[str, Any]) -> None:
+    """
+    Restricts access to user and team management exclusively to user Puja (puja@gmail.com).
+    Raises HTTP 403 Forbidden for any other user.
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    email = (user.get("email") or "").strip().lower()
+    name = (user.get("name") or "").strip().lower()
+    if email != "puja@gmail.com" and name != "puja":
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied. Only Puja has access to view or manage team members and user accounts."
+        )
+
+
 @app.get("/api/admin/users")
 def admin_list_users(authorization: Optional[str] = Header(None)):
-    """Lists all users for team management."""
-    get_current_user(authorization)
+    """Lists all users for team management - restricted strictly to user Puja."""
+    user = get_current_user(authorization)
+    require_puja_admin(user)
     return {"status": "ok", "users": database.list_users()}
 
 
 @app.post("/api/admin/users/create")
 def admin_create_user(payload: AdminCreateUserPayload, authorization: Optional[str] = Header(None)):
-    """Creates a new user directly from the web interface without shell access."""
-    get_current_user(authorization)
+    """Creates a new user directly from the web interface - restricted strictly to user Puja."""
+    user = get_current_user(authorization)
+    require_puja_admin(user)
     try:
         new_user = database.create_user(
             email=payload.email,
@@ -275,8 +293,9 @@ def admin_create_user(payload: AdminCreateUserPayload, authorization: Optional[s
 
 @app.post("/api/admin/users/change-password")
 def admin_change_password(payload: AdminChangePasswordPayload, authorization: Optional[str] = Header(None)):
-    """Updates password for a user from the web interface without shell access."""
-    get_current_user(authorization)
+    """Updates password for a user - restricted strictly to user Puja."""
+    user = get_current_user(authorization)
+    require_puja_admin(user)
     try:
         ok = database.update_user_password(payload.email, payload.password)
         if not ok:
@@ -288,9 +307,10 @@ def admin_change_password(payload: AdminChangePasswordPayload, authorization: Op
 
 @app.post("/api/admin/users/delete")
 def admin_delete_user(payload: AdminDeleteUserPayload, authorization: Optional[str] = Header(None)):
-    """Deletes a user account from the web interface without shell access."""
-    curr = get_current_user(authorization)
-    if curr["email"].lower() == payload.email.lower():
+    """Deletes a user account - restricted strictly to user Puja."""
+    user = get_current_user(authorization)
+    require_puja_admin(user)
+    if user["email"].lower() == payload.email.lower():
         raise HTTPException(status_code=400, detail="Cannot delete your own active account.")
     ok = database.delete_user(payload.email)
     if not ok:
