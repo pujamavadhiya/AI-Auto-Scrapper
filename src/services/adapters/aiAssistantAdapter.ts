@@ -15,10 +15,11 @@ export class AIAssistantAdapter {
 I can directly research prospective companies, identify key decision makers (CEOs, VPs, Directors), analyze market competitors, and draft personalized outreach strategies.
 
 ### What would you like to explore?
-- "Find the CEO and VP of Sales at Stripe"
-- "List the top 5 cybersecurity startups in Austin with decision makers"
-- "Draft an executive cold email to the CTO of Datadog"
-- "Compare Snowflake vs Databricks for enterprise sales"`,
+- **Decision Maker Discovery**: Find executive contacts (CEOs, CTOs, VPs) with verified titles & companies
+- **Company Intelligence**: Analyze company products, market alternatives, and competitor positioning
+- **Outreach Strategy**: Draft personalized executive cold emails and tailored value propositions
+
+Select a suggested inquiry below or ask any research question to get started!`,
       timestamp: new Date().toISOString(),
       suggestedPrompts: [
         'Find the CEO and VP of Sales at Stripe',

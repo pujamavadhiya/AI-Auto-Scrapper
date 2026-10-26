@@ -22,6 +22,7 @@ import { authService } from '../services/authService';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 import { Card } from '../components/ui/Card';
+import { MarkdownView } from '../components/common/MarkdownView';
 
 export const AIResearchAssistant: React.FC = () => {
   const [messages, setMessages] = useState<ChatMessage[]>(() => aiAssistantService.getInitialMessages());
@@ -315,10 +316,8 @@ export const AIResearchAssistant: React.FC = () => {
                     : 'bg-white border border-slate-200/90 text-slate-800 rounded-tl-xs'
                 }`}
               >
-                {/* Text Body with Markdown styling */}
-                <div className="prose prose-sm max-w-none text-inherit space-y-3 whitespace-pre-wrap font-normal leading-relaxed">
-                  {msg.content}
-                </div>
+                {/* Text Body with rich Markdown styling */}
+                <MarkdownView content={msg.content} isUser={isUser} />
 
                 {/* Suggested Follow-up Prompts */}
                 {msg.suggestedPrompts && msg.suggestedPrompts.length > 0 && !isUser && (
