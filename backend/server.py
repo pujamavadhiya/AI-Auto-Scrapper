@@ -15,6 +15,7 @@ import time
 import traceback
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -49,7 +50,7 @@ from linkedin_collector import CollectorConfig, KeywordLinkedInCollector, clean_
 from social_media_scraper import SocialMediaScraper
 from decision_maker_finder import DecisionMakerFinder
 from leadocean_enricher import LeadOceanEnricher, load_config as load_leadocean_config
-from gemini_lead_auditor import audit_leads_with_gemini, get_gemini_api_key
+from gemini_lead_auditor import audit_leads_with_gemini, get_gemini_api_key, call_gemini_api
 
 app = FastAPI(title="AI Auto Scrapper API", version="1.0.0")
 
@@ -129,6 +130,17 @@ class UserKeyUpdatePayload(BaseModel):
     apifyToken: Optional[str] = None
     openaiApiKey: Optional[str] = None
     defaultEngine: Optional[str] = None
+
+
+class ChatMessageItem(BaseModel):
+    role: str
+    content: str
+
+
+class AssistantChatPayload(BaseModel):
+    message: str
+    history: Optional[List[ChatMessageItem]] = None
+    geminiApiKey: Optional[str] = None
 
 
 def get_current_user_optional(authorization: Optional[str] = Header(None)) -> Optional[Dict[str, Any]]:
@@ -344,6 +356,154 @@ def health(authorization: Optional[str] = Header(None)):
         "keyPreview": masked,
         "engine": "SerpAPI Decision Maker LinkedIn URL Finder",
         "user": user["email"] if user else None,
+    }
+
+
+@app.get("/api/dashboard/stats")
+def get_dashboard_stats(authorization: Optional[str] = Header(None)):
+    """
+    Returns actual dynamic dashboard statistics for the authenticated user:
+    - Real leads extracted count
+    - Enriched records count
+    - Real search extractions list
+    - Active background tasks
+    - Configured API keys
+    """
+    user = get_current_user(authorization)
+    user_keys = database.get_user_keys(user["id"])
+    history = database.get_user_search_history(user["id"], limit=10)
+
+    total_leads = sum(item.get("recordCount", 0) for item in history)
+    total_enriched = sum(item.get("enrichedCount", 0) for item in history)
+    total_searches = len(history)
+
+    # Check key statuses
+    keys_status = {
+        "serpapi": bool(user_keys.get("serpapi_key", "").strip() and not user_keys.get("serpapi_key", "").startswith("your_")),
+        "serper": bool(user_keys.get("serper_key", "").strip() and not user_keys.get("serper_key", "").startswith("your_")),
+        "gemini": bool(user_keys.get("gemini_api_key", "").strip() and not user_keys.get("gemini_api_key", "").startswith("your_")),
+        "leadocean": bool(user_keys.get("leadocean_api_key", "").strip() and not user_keys.get("leadocean_api_key", "").startswith("your_")),
+    }
+    keys_configured = sum(1 for v in keys_status.values() if v)
+
+    # Check for active running collector tasks
+    active_task = None
+    for tid, task in reversed(list(COLLECTOR_TASKS.items())):
+        if task.get("userId") == user["id"] and task.get("status") in ("running", "stopping"):
+            active_task = get_collector_status(tid)
+            break
+
+    return {
+        "status": "ok",
+        "user": {
+            "name": user.get("name") or user.get("email", "").split("@")[0],
+            "email": user["email"],
+            "role": user.get("role", "user"),
+        },
+        "stats": {
+            "totalLeads": total_leads,
+            "totalEnriched": total_enriched,
+            "totalSearches": total_searches,
+            "keysConfigured": keys_configured,
+            "keysTotal": 4,
+        },
+        "keysStatus": keys_status,
+        "activeTask": active_task,
+        "recentHistory": history,
+    }
+
+
+@app.get("/api/assistant/status")
+def assistant_status(authorization: Optional[str] = Header(None)):
+    """Checks whether the user currently has an active Gemini API key configured."""
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+    user_gemini = user_keys.get("gemini_api_key", "").strip()
+    if user_gemini and (user_gemini.startswith("test_") or user_gemini.startswith("your_")):
+        user_gemini = ""
+    api_key = user_gemini or os.environ.get("GEMINI_API_KEY", "").strip()
+    has_key = bool(api_key and not api_key.startswith("your_") and not api_key.startswith("test_"))
+    masked = (api_key[:4] + "..." + api_key[-4:]) if has_key and len(api_key) > 8 else ("configured" if has_key else "")
+    return {
+        "status": "ok",
+        "hasGeminiKey": has_key,
+        "maskedKey": masked,
+        "engine": "Google Gemini",
+    }
+
+
+@app.post("/api/assistant/chat")
+def assistant_chat(payload: AssistantChatPayload, authorization: Optional[str] = Header(None)):
+    """
+    Direct AI conversational research and company intelligence powered by Google Gemini.
+    Uses the user's isolated Gemini API key (or key passed in payload, or fallback env).
+    """
+    query = (payload.message or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+
+    explicit_key = (payload.geminiApiKey or "").strip()
+    user_gemini = user_keys.get("gemini_api_key", "").strip() if user else ""
+    if user_gemini and (user_gemini.startswith("test_") or user_gemini.startswith("your_")):
+        user_gemini = ""
+
+    api_key = explicit_key or user_gemini or os.environ.get("GEMINI_API_KEY", "").strip()
+
+    if not api_key or api_key.startswith("test_") or api_key.startswith("your_"):
+        raise HTTPException(
+            status_code=400,
+            detail="Gemini API Key is missing. Please provide your Gemini API Key in the chat bar or configure it in Platform Settings."
+        )
+
+    # Build conversation context
+    conversation_text = ""
+    if payload.history:
+        for item in payload.history[-6:]:
+            role_label = "User" if item.role == "user" else "Assistant"
+            conversation_text += f"{role_label}: {item.content}\n"
+
+    system_prompt = (
+        "You are the AI Auto Scrapper B2B Research & Intelligence Assistant. "
+        "You specialize in enterprise account discovery, decision-maker hierarchy (CEOs, VPs, Directors), "
+        "email/phone prospecting strategies, company intelligence, and competitive benchmarking.\n"
+        "Guidelines:\n"
+        "1. Provide factual, concise, well-structured answers using GitHub markdown (tables, bullet points, bold headers).\n"
+        "2. When identifying decision makers, structure them clearly: Full Name, Professional Title, Department, and LinkedIn profile format.\n"
+        "3. When asked to write cold emails or outreach angles, make them compelling, value-oriented, and personalized.\n"
+        "4. If asked to compare companies or analyze competitors, provide a clear comparison table.\n"
+        "5. Be direct, authoritative, and extremely helpful for sales, recruiting, and business development professionals.\n"
+    )
+
+    full_prompt = f"{system_prompt}\nRecent Conversation:\n{conversation_text}\nUser Query: {query}\n\nProvide an exhaustive, professional response:"
+
+    try:
+        response_text = call_gemini_api(full_prompt, api_key=api_key, timeout=40)
+        if not response_text:
+            raise Exception("Gemini API returned an empty response. Please verify your Gemini API key has sufficient quota.")
+    except Exception as e:
+        logger.error(f"Gemini chat error: {e}")
+        raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
+
+    suggested = [
+        f"Find decision-maker emails and LinkedIn for this",
+        f"Draft a personalized cold email pitch",
+        f"Compare key competitors and market alternatives",
+    ]
+
+    return {
+        "status": "ok",
+        "message": {
+            "id": f"msg-{int(time.time() * 1000)}",
+            "role": "assistant",
+            "content": response_text.strip(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "suggestedPrompts": suggested,
+        },
+        "engine": "Google Gemini 1.5",
+        "hasKey": True,
     }
 
 
