@@ -22,6 +22,7 @@ import {
   Phone,
   Linkedin,
   Filter,
+  Globe,
 } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
@@ -426,10 +427,11 @@ export const ExportHistory: React.FC = () => {
                     </thead>
                     <tbody className="divide-y divide-slate-100 font-mono text-[11px]">
                       {filteredModalRecords.map((r: any, idx: number) => {
-                        const name = r.personName || r['Full name'] || r.name || r['Decision maker name'] || '—';
+                        const name = r.personName || r['Full name'] || r.name || r['Decision maker name'] || r.customFields?.['Founder'] || r.Founder || '—';
                         const comp = r.companyName || r['Company name'] || r.company || r['Company'] || '—';
-                        const title = r.title || r['Decision maker title'] || r['Designation'] || '—';
-                        const liUrl = r.linkedinUrl || r['Profile URL'] || r['Decision Maker Linkedin'] || r.companyLinkedinUrl || '';
+                        const title = r.title || r['Decision maker title'] || r['Designation'] || r.customFields?.['Founder Title'] || r['Founder Title'] || '—';
+                        const liUrl = r.linkedinUrl || r['Profile URL'] || r['Decision Maker Linkedin'] || r.companyLinkedinUrl || r.customFields?.['Founder LinkedIn'] || r['Founder LinkedIn'] || '';
+                        const siteUrl = r.companyWebsite || r.customFields?.['Website'] || r.Website || (r.domain ? `https://${r.domain}` : '');
                         const email = r.email || r['Email'] || '';
                         const phone = r.phone || r['Phone'] || '';
 
@@ -437,7 +439,18 @@ export const ExportHistory: React.FC = () => {
                           <tr key={idx} className="hover:bg-blue-50/40 transition-colors">
                             <td className="p-3 text-slate-400 font-sans">{idx + 1}</td>
                             <td className="p-3 font-semibold text-slate-900 font-sans">
-                              {comp}
+                              <div>{comp}</div>
+                              {siteUrl && (
+                                <a
+                                  href={siteUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="text-[10px] text-blue-600 hover:underline flex items-center gap-1 font-mono font-normal mt-0.5"
+                                >
+                                  <Globe className="w-2.5 h-2.5 text-blue-500" />
+                                  <span>{siteUrl.replace(/^https?:\/\/(www\.)?/, '')}</span>
+                                </a>
+                              )}
                             </td>
                             <td className="p-3 font-semibold text-blue-700 font-sans">
                               {name}
