@@ -44,15 +44,11 @@ try:
     from backend.gemini_query_expander import (
         expand_criteria_with_gemini,
         verify_company_industry_smart,
-        search_serper,
-        search_serpapi,
     )
 except ImportError:
     from gemini_query_expander import (
         expand_criteria_with_gemini,
         verify_company_industry_smart,
-        search_serper,
-        search_serpapi,
     )
 
 logger = logging.getLogger("linkedin_collector")

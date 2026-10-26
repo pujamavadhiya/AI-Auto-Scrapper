@@ -16,9 +16,11 @@ import {
   Sparkles,
   ShieldCheck,
   Search,
+  LogOut,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { Badge } from '../ui/Badge';
+import { useAuth } from '../../context/AuthContext';
 
 interface SidebarProps {
   isCollapsed: boolean;
@@ -33,6 +35,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   isMobileOpen,
   setIsMobileOpen,
 }) => {
+  const { user, logout } = useAuth();
   const primaryNav = [
     {
       title: 'Dashboard',
@@ -269,20 +272,66 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         </div>
 
-        {/* Bottom Integration Status banner */}
+        {/* User Account & Logout Footer */}
         {!isCollapsed ? (
-          <div className="p-3 m-3 rounded-xl bg-slate-50 border border-slate-200/80 text-xs text-slate-600">
-            <div className="flex items-center gap-1.5 font-semibold text-slate-800 mb-1">
-              <ShieldCheck className="w-4 h-4 text-emerald-600" />
-              <span>Modular Scraping Ready</span>
+          <div className="p-3 m-3 rounded-xl bg-slate-900 text-white text-xs border border-slate-800 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 min-w-0">
+                <div className="w-7 h-7 rounded-lg bg-blue-600 text-white flex items-center justify-center font-bold text-xs shrink-0 shadow-xs">
+                  {user?.email ? user.email.charAt(0).toUpperCase() : 'U'}
+                </div>
+                <div className="min-w-0 truncate">
+                  <p className="font-semibold text-white truncate text-[11px] leading-tight">
+                    {user?.name || user?.email?.split('@')[0] || 'User'}
+                  </p>
+                  <p className="text-[10px] text-slate-400 truncate leading-tight">
+                    {user?.email || 'Authenticated'}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={async () => {
+                  if (confirm('Log out of account?')) {
+                    await logout();
+                    window.location.href = '/login';
+                  }
+                }}
+                title="Log out"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+              </button>
             </div>
-            <p className="text-[11px] text-slate-500 leading-relaxed">
-              Operating in high-fidelity mock adapter mode. Ready for custom scraping pipeline plug-in.
-            </p>
+            <div className="flex items-center justify-between text-[10px] text-slate-400 pt-1 border-t border-slate-800/80">
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                Isolated Keys
+              </span>
+              <NavLink to="/settings" className="text-blue-400 hover:underline">
+                Configure Keys
+              </NavLink>
+            </div>
           </div>
         ) : (
-          <div className="p-3 flex justify-center border-t border-slate-100">
-            <div className="w-3 h-3 rounded-full bg-emerald-500" title="System Ready" />
+          <div className="p-3 flex flex-col items-center gap-2 border-t border-slate-100">
+            <div
+              className="w-7 h-7 rounded-lg bg-blue-600 text-white flex items-center justify-center font-bold text-xs shadow-xs"
+              title={user?.email || 'Logged In'}
+            >
+              {user?.email ? user.email.charAt(0).toUpperCase() : 'U'}
+            </div>
+            <button
+              onClick={async () => {
+                if (confirm('Log out?')) {
+                  await logout();
+                  window.location.href = '/login';
+                }
+              }}
+              title="Log out"
+              className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-slate-100 transition-colors cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
           </div>
         )}
       </aside>

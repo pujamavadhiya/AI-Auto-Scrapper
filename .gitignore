@@ -26,6 +26,9 @@ __pycache__/
 serp_cache.jsonl
 *.xlsx
 !sample*.xlsx
+*.db
+*.db-wal
+*.db-shm
 
 # Editor directories and files
 .vscode/*

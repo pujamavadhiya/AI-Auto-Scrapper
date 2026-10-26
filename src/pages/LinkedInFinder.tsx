@@ -32,6 +32,7 @@ import { ParsedFileResult, excelService } from '../services/excelService';
 import { linkedinFinderService } from '../services/adapters';
 import { getSampleInitialRecords } from '../services/mockData';
 import { storageService } from '../services/storageService';
+import { historyService } from '../services/historyService';
 
 export const LinkedInFinder: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'table' | 'upload' | 'config' | 'review'>('table');
@@ -189,6 +190,19 @@ export const LinkedInFinder: React.FC = () => {
         const enrichedMap = new Map(enrichedBatch.map((item) => [item.id, item]));
         return prev.map((item) => enrichedMap.get(item.id) || item);
       });
+
+      // Auto-save to user history
+      const queryTitle =
+        parsedFile?.fileName ||
+        (targets[0]?.companyName
+          ? `${targets[0].companyName}${targets.length > 1 ? ` & ${targets.length - 1} others` : ''}`
+          : 'LinkedIn URL Discovery');
+
+      historyService.saveSearchHistory({
+        moduleType: 'linkedin-finder',
+        searchQuery: queryTitle,
+        records: enrichedBatch,
+      });
     } catch (err: any) {
       if (err.name === 'AbortError') {
         setProgress((prev) => ({
@@ -255,6 +269,13 @@ export const LinkedInFinder: React.FC = () => {
         }));
         setRecords(mappedRecords);
         setActiveTab('table');
+
+        // Auto-save file enrichment to user history
+        historyService.saveSearchHistory({
+          moduleType: 'linkedin-finder',
+          searchQuery: rawUploadedFile.name,
+          records: mappedRecords,
+        });
       }
 
       setProgress({

@@ -28,10 +28,11 @@ from dotenv import load_dotenv
 load_dotenv(ROOT_DIR / ".env", override=True)
 load_dotenv(BASE_DIR / ".env", override=True)
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+import database
 
 import pandas as pd
 from linkedin_finder import (
@@ -114,9 +115,227 @@ class UpdateLeadOceanConfigPayload(BaseModel):
     authName: Optional[str] = None
 
 
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
+
+class UserKeyUpdatePayload(BaseModel):
+    serpapiKey: Optional[str] = None
+    serperKey: Optional[str] = None
+    geminiApiKey: Optional[str] = None
+    leadoceanApiKey: Optional[str] = None
+    leadoceanEndpoint: Optional[str] = None
+    apifyToken: Optional[str] = None
+    openaiApiKey: Optional[str] = None
+    defaultEngine: Optional[str] = None
+
+
+def get_current_user_optional(authorization: Optional[str] = Header(None)) -> Optional[Dict[str, Any]]:
+    """Resolves authenticated user from Bearer token if present."""
+    if not authorization:
+        return None
+    token = authorization.replace("Bearer ", "").strip()
+    return database.get_user_by_token(token)
+
+
+def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """Requires valid Bearer token. Raises HTTP 401 otherwise."""
+    user = get_current_user_optional(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required. Please log in.")
+    return user
+
+
+def get_effective_user_key(user: Optional[Dict[str, Any]], key_name: str, fallback_env: str = "") -> str:
+    """
+    Returns the user's isolated configured API key from database.
+    If the user has not configured the key, returns empty string.
+    Only falls back to env if no user is specified (backwards compatibility).
+    """
+    if user:
+        user_keys = database.get_user_keys(user["id"])
+        val = user_keys.get(key_name, "")
+        if val and str(val).strip():
+            return str(val).strip()
+        return ""
+    if fallback_env:
+        return os.environ.get(fallback_env, "").strip()
+    return ""
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: LoginPayload):
+    """Logs in user with email and password, returning session token & user keys."""
+    user = database.authenticate_user(payload.email, payload.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    token = database.create_session(user["id"], days_valid=30)
+    keys = database.get_user_keys(user["id"])
+
+    return {
+        "status": "ok",
+        "token": token,
+        "user": user,
+        "keys": keys,
+    }
+
+
+@app.get("/api/auth/me")
+def auth_me(authorization: Optional[str] = Header(None)):
+    """Validates session and returns current authenticated user and their configured keys."""
+    user = get_current_user(authorization)
+    keys = database.get_user_keys(user["id"])
+    return {
+        "status": "ok",
+        "user": user,
+        "keys": keys,
+    }
+
+
+@app.post("/api/auth/logout")
+def auth_logout(authorization: Optional[str] = Header(None)):
+    """Logs out user by invalidating their active session token."""
+    if authorization:
+        database.delete_session(authorization)
+    return {"status": "ok", "message": "Logged out successfully."}
+
+
+@app.get("/api/user/keys")
+def get_user_keys_endpoint(authorization: Optional[str] = Header(None)):
+    """Returns the isolated API keys configured specifically for the logged-in user."""
+    user = get_current_user(authorization)
+    keys = database.get_user_keys(user["id"])
+    return {"status": "ok", "keys": keys}
+
+
+@app.post("/api/user/keys")
+def update_user_keys_endpoint(payload: UserKeyUpdatePayload, authorization: Optional[str] = Header(None)):
+    """Updates API keys for the logged-in user in their private database record."""
+    user = get_current_user(authorization)
+    updated = database.update_user_keys(user["id"], payload.model_dump(exclude_unset=True))
+    return {
+        "status": "ok",
+        "message": f"API keys updated successfully for {user['email']}.",
+        "keys": updated,
+    }
+
+
+class SaveHistoryPayload(BaseModel):
+    moduleType: str
+    searchQuery: str
+    records: List[Dict[str, Any]]
+    filters: Optional[Dict[str, Any]] = None
+    status: Optional[str] = "completed"
+    enrichedCount: Optional[int] = None
+
+
+@app.get("/api/history")
+def get_history_list(authorization: Optional[str] = Header(None)):
+    """Returns summary list of all search and extraction history for authenticated user."""
+    user = get_current_user(authorization)
+    items = database.get_user_search_history(user["id"])
+    return {"status": "ok", "history": items}
+
+
+@app.get("/api/history/{history_id}")
+def get_history_details(history_id: str, authorization: Optional[str] = Header(None)):
+    """Returns full extracted results and records for a specific search history item."""
+    user = get_current_user(authorization)
+    item = database.get_search_history_by_id(user["id"], history_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Search history record not found.")
+    return {"status": "ok", "history": item}
+
+
+@app.post("/api/history")
+def save_history_item(payload: SaveHistoryPayload, authorization: Optional[str] = Header(None)):
+    """Saves search and extracted records into user's private history archive."""
+    user = get_current_user(authorization)
+    saved = database.save_search_history(
+        user_id=user["id"],
+        module_type=payload.moduleType,
+        search_query=payload.searchQuery,
+        records=payload.records,
+        filters=payload.filters,
+        status=payload.status or "completed",
+        enriched_count=payload.enrichedCount,
+    )
+    return {"status": "ok", "message": "Search and extracted records saved to history.", "history": saved}
+
+
+@app.delete("/api/history/{history_id}")
+def delete_history_item(history_id: str, authorization: Optional[str] = Header(None)):
+    """Deletes a search history record for the user."""
+    user = get_current_user(authorization)
+    deleted = database.delete_search_history(user["id"], history_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Search history item not found.")
+    return {"status": "ok", "message": "History item deleted successfully."}
+
+
+@app.delete("/api/history")
+def clear_all_history(authorization: Optional[str] = Header(None)):
+    """Clears all extraction history for the authenticated user only."""
+    user = get_current_user(authorization)
+    count = database.clear_user_search_history(user["id"])
+    return {"status": "ok", "message": f"Cleared {count} history items for {user['email']}."}
+
+
+@app.get("/api/history/{history_id}/export")
+def export_history_file(
+    history_id: str,
+    format: str = "xlsx",
+    token: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Exports and downloads the extracted records from user history as formatted XLSX or CSV."""
+    auth_header = authorization or (f"Bearer {token}" if token else None)
+    user = get_current_user(auth_header)
+    item = database.get_search_history_by_id(user["id"], history_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Search history record not found.")
+    records = item.get("records", [])
+    if not records:
+        raise HTTPException(status_code=400, detail="No records to export.")
+
+    flat_rows = []
+    for r in records:
+        flat = dict(r)
+        custom = flat.pop("customFields", None)
+        if isinstance(custom, dict):
+            for k, v in custom.items():
+                if k not in flat:
+                    flat[k] = v
+        flat_rows.append(flat)
+
+    df = pd.DataFrame(flat_rows)
+    temp_dir = tempfile.mkdtemp()
+    clean_title = re.sub(r'[^a-zA-Z0-9_-]', '_', item.get("searchQuery", "leads"))[:40]
+
+    if format.lower() == "csv":
+        out_filename = f"{clean_title}_{history_id[:8]}.csv"
+        out_path = Path(temp_dir) / out_filename
+        df.to_csv(out_path, index=False)
+        return FileResponse(out_path, media_type="text/csv", filename=out_filename)
+    else:
+        out_filename = f"{clean_title}_{history_id[:8]}.xlsx"
+        out_path = Path(temp_dir) / out_filename
+        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Extracted Leads")
+        return FileResponse(
+            out_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=out_filename
+        )
+
+
 @app.get("/api/health")
-def health():
-    api_key = os.environ.get("SERPAPI_KEY", "").strip()
+def health(authorization: Optional[str] = Header(None)):
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+    api_key = user_keys.get("serpapi_key", "").strip() or os.environ.get("SERPAPI_KEY", "").strip()
     is_set = bool(api_key and not api_key.startswith("your_"))
     masked = (api_key[:4] + "..." + api_key[-4:]) if is_set and len(api_key) > 8 else ("configured" if is_set else "missing")
     return {
@@ -124,6 +343,7 @@ def health():
         "hasSerpApiKey": is_set,
         "keyPreview": masked,
         "engine": "SerpAPI Decision Maker LinkedIn URL Finder",
+        "user": user["email"] if user else None,
     }
 
 
@@ -150,15 +370,17 @@ def run_unit_tests():
 
 
 @app.post("/api/enrich/linkedin-rows")
-def enrich_linkedin_rows(payload: EnrichRowsPayload):
+def enrich_linkedin_rows(payload: EnrichRowsPayload, authorization: Optional[str] = Header(None)):
     records = payload.records
     user_config = payload.config or {}
 
-    api_key = os.environ.get("SERPAPI_KEY", "").strip()
+    user = get_current_user_optional(authorization)
+    api_key = get_effective_user_key(user, "serpapi_key", fallback_env="SERPAPI_KEY")
     if not api_key or api_key.startswith("your_"):
+        user_msg = f" for account {user['email']}" if user else " in .env file"
         raise HTTPException(
             status_code=400,
-            detail="SERPAPI_KEY is missing or invalid in .env file. Please add your key to .env to execute live scraping."
+            detail=f"SERPAPI_KEY is missing or unconfigured{user_msg}. Please configure your SerpAPI key in Platform Settings."
         )
 
     cfg = Config(
@@ -250,12 +472,15 @@ async def enrich_linkedin_file(
     min_confidence: str = Form("medium"),
     max_searches: int = Form(3),
     allow_location_conflict: bool = Form(False),
+    authorization: Optional[str] = Header(None),
 ):
-    api_key = os.environ.get("SERPAPI_KEY", "").strip()
+    user = get_current_user_optional(authorization)
+    api_key = get_effective_user_key(user, "serpapi_key", fallback_env="SERPAPI_KEY")
     if not api_key or api_key.startswith("your_"):
+        user_msg = f" for account {user['email']}" if user else " in .env"
         raise HTTPException(
             status_code=400,
-            detail="SERPAPI_KEY is not set in .env. Please configure your key in .env to run live SerpAPI extraction."
+            detail=f"SERPAPI_KEY is not configured{user_msg}. Please configure your key in Platform Settings to run live SerpAPI extraction."
         )
 
     temp_dir = tempfile.mkdtemp()
@@ -456,16 +681,19 @@ def _run_collector_thread(
 
 
 @app.post("/api/collector/start")
-def start_keyword_collector(payload: StartCollectorPayload):
+def start_keyword_collector(payload: StartCollectorPayload, authorization: Optional[str] = Header(None)):
     clean_kws = [k.strip() for k in payload.keywords if k.strip()]
     if not clean_kws:
         raise HTTPException(status_code=400, detail="At least one keyword is required.")
+
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
 
     target = max(1, min(int(payload.targetCount or 50), 2000))
     titles = payload.titles if payload.titles else ["CEO", "Founder", "COO", "Owner", "Director", "VP"]
 
     verify_gemini = bool(payload.verifyWithGemini) if payload.verifyWithGemini is not None else True
-    gemini_key = (payload.geminiApiKey or os.environ.get("GEMINI_API_KEY", "")).strip()
+    gemini_key = (payload.geminiApiKey or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")).strip()
     cfg = CollectorConfig(
         keywords=clean_kws,
         country=payload.country or "",
@@ -618,7 +846,7 @@ def export_current_collector_data(task_id: str):
 
 
 @app.post("/api/collector/verify-gemini/{task_id}")
-def verify_collector_gemini(task_id: str, payload: Optional[VerifyGeminiPayload] = None):
+def verify_collector_gemini(task_id: str, payload: Optional[VerifyGeminiPayload] = None, authorization: Optional[str] = Header(None)):
     """
     On-demand Gemini AI verification for an existing collector task.
     Audits Name, Title, Company, and Location so each column contains only clean, accurate data.
@@ -632,9 +860,11 @@ def verify_collector_gemini(task_id: str, payload: Optional[VerifyGeminiPayload]
     if not records:
         raise HTTPException(status_code=400, detail="No records collected yet.")
 
-    api_key = (payload.geminiApiKey if payload else None) or os.environ.get("GEMINI_API_KEY", "")
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+    api_key = (payload.geminiApiKey if payload else None) or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")
     if not api_key:
-        raise HTTPException(status_code=400, detail="GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in Settings or .env.")
+        raise HTTPException(status_code=400, detail="GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in Platform Settings.")
 
     cleaned = audit_leads_with_gemini(records, api_key=api_key)
     task["records"] = cleaned
@@ -678,20 +908,23 @@ def verify_collector_gemini(task_id: str, payload: Optional[VerifyGeminiPayload]
 
 
 @app.post("/api/collector/verify-records")
-def verify_records_gemini(payload: VerifyRecordsPayload):
+def verify_records_gemini(payload: VerifyRecordsPayload, authorization: Optional[str] = Header(None)):
     """Audits arbitrary lead records with Gemini AI and returns sanitized records."""
     records = payload.records
     if not records:
         return {"status": "ok", "records": []}
-    api_key = payload.geminiApiKey or os.environ.get("GEMINI_API_KEY", "")
+
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+    api_key = payload.geminiApiKey or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")
     if not api_key:
-        raise HTTPException(status_code=400, detail="GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in Settings or .env.")
+        raise HTTPException(status_code=400, detail="GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in Platform Settings.")
     cleaned = audit_leads_with_gemini(records, api_key=api_key)
     return {"status": "ok", "records": cleaned}
 
 
 @app.post("/api/collector/parse-idea")
-def parse_scraping_idea(payload: ParseIdeaPayload):
+def parse_scraping_idea(payload: ParseIdeaPayload, authorization: Optional[str] = Header(None)):
     """
     Parses a user's natural language scraping idea into structured
     keywords, city, state, country, titles, and target count using Gemini AI.
@@ -700,7 +933,9 @@ def parse_scraping_idea(payload: ParseIdeaPayload):
     if not idea:
         raise HTTPException(status_code=400, detail="Please provide a description of the data you want to scrape.")
 
-    key = (payload.geminiApiKey or os.environ.get("GEMINI_API_KEY", "")).strip()
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+    key = (payload.geminiApiKey or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")).strip()
     try:
         from gemini_query_expander import parse_scraping_idea_with_gemini
     except ImportError:
@@ -929,14 +1164,16 @@ def export_social_media_data(task_id: str):
 # =====================================================================
 
 @app.get("/api/decision-makers/config")
-def get_decision_makers_config():
+def get_decision_makers_config(authorization: Optional[str] = Header(None)):
     """Returns SerpApi and Serper.dev configuration status for Decision Maker Finder."""
-    load_dotenv(ROOT_DIR / ".env", override=True)
-    serp_key = os.environ.get("SERPAPI_KEY", "").strip()
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+
+    serp_key = (user_keys.get("serpapi_key", "") or (os.environ.get("SERPAPI_KEY", "") if not user else "")).strip()
     serp_set = bool(serp_key and not serp_key.startswith("your_"))
     serp_masked = (serp_key[:4] + "..." + serp_key[-4:]) if serp_set and len(serp_key) > 8 else ("configured" if serp_set else "missing")
 
-    serper_key = os.environ.get("SERPER_API_KEY", "").strip()
+    serper_key = (user_keys.get("serper_key", "") or (os.environ.get("SERPER_API_KEY", "") if not user else "")).strip()
     serper_set = bool(serper_key and not serper_key.startswith("your_"))
     serper_masked = (serper_key[:4] + "..." + serper_key[-4:]) if serper_set and len(serper_key) > 8 else ("configured" if serper_set else "missing")
 
@@ -947,15 +1184,28 @@ def get_decision_makers_config():
         "keyPreview": serp_masked,  # backwards compatibility
         "hasSerperApiKey": serper_set,
         "serperApiKeyPreview": serper_masked,
-        "defaultEngine": "serpapi",
+        "defaultEngine": user_keys.get("default_engine", "serpapi") if user else "serpapi",
         "supportedEngines": ["serpapi", "serper"],
         "engine": "Dual-Engine (SerpApi / Serper.dev)",
+        "user": user["email"] if user else None,
     }
 
 
 @app.post("/api/decision-makers/config")
-def update_decision_makers_config(payload: UpdateDecisionMakerConfigPayload):
-    """Updates SERPAPI_KEY or SERPER_API_KEY in .env."""
+def update_decision_makers_config(payload: UpdateDecisionMakerConfigPayload, authorization: Optional[str] = Header(None)):
+    """Updates SERPAPI_KEY or SERPER_API_KEY for the authenticated user, or in .env if unauthenticated."""
+    user = get_current_user_optional(authorization)
+    if user:
+        keys_to_update = {}
+        if payload.serpapiKey is not None:
+            keys_to_update["serpapi_key"] = payload.serpapiKey.strip()
+        if payload.serperKey is not None:
+            keys_to_update["serper_key"] = payload.serperKey.strip()
+        if payload.defaultEngine is not None:
+            keys_to_update["default_engine"] = payload.defaultEngine.strip()
+        database.update_user_keys(user["id"], keys_to_update)
+        return {"status": "ok", "message": f"Decision Maker Finder keys saved for account {user['email']}."}
+
     env_file = ROOT_DIR / ".env"
     lines = []
     if env_file.exists():
@@ -990,7 +1240,7 @@ def update_decision_makers_config(payload: UpdateDecisionMakerConfigPayload):
 
 
 @app.post("/api/enrich/decision-makers")
-def enrich_decision_makers(payload: DecisionMakerPayload):
+def enrich_decision_makers(payload: DecisionMakerPayload, authorization: Optional[str] = Header(None)):
     """
     Enriches candidate records with verified Decision Maker Name, Position, and LinkedIn.
     Supports selecting between SerpApi and Serper.dev engines.
@@ -1004,10 +1254,19 @@ def enrich_decision_makers(payload: DecisionMakerPayload):
     if not records:
         return {"status": "ok", "results": []}
 
-    load_dotenv(ROOT_DIR / ".env", override=True)
-    engine = (payload.engine or "serpapi").lower().strip()
-    serpapi_key = (payload.serpapiKey or os.environ.get("SERPAPI_KEY", "")).strip()
-    serper_key = (payload.serperKey or payload.serperApiKey or os.environ.get("SERPER_API_KEY", "")).strip()
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+
+    engine = (payload.engine or user_keys.get("default_engine") or "serpapi").lower().strip()
+    serpapi_key = (payload.serpapiKey or user_keys.get("serpapi_key", "") or (os.environ.get("SERPAPI_KEY", "") if not user else "")).strip()
+    serper_key = (payload.serperKey or payload.serperApiKey or user_keys.get("serper_key", "") or (os.environ.get("SERPER_API_KEY", "") if not user else "")).strip()
+
+    if engine == "serpapi" and not serpapi_key:
+        user_msg = f" for account '{user['email']}'" if user else ""
+        raise HTTPException(status_code=400, detail=f"SerpAPI key is missing or unconfigured{user_msg}. Please configure your SerpAPI key in Platform Settings.")
+    if engine == "serper" and not serper_key:
+        user_msg = f" for account '{user['email']}'" if user else ""
+        raise HTTPException(status_code=400, detail=f"Serper.dev key is missing or unconfigured{user_msg}. Please configure your Serper key in Platform Settings.")
 
     max_queries = payload.maxQueries or 2
     delay = payload.delay if payload.delay is not None else (0.6 if engine == "serper" else 0.5)
@@ -1100,28 +1359,42 @@ def enrich_decision_makers(payload: DecisionMakerPayload):
 # =====================================================================
 
 @app.get("/api/leadocean/config")
-def get_leadocean_config():
-    """Returns current LeadOcean API and endpoint configuration."""
-    load_dotenv(ROOT_DIR / ".env", override=True)
+def get_leadocean_config(authorization: Optional[str] = Header(None)):
+    """Returns current LeadOcean API and endpoint configuration for authenticated user."""
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+
     cfg = load_leadocean_config()
-    api_key = os.environ.get(cfg.get("api_key_env", "LEADOCEAN_API_KEY"), "") or os.environ.get("LEADOCEAN_API_KEY", "")
-    api_key = api_key.strip()
+    api_key = (user_keys.get("leadocean_api_key", "") or (os.environ.get("LEADOCEAN_API_KEY", "") if not user else "")).strip()
     is_set = bool(api_key and not api_key.startswith("your_"))
     masked = (api_key[:4] + "..." + api_key[-4:]) if is_set and len(api_key) > 8 else ("configured" if is_set else "missing")
+    url = user_keys.get("leadocean_endpoint") or cfg.get("url", "https://api.leadocean.io/v1/people/enrich")
+
     return {
         "status": "ok",
         "hasApiKey": is_set,
         "keyPreview": masked,
-        "url": cfg.get("url", "https://api.leadocean.io/v1/people/enrich"),
+        "url": url,
         "method": cfg.get("method", "POST"),
         "authName": cfg.get("auth_name", "x-api-key"),
         "engine": "LeadOcean Email & Phone Enricher",
+        "user": user["email"] if user else None,
     }
 
 
 @app.post("/api/leadocean/config")
-def update_leadocean_config(payload: UpdateLeadOceanConfigPayload):
-    """Updates LeadOcean config in leadocean_config.json and .env."""
+def update_leadocean_config(payload: UpdateLeadOceanConfigPayload, authorization: Optional[str] = Header(None)):
+    """Updates LeadOcean config in user profile, or leadocean_config.json/.env as fallback."""
+    user = get_current_user_optional(authorization)
+    if user:
+        keys_to_update = {}
+        if payload.apiKey is not None:
+            keys_to_update["leadocean_api_key"] = payload.apiKey.strip()
+        if payload.url is not None:
+            keys_to_update["leadocean_endpoint"] = payload.url.strip()
+        database.update_user_keys(user["id"], keys_to_update)
+        return {"status": "ok", "message": f"LeadOcean settings saved for {user['email']}."}
+
     cfg = load_leadocean_config()
     if payload.url:
         cfg["url"] = payload.url.strip()
@@ -1155,7 +1428,7 @@ def update_leadocean_config(payload: UpdateLeadOceanConfigPayload):
 
 
 @app.post("/api/enrich/contacts")
-def enrich_contacts(payload: ContactEnrichPayload):
+def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] = Header(None)):
     """
     Enriches candidate records with verified Email, Phone, and Enrich Status
     using LeadOcean API.
@@ -1164,9 +1437,11 @@ def enrich_contacts(payload: ContactEnrichPayload):
     if not records:
         return {"status": "ok", "results": []}
 
-    load_dotenv(ROOT_DIR / ".env", override=True)
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+
     cfg = load_leadocean_config()
-    api_key = (payload.apiKey or os.environ.get("LEADOCEAN_API_KEY", "") or os.environ.get(cfg.get("api_key_env", ""), "")).strip()
+    api_key = (payload.apiKey or user_keys.get("leadocean_api_key", "") or (os.environ.get("LEADOCEAN_API_KEY", "") if not user else "")).strip()
     delay = payload.delay or 0.3
     overwrite = bool(payload.overwrite)
 

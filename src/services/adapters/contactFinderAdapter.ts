@@ -1,6 +1,6 @@
 import { IResearchAdapter, ModuleMetadata } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
-import { getApiBaseUrl } from '../../config/api';
+import { getApiBaseUrl, getAuthHeaders } from '../../config/api';
 
 export class ContactFinderAdapter implements IResearchAdapter {
   readonly metadata: ModuleMetadata = {
@@ -28,7 +28,7 @@ export class ContactFinderAdapter implements IResearchAdapter {
     try {
       const res = await fetch(`${apiBase}/api/enrich/contacts`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           records: [payloadRecord],
           delay: 0,
@@ -157,9 +157,9 @@ export class ContactFinderAdapter implements IResearchAdapter {
 
         const response = await fetch(`${apiBase}/api/enrich/contacts`, {
           method: 'POST',
-          headers: {
+          headers: getAuthHeaders({
             'Content-Type': 'application/json',
-          },
+          }),
           body: JSON.stringify({
             records: payloadRecords,
             delay: 0.3,

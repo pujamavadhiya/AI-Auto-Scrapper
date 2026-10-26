@@ -32,7 +32,8 @@ import { Badge } from '../components/ui/Badge';
 import { Input } from '../components/ui/Input';
 import { Select } from '../components/ui/Select';
 import { cn } from '../lib/utils';
-import { getApiBaseUrl } from '../config/api';
+import { getApiBaseUrl, getAuthHeaders } from '../config/api';
+import { historyService } from '../services/historyService';
 
 export interface ScrapedProfile {
   'Company name': string;
@@ -147,7 +148,9 @@ export const KeywordLeadCollector: React.FC = () => {
         return;
       }
       try {
-        const res = await fetch(`${apiBase}/api/health`);
+        const res = await fetch(`${apiBase}/api/health`, {
+          headers: getAuthHeaders(),
+        });
         if (mounted) setBackendOnline(res.ok);
       } catch {
         if (mounted) setBackendOnline(false);
@@ -207,7 +210,7 @@ export const KeywordLeadCollector: React.FC = () => {
     try {
       const res = await fetch(`${apiBase}/api/collector/parse-idea`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ idea: text }),
       });
 
@@ -297,7 +300,7 @@ export const KeywordLeadCollector: React.FC = () => {
     try {
       const res = await fetch(`${apiBase}/api/collector/start`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           keywords: activeKeywords,
           country: activeCountry,
@@ -342,13 +345,13 @@ export const KeywordLeadCollector: React.FC = () => {
       if (taskId) {
         res = await fetch(`${apiBase}/api/collector/verify-gemini/${taskId}`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({}),
         });
       } else {
         res = await fetch(`${apiBase}/api/collector/verify-records`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ records }),
         });
       }
@@ -414,6 +417,15 @@ export const KeywordLeadCollector: React.FC = () => {
               'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
             }));
             setRecords(cleaned);
+
+            // Auto-save to user's history
+            const searchTitle = (keywords.length > 0 ? keywords.join(', ') : 'Keyword Scraper') + (city ? ` in ${city}` : (country ? ` (${country})` : ''));
+            historyService.saveSearchHistory({
+              moduleType: 'keyword-collector',
+              searchQuery: searchTitle,
+              records: cleaned,
+              filters: { targetCount, titles, companySize, country, state, city },
+            });
           }
           clearInterval(pollIntervalRef.current);
         } else if (data.status === 'error') {

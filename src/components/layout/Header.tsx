@@ -1,5 +1,5 @@
 import React from 'react';
-import { useLocation, Link } from 'react-router-dom';
+import { useLocation, Link, useNavigate } from 'react-router-dom';
 import {
   Menu,
   Sparkles,
@@ -7,10 +7,13 @@ import {
   HelpCircle,
   FileSpreadsheet,
   CheckCircle2,
+  LogOut,
+  User as UserIcon,
 } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
 import { excelService } from '../../services/excelService';
+import { useAuth } from '../../context/AuthContext';
 
 interface HeaderProps {
   onToggleMobileMenu: () => void;
@@ -22,6 +25,8 @@ export const Header: React.FC<HeaderProps> = ({
   isSidebarCollapsed,
 }) => {
   const location = useLocation();
+  const navigate = useNavigate();
+  const { user, logout } = useAuth();
 
   const getPageTitle = (pathname: string): { title: string; subtitle: string } => {
     switch (pathname) {
@@ -56,6 +61,13 @@ export const Header: React.FC<HeaderProps> = ({
     excelService.downloadSampleTemplate('xlsx');
   };
 
+  const handleLogout = async () => {
+    if (confirm('Are you sure you want to log out?')) {
+      await logout();
+      navigate('/login');
+    }
+  };
+
   return (
     <header className="sticky top-0 z-30 flex items-center justify-between h-16 px-4 md:px-8 bg-white/90 backdrop-blur-md border-b border-slate-200/80 transition-all">
       {/* Left: Mobile hamburger & breadcrumb */}
@@ -74,30 +86,36 @@ export const Header: React.FC<HeaderProps> = ({
               {title}
             </h1>
             <Badge variant="secondary" size="sm" className="hidden sm:inline-flex text-[10px] font-medium text-slate-500">
-              Mock Service Active
+              Active Session
             </Badge>
           </div>
           <p className="hidden md:block text-xs text-slate-500 truncate">{subtitle}</p>
         </div>
       </div>
 
-      {/* Right: Quick actions & status */}
+      {/* Right: Quick actions, user profile & logout */}
       <div className="flex items-center gap-2 md:gap-3">
         <Button
           variant="outline"
           size="sm"
           onClick={handleDownloadSample}
-          className="hidden sm:inline-flex text-xs h-8 font-medium text-slate-700 hover:text-blue-600"
+          className="hidden lg:inline-flex text-xs h-8 font-medium text-slate-700 hover:text-blue-600"
           title="Download ready-to-test sample spreadsheet (.xlsx)"
         >
           <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 mr-1.5" />
           Sample Template
         </Button>
 
-        <div className="hidden xl:flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 border border-emerald-200/60 text-xs text-emerald-700 font-medium">
-          <CheckCircle2 className="w-3.5 h-3.5" />
-          <span>Browser SheetJS Ready</span>
-        </div>
+        {user && (
+          <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-100 border border-slate-200/70 text-xs">
+            <div className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-[10px]">
+              {user.email.charAt(0).toUpperCase()}
+            </div>
+            <span className="font-semibold text-slate-800 truncate max-w-[140px] md:max-w-[180px]">
+              {user.email}
+            </span>
+          </div>
+        )}
 
         <div className="flex items-center gap-2 pl-2 border-l border-slate-200">
           <Link
@@ -107,6 +125,14 @@ export const Header: React.FC<HeaderProps> = ({
             <Sparkles className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">Ask AI</span>
           </Link>
+
+          <button
+            onClick={handleLogout}
+            title="Log out of application"
+            className="p-1.5 rounded-lg text-slate-500 hover:text-rose-600 hover:bg-rose-50 border border-transparent hover:border-rose-200 transition-all cursor-pointer"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
         </div>
       </div>
     </header>

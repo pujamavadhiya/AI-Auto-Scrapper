@@ -1,10 +1,42 @@
 /**
- * Centralized API Base URL configuration
+ * Centralized API Base URL and Authentication Header configuration
  * Supports:
  *  1. User custom endpoint configured in Settings (localStorage)
  *  2. Environment variable VITE_API_URL set during Vercel / Netlify build
  *  3. Default fallback to http://127.0.0.1:8000 for local development
+ *  4. Isolated user JWT / Bearer token injection
  */
+
+const TOKEN_KEY = 'leadpulse_auth_token';
+
+export const getAuthToken = (): string | null => {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+};
+
+export const setAuthToken = (token: string | null): void => {
+  try {
+    if (token) {
+      localStorage.setItem(TOKEN_KEY, token);
+    } else {
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  } catch {
+    // ignore
+  }
+};
+
+export const getAuthHeaders = (customHeaders: Record<string, string> = {}): Record<string, string> => {
+  const headers: Record<string, string> = { ...customHeaders };
+  const token = getAuthToken();
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  return headers;
+};
 
 export const getApiBaseUrl = (): string => {
   try {
@@ -37,4 +69,26 @@ export const getApiBaseUrl = (): string => {
 
   // If deployed to Vercel/production and no backend URL provided yet, return empty
   return '';
+};
+
+export const authenticatedFetch = async (
+  endpointOrFullUrl: string,
+  init?: RequestInit
+): Promise<Response> => {
+  const apiBase = getApiBaseUrl();
+  const url = endpointOrFullUrl.startsWith('http://') || endpointOrFullUrl.startsWith('https://')
+    ? endpointOrFullUrl
+    : `${apiBase}${endpointOrFullUrl.startsWith('/') ? '' : '/'}${endpointOrFullUrl}`;
+
+  const token = getAuthToken();
+  const headers = new Headers(init?.headers || {});
+
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  return fetch(url, {
+    ...init,
+    headers,
+  });
 };

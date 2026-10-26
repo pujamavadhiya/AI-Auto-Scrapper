@@ -33,8 +33,9 @@ import { EnrichmentRecord, ResearchConfig, ResearchProgress, ColumnMapping } fro
 import { ParsedFileResult } from '../services/excelService';
 import { contactFinderService } from '../services/adapters';
 import { getSampleInitialRecords } from '../services/mockData';
+import { getApiBaseUrl, getAuthHeaders } from '../config/api';
+import { historyService } from '../services/historyService';
 import { storageService } from '../services/storageService';
-import { getApiBaseUrl } from '../config/api';
 
 export const ContactFinder: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'table' | 'quick' | 'bulk' | 'upload' | 'config'>('table');
@@ -124,7 +125,9 @@ export const ContactFinder: React.FC = () => {
     const apiBase = getApiBaseUrl();
     if (!apiBase) return;
     try {
-      const res = await fetch(`${apiBase}/api/leadocean/config`);
+      const res = await fetch(`${apiBase}/api/leadocean/config`, {
+        headers: getAuthHeaders(),
+      });
       if (res.ok) {
         const data = await res.json();
         setServerConfig({
@@ -155,7 +158,7 @@ export const ContactFinder: React.FC = () => {
     try {
       const res = await fetch(`${apiBase}/api/leadocean/config`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           apiKey: configForm.apiKey.trim() || undefined,
           url: configForm.url.trim() || undefined,
@@ -418,6 +421,19 @@ export const ContactFinder: React.FC = () => {
       setRecords((prev) => {
         const enrichedMap = new Map(enrichedBatch.map((item) => [item.id, item]));
         return prev.map((item) => enrichedMap.get(item.id) || item);
+      });
+
+      // Auto-save into user's private history archive
+      const queryTitle =
+        parsedFile?.fileName ||
+        (targets[0]?.companyName
+          ? `${targets[0].companyName}${targets.length > 1 ? ` & ${targets.length - 1} others` : ''}`
+          : 'Contact Enrichment');
+
+      historyService.saveSearchHistory({
+        moduleType: 'contact-finder',
+        searchQuery: queryTitle,
+        records: enrichedBatch,
       });
     } catch (err: any) {
       if (err.name === 'AbortError') {

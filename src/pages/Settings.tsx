@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Settings as SettingsIcon,
   Sliders,
@@ -26,10 +26,27 @@ import { Badge } from '../components/ui/Badge';
 import { storageService } from '../services/storageService';
 import { AppSettings } from '../types';
 import { getApiBaseUrl } from '../config/api';
+import { useAuth } from '../context/AuthContext';
 
 export const Settings: React.FC = () => {
+  const { user, keys: authKeys, updateKeys } = useAuth();
   const [settings, setSettings] = useState<AppSettings>(() => storageService.getSettings());
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
+
+  // Synchronize initial settings if auth keys arrived
+  useEffect(() => {
+    if (authKeys && Object.keys(authKeys).length > 0) {
+      setSettings((prev) => ({
+        ...prev,
+        serpApiKey: authKeys.serpapi_key || prev.serpApiKey,
+        serperApiKey: authKeys.serper_key || prev.serperApiKey,
+        geminiApiKey: authKeys.gemini_api_key || prev.geminiApiKey,
+        leadoceanApiKey: authKeys.leadocean_api_key || prev.leadoceanApiKey,
+        leadoceanEndpoint: authKeys.leadocean_endpoint || prev.leadoceanEndpoint,
+        defaultDecisionMakerEngine: authKeys.default_engine || prev.defaultDecisionMakerEngine,
+      }));
+    }
+  }, [authKeys]);
 
   // Backend connection state
   const [backendEndpoint, setBackendEndpoint] = useState<string>(
@@ -43,10 +60,24 @@ export const Settings: React.FC = () => {
     message: '',
   });
 
-  const handleUpdate = (updated: Partial<AppSettings>) => {
+  const handleUpdate = async (updated: Partial<AppSettings>) => {
     const next = storageService.saveSettings(updated);
     setSettings(next);
-    setSaveNotice('Settings updated successfully!');
+
+    // Sync to backend per-user private keys
+    const backendKeys: Record<string, string> = {};
+    if (updated.serpApiKey !== undefined) backendKeys.serpapiKey = updated.serpApiKey;
+    if (updated.serperApiKey !== undefined) backendKeys.serperKey = updated.serperApiKey;
+    if (updated.geminiApiKey !== undefined) backendKeys.geminiApiKey = updated.geminiApiKey;
+    if (updated.leadoceanApiKey !== undefined) backendKeys.leadoceanApiKey = updated.leadoceanApiKey;
+    if (updated.leadoceanEndpoint !== undefined) backendKeys.leadoceanEndpoint = updated.leadoceanEndpoint;
+    if (updated.defaultDecisionMakerEngine !== undefined) backendKeys.defaultEngine = updated.defaultDecisionMakerEngine;
+
+    if (Object.keys(backendKeys).length > 0) {
+      await updateKeys(backendKeys);
+    }
+
+    setSaveNotice('Settings and API keys saved to your account!');
     setTimeout(() => setSaveNotice(null), 2500);
   };
 
@@ -120,6 +151,46 @@ export const Settings: React.FC = () => {
           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
           <span>{saveNotice}</span>
         </div>
+      )}
+
+      {/* Authenticated User Account Card */}
+      {user && (
+        <Card className="border-indigo-200 bg-gradient-to-r from-indigo-50/50 via-white to-blue-50/30 shadow-xs">
+          <CardHeader className="p-5 border-b border-indigo-100/60">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-600 text-white flex items-center justify-center font-bold text-sm shadow-xs">
+                  {user.email.charAt(0).toUpperCase()}
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <CardTitle className="text-base text-slate-900 font-bold">
+                      {user.name || user.email.split('@')[0]}
+                    </CardTitle>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-100 text-indigo-800">
+                      Private Key Vault Active
+                    </span>
+                  </div>
+                  <CardDescription className="text-xs text-slate-600">
+                    Logged in as <span className="font-mono font-medium text-slate-800">{user.email}</span>
+                  </CardDescription>
+                </div>
+              </div>
+              <Badge variant="outline" className="text-xs border-indigo-200 text-indigo-700 font-medium">
+                Isolated Profile
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="p-4 text-xs text-slate-600 bg-white/70 space-y-1">
+            <p className="flex items-center gap-1.5 font-medium text-slate-700">
+              <ShieldCheck className="w-4 h-4 text-emerald-600" />
+              API Key Privacy Guarantee:
+            </p>
+            <p className="text-[11px] text-slate-500 leading-relaxed pl-5">
+              All keys entered below (SerpAPI, Serper.dev, Google Gemini, and LeadOcean) are stored securely in your private user profile in the backend database. Other users cannot access or view your keys, and saving changes here will not overwrite another user's configuration.
+            </p>
+          </CardContent>
+        </Card>
       )}
 
       {/* 0. Cloud & Vercel Backend Server Configuration */}

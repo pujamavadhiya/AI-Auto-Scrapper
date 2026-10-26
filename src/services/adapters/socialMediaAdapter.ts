@@ -1,6 +1,6 @@
 import { IResearchAdapter, ModuleMetadata } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
-import { getApiBaseUrl } from '../../config/api';
+import { getApiBaseUrl, getAuthHeaders } from '../../config/api';
 
 export class SocialMediaAdapter implements IResearchAdapter {
   readonly metadata: ModuleMetadata = {
@@ -100,7 +100,7 @@ export class SocialMediaAdapter implements IResearchAdapter {
 
         const res = await fetch(`${apiBase}/api/enrich/social-media`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             records: payloadRecords,
             mode,

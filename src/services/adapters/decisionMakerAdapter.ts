@@ -1,6 +1,6 @@
 import { IResearchAdapter, ModuleMetadata } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
-import { getApiBaseUrl } from '../../config/api';
+import { getApiBaseUrl, getAuthHeaders } from '../../config/api';
 
 export class DecisionMakerAdapter implements IResearchAdapter {
   readonly metadata: ModuleMetadata = {
@@ -103,9 +103,9 @@ export class DecisionMakerAdapter implements IResearchAdapter {
 
         const response = await fetch(`${apiBase}/api/enrich/decision-makers`, {
           method: 'POST',
-          headers: {
+          headers: getAuthHeaders({
             'Content-Type': 'application/json',
-          },
+          }),
           body: JSON.stringify({
             records: payloadRecords,
             engine: engine,

@@ -11,6 +11,7 @@ import {
   Calendar,
   Layers,
   FileSpreadsheet,
+  History,
 } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
@@ -90,6 +91,12 @@ export const AllProjects: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
+          <Link to="/export-history">
+            <Button variant="secondary" size="sm" className="gap-1.5 shadow-sm text-xs font-semibold">
+              <History className="w-4 h-4 text-primary" />
+              <span>User Extraction History</span>
+            </Button>
+          </Link>
           <Link to="/decision-maker">
             <Button variant="primary" size="sm" className="gap-1.5 shadow-sm text-xs font-semibold">
               <Plus className="w-4 h-4" />

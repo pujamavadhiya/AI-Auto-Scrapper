@@ -1,6 +1,7 @@
 import { IResearchAdapter, ModuleMetadata, simulateDelay } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
 import { MOCK_COMPANIES } from '../mockData';
+import { getApiBaseUrl, getAuthHeaders } from '../../config/api';
 
 // ---------------------------------------------------------------------------
 // Precision Matching Algorithm (Client-side mirror of python linkedin_finder.py)
@@ -114,7 +115,10 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
    */
   async checkBackendHealth(): Promise<{ isOnline: boolean; hasKey: boolean; keyPreview: string }> {
     try {
-      const res = await fetch('/api/health');
+      const apiBase = getApiBaseUrl();
+      const res = await fetch(`${apiBase}/api/health`, {
+        headers: getAuthHeaders(),
+      });
       if (!res.ok) return { isOnline: false, hasKey: false, keyPreview: 'offline' };
       const data = await res.json();
       return {
@@ -132,7 +136,10 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
    */
   async runAlgorithmUnitTests(): Promise<{ success: boolean; totalTests: number; output: string }> {
     try {
-      const res = await fetch('/api/run-tests');
+      const apiBase = getApiBaseUrl();
+      const res = await fetch(`${apiBase}/api/run-tests`, {
+        headers: getAuthHeaders(),
+      });
       if (!res.ok) throw new Error(`HTTP error ${res.status}`);
       return await res.json();
     } catch (err) {
@@ -168,8 +175,10 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
       formData.append('allow_location_conflict', String(options.allowLocationConflict));
     }
 
-    const res = await fetch('/api/enrich/linkedin-file', {
+    const apiBase = getApiBaseUrl();
+    const res = await fetch(`${apiBase}/api/enrich/linkedin-file`, {
       method: 'POST',
+      headers: getAuthHeaders(),
       body: formData,
     });
 
@@ -307,9 +316,10 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
       });
 
       try {
-        const response = await fetch('/api/enrich/linkedin-rows', {
+        const apiBase = getApiBaseUrl();
+        const response = await fetch(`${apiBase}/api/enrich/linkedin-rows`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             records,
             config: {

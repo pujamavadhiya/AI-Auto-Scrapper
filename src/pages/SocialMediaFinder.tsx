@@ -24,7 +24,8 @@ import { EnrichmentRecord, ResearchConfig, ResearchProgress, ColumnMapping } fro
 import { ParsedFileResult } from '../services/excelService';
 import { socialMediaService } from '../services/adapters';
 import { storageService } from '../services/storageService';
-import { getApiBaseUrl } from '../config/api';
+import { getApiBaseUrl, getAuthHeaders } from '../config/api';
+import { historyService } from '../services/historyService';
 
 export const SocialMediaFinder: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'table' | 'upload' | 'quick-input' | 'settings'>('table');
@@ -49,7 +50,9 @@ export const SocialMediaFinder: React.FC = () => {
         return;
       }
       try {
-        const res = await fetch(`${apiBase}/api/health`);
+        const res = await fetch(`${apiBase}/api/health`, {
+          headers: getAuthHeaders(),
+        });
         if (mounted) setBackendOnline(res.ok);
       } catch {
         if (mounted) setBackendOnline(false);
@@ -213,6 +216,20 @@ export const SocialMediaFinder: React.FC = () => {
           });
         }
       );
+
+      // Auto-save to user history archive
+      const queryTitle =
+        parsedFile?.fileName ||
+        (targets[0]?.companyName
+          ? `${targets[0].companyName}${targets.length > 1 ? ` & ${targets.length - 1} others` : ''}`
+          : 'Social Media Footprint Discovery');
+
+      historyService.saveSearchHistory({
+        moduleType: 'social-finder',
+        searchQuery: queryTitle,
+        records: targets,
+        filters: { socialMode },
+      });
     } catch (err: any) {
       if (err.name === 'AbortError') {
         setProgress((prev) => ({

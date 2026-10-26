@@ -27,7 +27,8 @@ import { EnrichmentRecord, ResearchConfig, ResearchProgress, ColumnMapping } fro
 import { ParsedFileResult } from '../services/excelService';
 import { decisionMakerService } from '../services/adapters';
 import { storageService } from '../services/storageService';
-import { getApiBaseUrl } from '../config/api';
+import { getApiBaseUrl, getAuthHeaders } from '../config/api';
+import { historyService } from '../services/historyService';
 
 export const DecisionMakerFinder: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'table' | 'quick' | 'upload'>('table');
@@ -103,7 +104,9 @@ export const DecisionMakerFinder: React.FC = () => {
       const apiBase = getApiBaseUrl();
       if (!apiBase) return;
       try {
-        const res = await fetch(`${apiBase}/api/decision-makers/config`);
+        const res = await fetch(`${apiBase}/api/decision-makers/config`, {
+          headers: getAuthHeaders(),
+        });
         if (res.ok) {
           const data = await res.json();
           setServerConfig({
@@ -130,7 +133,7 @@ export const DecisionMakerFinder: React.FC = () => {
       if (apiBase) {
         await fetch(`${apiBase}/api/decision-makers/config`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify(
             selectedEngine === 'serper'
               ? { serperKey: cleanKey }
@@ -351,10 +354,25 @@ export const DecisionMakerFinder: React.FC = () => {
         (chunkResults) => {
           setRecords((prev) => {
             const chunkMap = new Map(chunkResults.map((r) => [r.id, r]));
-            return prev.map((item) => chunkMap.get(item.id) || item);
+            const nextRecords = prev.map((item) => chunkMap.get(item.id) || item);
+            return nextRecords;
           });
         }
       );
+
+      // Auto-save search and extracted results into user's private history
+      const queryName =
+        parsedFile?.fileName ||
+        (targets[0]?.companyName
+          ? `${targets[0].companyName}${targets.length > 1 ? ` & ${targets.length - 1} others` : ''}`
+          : 'Decision Maker Discovery');
+
+      historyService.saveSearchHistory({
+        moduleType: 'decision-maker',
+        searchQuery: queryName,
+        records: targets,
+        filters: { engine: selectedEngine },
+      });
     } catch (err: any) {
       if (err.name === 'AbortError') {
         setProgress((prev) => ({
