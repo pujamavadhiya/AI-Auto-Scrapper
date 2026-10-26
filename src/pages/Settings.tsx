@@ -163,6 +163,9 @@ export const Settings: React.FC = () => {
 
     if (Object.keys(backendKeys).length > 0) {
       await updateKeys(backendKeys);
+      if (isPuja) {
+        loadTeamUsers();
+      }
     }
 
     setSaveNotice('Settings and API keys saved to your account!');
@@ -944,6 +947,9 @@ export const Settings: React.FC = () => {
                             </span>
                             <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${u.has_serper_key ? 'bg-sky-50 text-sky-700 border border-sky-200' : 'bg-slate-100 text-slate-400'}`}>
                               Serper: {u.has_serper_key ? '✓' : '—'}
+                            </span>
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${u.has_leadocean_key ? 'bg-teal-50 text-teal-700 border border-teal-200' : 'bg-slate-100 text-slate-400'}`}>
+                              LeadOcean: {u.has_leadocean_key ? '✓' : '—'}
                             </span>
                           </div>
                         </td>
