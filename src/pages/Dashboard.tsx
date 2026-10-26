@@ -220,9 +220,15 @@ export const Dashboard: React.FC = () => {
                 Start Keyword Search
               </Button>
             </Link>
+            <Link to="/decision-maker">
+              <Button className="bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs h-9 border border-blue-400/40 shadow-xs">
+                <UserCheck className="w-4 h-4 mr-2 text-blue-200" />
+                Find Decision Makers
+              </Button>
+            </Link>
             <Link to="/ai-assistant">
-              <Button variant="outline" className="border-white/30 text-white hover:bg-white/10 text-xs h-9">
-                <Bot className="w-4 h-4 mr-2 text-indigo-300" />
+              <Button className="bg-indigo-600/90 hover:bg-indigo-600 text-white font-semibold text-xs h-9 border border-indigo-400/40 shadow-xs">
+                <Bot className="w-4 h-4 mr-2 text-indigo-200" />
                 AI Research Assistant
               </Button>
             </Link>

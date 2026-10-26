@@ -340,12 +340,11 @@ export const LinkedInFinder: React.FC = () => {
 
         <div className="flex items-center gap-2">
           <Button
-            variant="outline"
             size="sm"
             onClick={handleRunTests}
-            className="border-white/30 text-white hover:bg-white/10 text-xs font-semibold h-8"
+            className="bg-indigo-600 hover:bg-indigo-500 text-white border border-indigo-400/40 text-xs font-semibold h-8 shadow-xs"
           >
-            <FlaskConical className="w-3.5 h-3.5 mr-1.5 text-blue-300" />
+            <FlaskConical className="w-3.5 h-3.5 mr-1.5 text-indigo-200" />
             Run 15 Unit Tests
           </Button>
 
