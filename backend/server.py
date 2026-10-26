@@ -600,6 +600,17 @@ def _run_collector_thread(
                 task["records"].append(prof)
                 task["totalCollected"] = len(task["records"])
                 task["progressMessage"] = f"Found {prof.get('Full name')} at {prof.get('Company name')}"
+                # Incremental background persistence every 5 leads so closing page never loses data
+                if len(task["records"]) % 5 == 0 and task.get("userId") and task.get("historyId"):
+                    try:
+                        database.update_search_history(
+                            history_id=task["historyId"],
+                            user_id=task["userId"],
+                            records=task["records"],
+                            status="running",
+                        )
+                    except Exception as he:
+                        logger.warning(f"Error persisting incremental history: {he}")
         elif etype == "target_reached":
             task["progressMessage"] = event.get("message", "Target profile count reached!")
         elif etype == "enrich_start":
@@ -666,18 +677,45 @@ def _run_collector_thread(
         task["fileId"] = file_id
         task["downloadUrl"] = f"/api/download/{file_id}"
         task["fileName"] = out_filename
-        task["status"] = "stopped" if collector.stop_requested.is_set() else "completed"
+        final_status = "stopped" if collector.stop_requested.is_set() else "completed"
+        task["status"] = final_status
         task["progressMessage"] = (
-            f"Done! Exactly {len(rows)} verified profiles cleaned with Gemini AI and ready for download."
+            f"Done! Exactly {len(rows)} verified profiles cleaned with Gemini AI and saved to your history."
             if task.get("geminiVerified")
-            else f"Done! Exactly {len(rows)} verified profiles ready for download."
+            else f"Done! Exactly {len(rows)} verified profiles saved to your history."
         )
+
+        # Commit final complete dataset to user's database history
+        if task.get("userId") and task.get("historyId"):
+            database.update_search_history(
+                history_id=task["historyId"],
+                user_id=task["userId"],
+                records=rows,
+                status=final_status,
+            )
+        elif task.get("userId"):
+            h = database.save_search_history(
+                user_id=task["userId"],
+                module_type="keyword-collector",
+                search_query=task.get("searchQuery", "Keyword Scraper"),
+                records=rows,
+                filters=task.get("filters", {}),
+                status=final_status,
+            )
+            task["historyId"] = h["id"]
 
     except Exception as e:
         traceback.print_exc()
         task["status"] = "error"
         task["error"] = str(e)
         task["progressMessage"] = f"Error during scraping: {str(e)}"
+        if task.get("userId") and task.get("historyId"):
+            database.update_search_history(
+                history_id=task["historyId"],
+                user_id=task["userId"],
+                records=task.get("records", []),
+                status="error",
+            )
 
 
 @app.post("/api/collector/start")
@@ -687,6 +725,7 @@ def start_keyword_collector(payload: StartCollectorPayload, authorization: Optio
         raise HTTPException(status_code=400, detail="At least one keyword is required.")
 
     user = get_current_user_optional(authorization)
+    user_id = user["id"] if user else None
     user_keys = database.get_user_keys(user["id"]) if user else {}
 
     target = max(1, min(int(payload.targetCount or 50), 2000))
@@ -707,16 +746,47 @@ def start_keyword_collector(payload: StartCollectorPayload, authorization: Optio
         gemini_api_key=gemini_key,
     )
 
+    city_suffix = f" in {payload.city}" if payload.city else (f" ({payload.country})" if payload.country else "")
+    search_title = (", ".join(clean_kws) if clean_kws else "Keyword Scraper") + city_suffix
+
+    filter_dict = {
+        "keywords": clean_kws,
+        "country": payload.country or "",
+        "state": payload.state or "",
+        "city": payload.city or "",
+        "targetCount": target,
+        "titles": titles,
+        "companySize": payload.companySize or "all",
+        "enrichCompany": bool(payload.enrichCompany),
+        "verifyWithGemini": verify_gemini,
+    }
+
+    history_id = None
+    if user_id:
+        h = database.save_search_history(
+            user_id=user_id,
+            module_type="keyword-collector",
+            search_query=search_title,
+            records=[],
+            filters=filter_dict,
+            status="running",
+        )
+        history_id = h["id"]
+
     task_id = f"task_{uuid.uuid4().hex[:10]}"
     COLLECTOR_TASKS[task_id] = {
         "id": task_id,
+        "userId": user_id,
+        "historyId": history_id,
+        "searchQuery": search_title,
+        "filters": filter_dict,
         "status": "running",
         "target": target,
         "records": [],
         "events": [],
         "latestQuery": "",
         "activeEngine": "ddg",
-        "progressMessage": "Initializing scraping workers...",
+        "progressMessage": "Initializing scraping workers in background...",
         "downloadUrl": None,
         "fileId": None,
         "fileName": None,
@@ -735,11 +805,53 @@ def start_keyword_collector(payload: StartCollectorPayload, authorization: Optio
 
     return {
         "taskId": task_id,
+        "historyId": history_id,
         "status": "running",
         "target": target,
         "keywords": clean_kws,
+        "searchQuery": search_title,
         "verifyWithGemini": verify_gemini,
     }
+
+
+@app.get("/api/collector/active")
+def get_active_collector_task(authorization: Optional[str] = Header(None)):
+    """
+    Returns any active or currently running scraping task for this user so they can reconnect
+    when refreshing, switching tabs, switching sections, or returning after closing the page.
+    """
+    user = get_current_user_optional(authorization)
+    user_id = user["id"] if user else None
+
+    # Priority 1: Actively running or stopping tasks
+    for tid, task in reversed(list(COLLECTOR_TASKS.items())):
+        task_user = task.get("userId")
+        if (user_id and task_user == user_id) or (not user_id and not task_user):
+            if task.get("status") in ("running", "stopping"):
+                status_payload = get_collector_status(tid)
+                return {
+                    "hasActiveTask": True,
+                    "task": status_payload,
+                    "searchQuery": task.get("searchQuery", ""),
+                    "filters": task.get("filters", {}),
+                    "historyId": task.get("historyId"),
+                }
+
+    # Priority 2: Recently finished tasks (within last 30 minutes)
+    for tid, task in reversed(list(COLLECTOR_TASKS.items())):
+        task_user = task.get("userId")
+        if (user_id and task_user == user_id) or (not user_id and not task_user):
+            if time.time() - task.get("createdAt", 0) < 1800:
+                status_payload = get_collector_status(tid)
+                return {
+                    "hasActiveTask": False,
+                    "recentTask": status_payload,
+                    "searchQuery": task.get("searchQuery", ""),
+                    "filters": task.get("filters", {}),
+                    "historyId": task.get("historyId"),
+                }
+
+    return {"hasActiveTask": False, "task": None}
 
 
 @app.get("/api/collector/status/{task_id}")
@@ -764,11 +876,14 @@ def get_collector_status(task_id: str, from_index: int = 0):
         "downloadUrl": task.get("downloadUrl"),
         "fileName": task.get("fileName"),
         "error": task.get("error"),
+        "historyId": task.get("historyId"),
+        "searchQuery": task.get("searchQuery", ""),
     }
 
 
 @app.post("/api/collector/stop/{task_id}")
-def stop_collector(task_id: str):
+def stop_collector(task_id: str, authorization: Optional[str] = Header(None)):
+    user = get_current_user_optional(authorization)
     task = COLLECTOR_TASKS.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Collector task not found.")
@@ -777,8 +892,8 @@ def stop_collector(task_id: str):
     if collector:
         collector.stop()
 
-    task["status"] = "stopping"
-    task["progressMessage"] = "Stopping scraper and building Excel output..."
+    task["status"] = "stopped"
+    task["progressMessage"] = "Scraping interrupted by user. Saved extracted leads to history."
 
     # If Excel not yet generated, generate from current rows
     if not task.get("downloadUrl") and task.get("records"):
@@ -792,15 +907,27 @@ def stop_collector(task_id: str):
             task["fileId"] = file_id
             task["downloadUrl"] = f"/api/download/{file_id}"
             task["fileName"] = out_filename
-            task["status"] = "stopped"
         except Exception as e:
             logger.error(f"Error writing partial Excel: {e}")
+
+    # Immediately save whatever was extracted so far to database history!
+    if task.get("userId") and task.get("historyId"):
+        try:
+            database.update_search_history(
+                history_id=task["historyId"],
+                user_id=task["userId"],
+                records=task.get("records", []),
+                status="stopped",
+            )
+        except Exception as e:
+            logger.error(f"Error updating search history on stop: {e}")
 
     return {
         "taskId": task_id,
         "status": task["status"],
         "totalCollected": len(task["records"]),
         "downloadUrl": task.get("downloadUrl"),
+        "progressMessage": task["progressMessage"],
     }
 
 

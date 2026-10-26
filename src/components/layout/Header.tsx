@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { useLocation, Link, useNavigate } from 'react-router-dom';
 import {
   Menu,
@@ -9,11 +9,14 @@ import {
   CheckCircle2,
   LogOut,
   User as UserIcon,
+  Loader2,
+  Square,
 } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
 import { excelService } from '../../services/excelService';
 import { useAuth } from '../../context/AuthContext';
+import { getApiBaseUrl, getAuthHeaders } from '../../config/api';
 
 interface HeaderProps {
   onToggleMobileMenu: () => void;
@@ -57,6 +60,66 @@ export const Header: React.FC<HeaderProps> = ({
 
   const { title, subtitle } = getPageTitle(location.pathname);
 
+  const [activeTask, setActiveTask] = useState<{
+    taskId: string;
+    status: string;
+    totalCollected: number;
+    target: number;
+    searchQuery?: string;
+  } | null>(null);
+
+  // Poll for background scraping activity across the application
+  useEffect(() => {
+    let mounted = true;
+    const checkActive = async () => {
+      if (!user) {
+        if (mounted) setActiveTask(null);
+        return;
+      }
+      const apiBase = getApiBaseUrl();
+      if (!apiBase) return;
+      try {
+        const res = await fetch(`${apiBase}/api/collector/active`, {
+          headers: getAuthHeaders(),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!mounted) return;
+        if (data.hasActiveTask && data.task && (data.task.status === 'running' || data.task.status === 'stopping')) {
+          setActiveTask(data.task);
+        } else {
+          setActiveTask(null);
+        }
+      } catch {
+        if (mounted) setActiveTask(null);
+      }
+    };
+
+    checkActive();
+    const interval = setInterval(checkActive, 3000);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, [user]);
+
+  const handleHeaderStop = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!activeTask?.taskId) return;
+    const apiBase = getApiBaseUrl();
+    if (!apiBase) return;
+    try {
+      await fetch(`${apiBase}/api/collector/stop/${activeTask.taskId}`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
+      setActiveTask(null);
+    } catch (err) {
+      console.error('Stop error from header:', err);
+    }
+  };
+
   const handleDownloadSample = () => {
     excelService.downloadSampleTemplate('xlsx');
   };
@@ -93,8 +156,37 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
       </div>
 
-      {/* Right: Quick actions, user profile & logout */}
+      {/* Right: Quick actions, background scraper indicator, user profile & logout */}
       <div className="flex items-center gap-2 md:gap-3">
+        {/* Persistent Background Scraping Indicator */}
+        {activeTask && (
+          <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 border border-blue-200 text-xs text-blue-900 shadow-xs">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-600"></span>
+            </span>
+            <span className="hidden sm:inline font-medium text-blue-800">
+              Background Scraping:
+            </span>
+            <span className="font-bold text-blue-950">
+              {activeTask.totalCollected}/{activeTask.target} leads
+            </span>
+            <Link
+              to="/keyword-collector"
+              className="text-blue-700 hover:text-blue-900 font-semibold underline text-[11px] ml-0.5"
+            >
+              View
+            </Link>
+            <button
+              onClick={handleHeaderStop}
+              className="text-rose-600 hover:text-rose-800 font-semibold text-[11px] hover:underline cursor-pointer ml-1"
+              title="Stop scraping now"
+            >
+              Stop
+            </button>
+          </div>
+        )}
+
         <Button
           variant="outline"
           size="sm"

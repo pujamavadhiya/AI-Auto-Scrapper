@@ -389,7 +389,9 @@ export const KeywordLeadCollector: React.FC = () => {
       if (!apiBase) return;
 
       try {
-        const res = await fetch(`${apiBase}/api/collector/status/${id}`);
+        const res = await fetch(`${apiBase}/api/collector/status/${id}`, {
+          headers: getAuthHeaders(),
+        });
         if (!res.ok) return;
 
         const data = await res.json();
@@ -440,27 +442,105 @@ export const KeywordLeadCollector: React.FC = () => {
     }, 600);
   };
 
-  // Stop Scraping
+  // Stop Scraping - immediately halts crawler and saves extracted results
   const handleStopScraping = async () => {
     if (!taskId) return;
     const apiBase = getApiBaseUrl();
     if (!apiBase) return;
-    setProgressMessage('Halting crawler and preparing Excel spreadsheet...');
+    setProgressMessage('Halting crawler and saving extracted results to history...');
     try {
       const res = await fetch(`${apiBase}/api/collector/stop/${taskId}`, {
         method: 'POST',
+        headers: getAuthHeaders(),
       });
       if (res.ok) {
         const data = await res.json();
         setStatus('stopped');
         setIsRunning(false);
         if (data.downloadUrl) setDownloadUrl(data.downloadUrl);
+        if (data.progressMessage) setProgressMessage(data.progressMessage);
         if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
       }
     } catch (err) {
       console.error('Stop error:', err);
     }
   };
+
+  // Reconnect automatically to active or background scraping task on mount / refresh
+  useEffect(() => {
+    let mounted = true;
+    const syncActiveTask = async () => {
+      const apiBase = getApiBaseUrl();
+      if (!apiBase) return;
+      try {
+        const res = await fetch(`${apiBase}/api/collector/active`, {
+          headers: getAuthHeaders(),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!mounted) return;
+
+        if (data.hasActiveTask && data.task) {
+          const t = data.task;
+          setTaskId(t.taskId);
+          setStatus(t.status);
+          if (t.target) setTargetCount(t.target);
+          if (t.records && t.records.length > 0) {
+            const cleaned = t.records.map((r: ScrapedProfile) => ({
+              ...r,
+              'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
+            }));
+            setRecords(cleaned);
+          }
+          if (t.latestQuery) setLatestQuery(t.latestQuery);
+          if (t.activeEngine) setActiveEngine(t.activeEngine);
+          if (t.progressMessage) setProgressMessage(t.progressMessage);
+          if (t.downloadUrl) setDownloadUrl(t.downloadUrl);
+          if (t.fileName) setFileName(t.fileName);
+
+          if (data.filters) {
+            if (data.filters.keywords && Array.isArray(data.filters.keywords)) setKeywords(data.filters.keywords);
+            if (data.filters.country) setCountry(data.filters.country);
+            if (data.filters.state) setState(data.filters.state);
+            if (data.filters.city) setCity(data.filters.city);
+            if (data.filters.titles && Array.isArray(data.filters.titles)) setTitles(data.filters.titles);
+            if (data.filters.companySize) setCompanySize(data.filters.companySize);
+          }
+
+          if (t.status === 'running') {
+            setIsRunning(true);
+            startPolling(t.taskId);
+          }
+        } else if (data.recentTask && records.length === 0) {
+          const t = data.recentTask;
+          setTaskId(t.taskId);
+          setStatus(t.status);
+          if (t.target) setTargetCount(t.target);
+          if (t.records && t.records.length > 0) {
+            const cleaned = t.records.map((r: ScrapedProfile) => ({
+              ...r,
+              'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
+            }));
+            setRecords(cleaned);
+          }
+          if (t.downloadUrl) setDownloadUrl(t.downloadUrl);
+          if (t.fileName) setFileName(t.fileName);
+          if (t.progressMessage) setProgressMessage(t.progressMessage);
+        }
+      } catch (e) {
+        console.error('Error restoring active scraping task:', e);
+      }
+    };
+
+    syncActiveTask();
+
+    return () => {
+      mounted = false;
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
+    };
+  }, []);
 
   // Download Excel (works both during live scraping and after completion)
   const handleClientDownload = async () => {
