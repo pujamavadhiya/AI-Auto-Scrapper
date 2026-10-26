@@ -822,6 +822,11 @@ class StartCollectorPayload(BaseModel):
     enrichCompany: Optional[bool] = True
     verifyWithGemini: Optional[bool] = True
     geminiApiKey: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    serpapiKey: Optional[str] = None
+    serpapi_key: Optional[str] = None
+    serperKey: Optional[str] = None
+    serper_key: Optional[str] = None
 
 
 class VerifyGeminiPayload(BaseModel):
@@ -992,7 +997,10 @@ def start_keyword_collector(payload: StartCollectorPayload, authorization: Optio
     titles = payload.titles if payload.titles else ["CEO", "Founder", "COO", "Owner", "Director", "VP"]
 
     verify_gemini = bool(payload.verifyWithGemini) if payload.verifyWithGemini is not None else True
-    gemini_key = (payload.geminiApiKey or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")).strip()
+    gemini_key = (payload.geminiApiKey or payload.gemini_api_key or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")).strip()
+    serpapi_k = (payload.serpapiKey or payload.serpapi_key or user_keys.get("serpapi_key", "") or os.environ.get("SERPAPI_KEY", "")).strip()
+    serper_k = (payload.serperKey or payload.serper_key or user_keys.get("serper_key", "") or os.environ.get("SERPER_API_KEY", "")).strip()
+
     cfg = CollectorConfig(
         keywords=clean_kws,
         country=payload.country or "",
@@ -1004,6 +1012,8 @@ def start_keyword_collector(payload: StartCollectorPayload, authorization: Optio
         enrich_company=bool(payload.enrichCompany),
         delay_range=(0.4, 0.9),
         gemini_api_key=gemini_key,
+        serper_api_key=serper_k,
+        serpapi_key=serpapi_k,
     )
 
     city_suffix = f" in {payload.city}" if payload.city else (f" ({payload.country})" if payload.country else "")
@@ -1146,7 +1156,13 @@ def stop_collector(task_id: str, authorization: Optional[str] = Header(None)):
     user = get_current_user_optional(authorization)
     task = COLLECTOR_TASKS.get(task_id)
     if not task:
-        raise HTTPException(status_code=404, detail="Collector task not found.")
+        return {
+            "taskId": task_id,
+            "status": "stopped",
+            "totalCollected": 0,
+            "downloadUrl": None,
+            "progressMessage": "Scraping task stopped or already finished.",
+        }
 
     collector = task.get("collector")
     if collector:

@@ -34,6 +34,8 @@ import { Select } from '../components/ui/Select';
 import { cn } from '../lib/utils';
 import { getApiBaseUrl, getAuthHeaders } from '../config/api';
 import { historyService } from '../services/historyService';
+import { useAuth } from '../context/AuthContext';
+import { storageService } from '../services/storageService';
 
 export interface ScrapedProfile {
   'Company name': string;
@@ -98,6 +100,8 @@ export const cleanLinkedInUrl = (url: string, fullName: string = '', company: st
 };
 
 export const KeywordLeadCollector: React.FC = () => {
+  const { keys: authKeys } = useAuth();
+
   // Input Configuration State
   const [keywords, setKeywords] = useState<string[]>(['SaaS']);
   const [keywordInput, setKeywordInput] = useState('');
@@ -297,6 +301,11 @@ export const KeywordLeadCollector: React.FC = () => {
       return;
     }
 
+    const activeSettings = storageService.getSettings();
+    const effectiveGeminiKey = (authKeys?.gemini_api_key || activeSettings?.geminiApiKey || '').trim();
+    const effectiveSerpapiKey = (authKeys?.serpapi_key || activeSettings?.serpApiKey || '').trim();
+    const effectiveSerperKey = (authKeys?.serper_key || activeSettings?.serperApiKey || '').trim();
+
     try {
       const res = await fetch(`${apiBase}/api/collector/start`, {
         method: 'POST',
@@ -311,6 +320,9 @@ export const KeywordLeadCollector: React.FC = () => {
           companySize: activeCompanySize,
           enrichCompany,
           verifyWithGemini,
+          geminiApiKey: effectiveGeminiKey,
+          serpapiKey: effectiveSerpapiKey,
+          serperKey: effectiveSerperKey,
         }),
       });
 
@@ -460,9 +472,16 @@ export const KeywordLeadCollector: React.FC = () => {
         if (data.downloadUrl) setDownloadUrl(data.downloadUrl);
         if (data.progressMessage) setProgressMessage(data.progressMessage);
         if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+      } else {
+        setStatus('stopped');
+        setIsRunning(false);
+        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
       }
     } catch (err) {
-      console.error('Stop error:', err);
+      console.warn('Stop signal sent:', err);
+      setStatus('stopped');
+      setIsRunning(false);
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     }
   };
 

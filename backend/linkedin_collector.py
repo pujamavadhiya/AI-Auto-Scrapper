@@ -44,11 +44,15 @@ try:
     from backend.gemini_query_expander import (
         expand_criteria_with_gemini,
         verify_company_industry_smart,
+        search_serper,
+        search_serpapi,
     )
 except ImportError:
     from gemini_query_expander import (
         expand_criteria_with_gemini,
         verify_company_industry_smart,
+        search_serper,
+        search_serpapi,
     )
 
 logger = logging.getLogger("linkedin_collector")
@@ -217,6 +221,8 @@ class Criteria:
     gemini_company_queries: List[str] = field(default_factory=list)
     gemini_people_queries: List[str] = field(default_factory=list)
     gemini_api_key: Optional[str] = None
+    serper_api_key: Optional[str] = None
+    serpapi_key: Optional[str] = None
 
     def __post_init__(self):
         self.keywords = self.keywords or list(self.industries)
@@ -839,9 +845,24 @@ def find_decision_makers(cand_name: str, info: Dict[str, Any], crit: Criteria, i
 
     order = lpc.ENGINES[idx % len(lpc.ENGINES):] + lpc.ENGINES[:idx % len(lpc.ENGINES)]
     failed = False
+    serper_k = (crit.serper_api_key or os.environ.get("SERPER_API_KEY", "")).strip()
+    serp_k = (crit.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
+
     for q in queries:
-        res = lpc.run_search(q, 1, order)
-        time.sleep(random.uniform(*lpc.DELAY_RANGE))
+        res = None
+        if serper_k:
+            try:
+                res = search_serper(q, page=1, api_key=serper_k)
+            except Exception:
+                res = None
+        if not res and serp_k:
+            try:
+                res = search_serpapi(q, page=1, api_key=serp_k)
+            except Exception:
+                res = None
+        if not res:
+            res = lpc.run_search(q, 1, order)
+            time.sleep(random.uniform(*lpc.DELAY_RANGE))
         if res is None:
             failed = True
             continue
@@ -1009,6 +1030,8 @@ class CollectorConfig:
     enrich_company: bool = True
     delay_range: Tuple[float, float] = (0.5, 1.2)
     gemini_api_key: Optional[str] = None
+    serper_api_key: Optional[str] = None
+    serpapi_key: Optional[str] = None
 
 
 class KeywordLinkedInCollector:
@@ -1040,6 +1063,8 @@ class KeywordLinkedInCollector:
             require_dm=True,
             titles=config.titles if config.titles else list(DEFAULT_TITLES),
             gemini_api_key=config.gemini_api_key,
+            serper_api_key=config.serper_api_key,
+            serpapi_key=config.serpapi_key,
         )
 
     def emit(self, event_type: str, data: Dict[str, Any]):
@@ -1064,12 +1089,40 @@ class KeywordLinkedInCollector:
 
         def search_job(args):
             i, job = args
+            query = job["q"]
+            page = job["page"]
+            must = r"linkedin\.com/(company|in)/"
+
+            serper_k = (crit.serper_api_key or os.environ.get("SERPER_API_KEY", "")).strip()
+            if serper_k:
+                try:
+                    self.emit("query_start", {"query": query, "engine": "serper (google)"})
+                    res = search_serper(query, page=page, api_key=serper_k)
+                    if res:
+                        good = [x for x in res if re.search(must, x.get('url', ''), re.I)]
+                        if good:
+                            return good
+                except Exception as e:
+                    logger.warning(f"Serper error in collector: {e}")
+
+            serp_k = (crit.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
+            if serp_k:
+                try:
+                    self.emit("query_start", {"query": query, "engine": "serpapi (google)"})
+                    res = search_serpapi(query, page=page, api_key=serp_k)
+                    if res:
+                        good = [x for x in res if re.search(must, x.get('url', ''), re.I)]
+                        if good:
+                            return good
+                except Exception as e:
+                    logger.warning(f"SerpApi error in collector: {e}")
+
             order = lpc.ENGINES[i % len(lpc.ENGINES):] + lpc.ENGINES[:i % len(lpc.ENGINES)]
             self.emit("query_start", {
-                "query": job["q"],
+                "query": query,
                 "engine": order[0],
             })
-            res = lpc.run_search(job["q"], job["page"], order, must=r"linkedin\.com/(company|in)/")
+            res = lpc.run_search(query, page, order, must=must)
             time.sleep(random.uniform(*crit.signature().get("delay", (0.5, 1.2))))
             return res
 
