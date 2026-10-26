@@ -87,8 +87,8 @@ export const getApiBaseUrl = (): string => {
     }
   }
 
-  // If deployed to Vercel/production and no backend URL provided yet, return empty
-  return '';
+  // 5. Default production backend fallback for deployed Vercel
+  return 'https://ai-auto-scrapper-backend.onrender.com';
 };
 
 export const authenticatedFetch = async (

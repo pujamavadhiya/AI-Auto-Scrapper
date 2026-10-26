@@ -409,7 +409,8 @@ export const KeywordLeadCollector: React.FC = () => {
         const data = await res.json();
         // Live instantaneous records synchronization
         if (data.records && data.records.length > 0) {
-          const cleaned = data.records.slice(0, targetCount).map((r: ScrapedProfile) => ({
+          const cap = data.target || targetCount || 50;
+          const cleaned = data.records.slice(0, cap).map((r: ScrapedProfile) => ({
             ...r,
             'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
           }));
@@ -426,7 +427,8 @@ export const KeywordLeadCollector: React.FC = () => {
           setIsRunning(false);
           setStatus(data.status);
           if (data.records && data.records.length > 0) {
-            const cleaned = data.records.slice(0, targetCount).map((r: ScrapedProfile) => ({
+            const cap = data.target || targetCount || 50;
+            const cleaned = data.records.slice(0, cap).map((r: ScrapedProfile) => ({
               ...r,
               'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
             }));
@@ -438,7 +440,7 @@ export const KeywordLeadCollector: React.FC = () => {
               moduleType: 'keyword-collector',
               searchQuery: searchTitle,
               records: cleaned,
-              filters: { targetCount, titles, companySize, country, state, city },
+              filters: { targetCount: cap, titles, companySize, country, state, city },
             });
           }
           clearInterval(pollIntervalRef.current);
