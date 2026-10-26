@@ -279,15 +279,23 @@ def admin_create_user(payload: AdminCreateUserPayload, authorization: Optional[s
     """Creates a new user directly from the web interface - restricted strictly to user Puja."""
     user = get_current_user(authorization)
     require_puja_admin(user)
+    clean_email = payload.email.strip().lower()
     try:
         new_user = database.create_user(
-            email=payload.email,
+            email=clean_email,
             password=payload.password,
             name=payload.name or "",
             role=payload.role or "user"
         )
         return {"status": "ok", "user": new_user}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
+        if "UNIQUE constraint failed" in str(e):
+            raise HTTPException(
+                status_code=400,
+                detail=f"User with email '{clean_email}' already exists in the database. Duplicate email IDs are not allowed."
+            )
         raise HTTPException(status_code=400, detail=str(e))
 
 

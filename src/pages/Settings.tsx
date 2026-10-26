@@ -108,9 +108,17 @@ export const Settings: React.FC = () => {
     e.preventDefault();
     setUserActionError(null);
     setUserActionSuccess(null);
+
+    const cleanEmail = newUserData.email.trim().toLowerCase();
+    const alreadyExists = teamUsers.some((u) => u.email?.trim().toLowerCase() === cleanEmail);
+    if (alreadyExists) {
+      setUserActionError(`A user with email "${cleanEmail}" already exists in the database. Duplicate email IDs are not allowed.`);
+      return;
+    }
+
     try {
-      await authService.createUser(newUserData);
-      setUserActionSuccess(`User "${newUserData.email}" created successfully!`);
+      await authService.createUser({ ...newUserData, email: cleanEmail });
+      setUserActionSuccess(`User "${cleanEmail}" created and saved to database successfully!`);
       setIsCreateUserModalOpen(false);
       setNewUserData({ email: '', password: '', name: '', role: 'user' });
       loadTeamUsers();
@@ -869,13 +877,14 @@ export const Settings: React.FC = () => {
               <RefreshCw className={`w-3.5 h-3.5 ${loadingUsers ? 'animate-spin text-blue-600' : ''}`} />
             </Button>
             <Button
+              id="open-create-user-modal-btn"
               size="sm"
               onClick={() => {
                 setUserActionError(null);
                 setUserActionSuccess(null);
                 setIsCreateUserModalOpen(true);
               }}
-              className="bg-blue-600 hover:bg-blue-700 text-white text-xs h-8 px-3 font-semibold gap-1.5 shadow-xs"
+              className="bg-blue-600 hover:bg-blue-700 text-white text-xs h-8 px-3 font-semibold gap-1.5 shadow-xs cursor-pointer"
             >
               <UserPlus className="w-3.5 h-3.5" />
               <span>Create User</span>
@@ -1019,11 +1028,18 @@ export const Settings: React.FC = () => {
             </div>
 
             <form onSubmit={handleCreateUser} className="p-5 space-y-3.5 text-xs">
+              {userActionError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center gap-2">
+                  <X className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{userActionError}</span>
+                </div>
+              )}
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">
                   Email Address <span className="text-rose-500">*</span>
                 </label>
                 <input
+                  id="create-user-email-input"
                   type="email"
                   required
                   placeholder="colleague@company.com"
@@ -1036,6 +1052,7 @@ export const Settings: React.FC = () => {
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Display Name</label>
                 <input
+                  id="create-user-name-input"
                   type="text"
                   placeholder="Jane Doe"
                   value={newUserData.name}
@@ -1049,6 +1066,7 @@ export const Settings: React.FC = () => {
                   Password <span className="text-rose-500">*</span> (min 6 characters)
                 </label>
                 <input
+                  id="create-user-password-input"
                   type="password"
                   required
                   minLength={6}
@@ -1062,6 +1080,7 @@ export const Settings: React.FC = () => {
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Role</label>
                 <select
+                  id="create-user-role-select"
                   value={newUserData.role}
                   onChange={(e) => setNewUserData({ ...newUserData, role: e.target.value })}
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
@@ -1073,6 +1092,7 @@ export const Settings: React.FC = () => {
 
               <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
                 <Button
+                  id="cancel-create-user-btn"
                   type="button"
                   variant="outline"
                   size="sm"
@@ -1080,7 +1100,7 @@ export const Settings: React.FC = () => {
                 >
                   Cancel
                 </Button>
-                <Button type="submit" size="sm" className="bg-blue-600 hover:bg-blue-700 text-white font-semibold">
+                <Button id="submit-create-user-btn" type="submit" size="sm" className="bg-blue-600 hover:bg-blue-700 text-white font-semibold cursor-pointer">
                   Create Account
                 </Button>
               </div>
@@ -1108,6 +1128,12 @@ export const Settings: React.FC = () => {
             </div>
 
             <form onSubmit={handleChangePassword} className="p-5 space-y-3.5 text-xs">
+              {userActionError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center gap-2">
+                  <X className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{userActionError}</span>
+                </div>
+              )}
               <div>
                 <div className="text-slate-500 text-[11px] mb-2">
                   Updating password for account:

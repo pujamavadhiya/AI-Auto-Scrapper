@@ -172,33 +172,41 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
 
 
 def create_user(email: str, password: str, name: str = "", role: str = "user") -> Dict[str, Any]:
-    """Creates a new user and an associated empty API keys record."""
+    """Creates a new user and an associated empty API keys record, strictly preventing duplicate emails."""
     clean_email = email.strip().lower()
     if not clean_email or "@" not in clean_email:
         raise ValueError("Invalid email address provided.")
     if len(password) < 6:
         raise ValueError("Password must be at least 6 characters.")
 
-    user_id = secrets.token_hex(12)
-    now = datetime.now(timezone.utc).isoformat()
-    pwd_hash, salt = hash_password(password)
-
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO users (id, email, password_hash, salt, name, role, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, clean_email, pwd_hash, salt, name.strip(), role, now, now)
-        )
-        conn.execute(
-            """
-            INSERT INTO user_keys (user_id, updated_at)
-            VALUES (?, ?)
-            """,
-            (user_id, now)
-        )
-        conn.commit()
+        # Prevent duplicate user with the same email
+        existing = conn.execute("SELECT id FROM users WHERE email = ?", (clean_email,)).fetchone()
+        if existing:
+            raise ValueError(f"User with email '{clean_email}' already exists in the database. Duplicate email IDs are not allowed.")
+
+        user_id = secrets.token_hex(12)
+        now = datetime.now(timezone.utc).isoformat()
+        pwd_hash, salt = hash_password(password)
+
+        try:
+            conn.execute(
+                """
+                INSERT INTO users (id, email, password_hash, salt, name, role, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, clean_email, pwd_hash, salt, name.strip(), role, now, now)
+            )
+            conn.execute(
+                """
+                INSERT INTO user_keys (user_id, updated_at)
+                VALUES (?, ?)
+                """,
+                (user_id, now)
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise ValueError(f"User with email '{clean_email}' already exists in the database. Duplicate email IDs are not allowed.")
 
     return {
         "id": user_id,
