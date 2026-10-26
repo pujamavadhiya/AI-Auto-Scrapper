@@ -3,16 +3,41 @@ import { AuthResponse, User, UserApiKeys } from '../types/auth';
 
 export const authService = {
   async login(email: string, password: string): Promise<AuthResponse> {
-    const apiBase = getApiBaseUrl() || (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? 'http://127.0.0.1:8000' : '');
-    const res = await fetch(`${apiBase}/api/auth/login`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ email: email.trim(), password }),
-    });
+    const isLocal = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+    const apiBase = getApiBaseUrl() || (isLocal ? 'http://127.0.0.1:8000' : '');
+
+    if (!apiBase && !isLocal) {
+      throw new Error(
+        'Backend API Server URL is not configured. On Vercel, please set VITE_API_URL or enter your live Backend URL below (e.g. Render or Railway).'
+      );
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`${apiBase}/api/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ email: email.trim(), password }),
+      });
+    } catch (netErr: any) {
+      throw new Error(
+        `Unable to reach backend server at "${apiBase}". Please verify your backend is running and CORS is enabled.`
+      );
+    }
 
     if (!res.ok) {
+      if (res.status === 404) {
+        throw new Error(
+          `Backend server at "${apiBase}" returned 404 for /api/auth/login. Please verify the URL points to your FastAPI backend.`
+        );
+      }
+      if (res.status === 502 || res.status === 503) {
+        throw new Error(
+          `Backend server is starting up or temporarily unavailable (${res.status}). If hosted on Render free tier, please wait 30-50s for cold start.`
+        );
+      }
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || 'Invalid email or password.');
     }

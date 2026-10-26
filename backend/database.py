@@ -88,6 +88,42 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_search_history_user_date
             ON search_history (user_id, created_at DESC);
         """)
+
+        # Auto-seed default admin user if database is empty (e.g. fresh cloud deployment on Render)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        row = cur.fetchone()
+        user_count = row[0] if row else 0
+        if user_count == 0:
+            default_email = os.environ.get("DEFAULT_ADMIN_EMAIL", "admin@example.com").strip().lower()
+            default_password = os.environ.get("DEFAULT_ADMIN_PASSWORD", "password123").strip()
+            default_name = os.environ.get("DEFAULT_ADMIN_NAME", "Admin User").strip()
+            salt = secrets.token_hex(16)
+            p_hash, _ = hash_password(default_password, salt)
+            user_id = secrets.token_hex(12)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cur.execute(
+                """
+                INSERT INTO users (id, email, password_hash, salt, name, role, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'admin', ?, ?)
+                """,
+                (user_id, default_email, p_hash, salt, default_name, now_iso, now_iso),
+            )
+            cur.execute(
+                """
+                INSERT INTO user_keys (user_id, serpapi_key, serper_key, gemini_api_key, leadocean_api_key, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    os.environ.get("SERPAPI_KEY", ""),
+                    os.environ.get("SERPER_API_KEY", ""),
+                    os.environ.get("GEMINI_API_KEY", ""),
+                    os.environ.get("LEADOCEAN_API_KEY", ""),
+                    now_iso,
+                ),
+            )
+
         conn.commit()
 
 

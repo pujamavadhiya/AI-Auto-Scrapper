@@ -38,9 +38,29 @@ export const getAuthHeaders = (customHeaders: Record<string, string> = {}): Reco
   return headers;
 };
 
+export const API_BASE_URL_STORAGE_KEY = 'leadpulse_api_base_url';
+
+export const setCustomApiBaseUrl = (url: string | null): void => {
+  try {
+    if (url && url.trim()) {
+      localStorage.setItem(API_BASE_URL_STORAGE_KEY, url.trim().replace(/\/+$/, ''));
+    } else {
+      localStorage.removeItem(API_BASE_URL_STORAGE_KEY);
+    }
+  } catch {
+    // ignore
+  }
+};
+
 export const getApiBaseUrl = (): string => {
   try {
-    // 1. Check user configured endpoint in Settings (saved in localStorage)
+    // 1. Direct explicit API base URL override
+    const explicitUrl = localStorage.getItem(API_BASE_URL_STORAGE_KEY);
+    if (explicitUrl && explicitUrl.trim()) {
+      return explicitUrl.trim().replace(/\/+$/, '');
+    }
+
+    // 2. Check user configured endpoint in Settings (saved in localStorage)
     const rawStorage = localStorage.getItem('leadpulse_app_settings');
     if (rawStorage) {
       const parsed = JSON.parse(rawStorage);
@@ -53,13 +73,13 @@ export const getApiBaseUrl = (): string => {
     // ignore json parse error
   }
 
-  // 2. Check Vite build-time environment variable
+  // 3. Check Vite build-time environment variable
   const envUrl = (import.meta as any).env?.VITE_API_URL;
   if (envUrl && typeof envUrl === 'string' && envUrl.trim()) {
     return envUrl.trim().replace(/\/+$/, '');
   }
 
-  // 3. Fallback for local development
+  // 4. Fallback for local development
   if (typeof window !== 'undefined') {
     const host = window.location.hostname;
     if (host === 'localhost' || host === '127.0.0.1') {
