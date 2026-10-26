@@ -20,20 +20,29 @@ import { ChatMessage } from '../types';
 import { aiAssistantService } from '../services/adapters/aiAssistantAdapter';
 import { authService } from '../services/authService';
 import { Button } from '../components/ui/Button';
-import { Badge } from '../components/ui/Badge';
 import { Card } from '../components/ui/Card';
+import { Badge } from '../components/ui/Badge';
 import { MarkdownView } from '../components/common/MarkdownView';
+import { useAuth } from '../context/AuthContext';
+import { storageService } from '../services/storageService';
 
 export const AIResearchAssistant: React.FC = () => {
+  const { keys: authKeys, updateKeys } = useAuth();
   const [messages, setMessages] = useState<ChatMessage[]>(() => aiAssistantService.getInitialMessages());
   const [inputPrompt, setInputPrompt] = useState('');
   const [isThinking, setIsThinking] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  // Gemini API Key State in Chatbot
-  const [geminiApiKey, setGeminiApiKey] = useState('');
-  const [hasConfiguredKey, setHasConfiguredKey] = useState<boolean | null>(null);
-  const [maskedKey, setMaskedKey] = useState('');
+  // Gemini API Key State in Chatbot - automatically synchronized with Settings
+  const [geminiApiKey, setGeminiApiKey] = useState(() => storageService.getSettings()?.geminiApiKey || '');
+  const [hasConfiguredKey, setHasConfiguredKey] = useState<boolean>(() => {
+    const localKey = storageService.getSettings()?.geminiApiKey || '';
+    return Boolean(localKey && !localKey.startsWith('your_') && !localKey.startsWith('test_'));
+  });
+  const [maskedKey, setMaskedKey] = useState(() => {
+    const localKey = storageService.getSettings()?.geminiApiKey || '';
+    return localKey.length > 8 ? localKey.slice(0, 4) + '...' + localKey.slice(-4) : '';
+  });
   const [isKeyDrawerOpen, setIsKeyDrawerOpen] = useState(false);
   const [isSavingKey, setIsSavingKey] = useState(false);
   const [keySaveMessage, setKeySaveMessage] = useState<string | null>(null);
@@ -49,16 +58,22 @@ export const AIResearchAssistant: React.FC = () => {
     scrollToBottom();
   }, [messages, isThinking]);
 
-  // Check Gemini Key status upon mount
+  // Check Gemini Key status upon mount or whenever settings / authKeys update
   const checkKeyStatus = async () => {
+    // 1. First check storageService / settings
+    const settingKey = storageService.getSettings()?.geminiApiKey || authKeys?.gemini_api_key || '';
+    if (settingKey && !settingKey.startsWith('your_') && !settingKey.startsWith('test_')) {
+      setHasConfiguredKey(true);
+      setMaskedKey(settingKey.slice(0, 4) + '...' + settingKey.slice(-4));
+      setGeminiApiKey(settingKey);
+      return;
+    }
+
     try {
       const status = await aiAssistantService.checkStatus();
-      setHasConfiguredKey(status.hasGeminiKey);
-      setMaskedKey(status.maskedKey);
-
-      // If user has no key, automatically open key drawer
-      if (!status.hasGeminiKey) {
-        setIsKeyDrawerOpen(true);
+      if (status.hasGeminiKey) {
+        setHasConfiguredKey(true);
+        setMaskedKey(status.maskedKey);
       }
     } catch (e) {
       console.warn('Could not check Gemini key status:', e);
@@ -67,9 +82,9 @@ export const AIResearchAssistant: React.FC = () => {
 
   useEffect(() => {
     checkKeyStatus();
-  }, []);
+  }, [authKeys]);
 
-  // Save Gemini Key directly from chatbot interface
+  // Save Gemini Key directly from chatbot interface and two-way sync with Settings
   const handleSaveGeminiKey = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const cleanKey = geminiApiKey.trim();
@@ -81,10 +96,15 @@ export const AIResearchAssistant: React.FC = () => {
     setIsSavingKey(true);
     setKeySaveMessage(null);
     try {
-      await authService.updateUserKeys({ gemini_api_key: cleanKey });
+      // 1. Save to local storage for Settings page
+      storageService.saveSettings({ geminiApiKey: cleanKey });
+      // 2. Save to user keys via AuthContext (syncs everywhere + backend)
+      await updateKeys({ gemini_api_key: cleanKey, geminiApiKey: cleanKey });
+      await authService.updateUserKeys({ gemini_api_key: cleanKey, geminiApiKey: cleanKey });
+
       setHasConfiguredKey(true);
       setMaskedKey(cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4));
-      setKeySaveMessage('✅ Gemini API Key connected successfully!');
+      setKeySaveMessage('✅ Gemini API Key connected & synced with Settings!');
       setTimeout(() => {
         setIsKeyDrawerOpen(false);
         setKeySaveMessage(null);
@@ -100,10 +120,13 @@ export const AIResearchAssistant: React.FC = () => {
     const query = textToSend || inputPrompt;
     if (!query.trim() || isThinking) return;
 
-    // If no key is configured and user hasn't typed one in the drawer, prompt them
-    if (!hasConfiguredKey && !geminiApiKey.trim()) {
+    // Check key from state, settings, or authKeys
+    const activeSettings = storageService.getSettings();
+    const effectiveGeminiKey = geminiApiKey.trim() || activeSettings?.geminiApiKey || authKeys?.gemini_api_key || '';
+
+    if (!effectiveGeminiKey || effectiveGeminiKey.startsWith('your_') || effectiveGeminiKey.startsWith('test_')) {
       setIsKeyDrawerOpen(true);
-      alert('Please provide your Google Gemini API Key in the box above to enable direct AI search & research.');
+      alert('Please provide your Google Gemini API Key in the box above or configure it in Settings to enable direct AI search & research.');
       return;
     }
 
@@ -122,7 +145,7 @@ export const AIResearchAssistant: React.FC = () => {
       const response = await aiAssistantService.askAssistant(
         query,
         messages,
-        geminiApiKey.trim() || undefined
+        effectiveGeminiKey
       );
       setMessages((prev) => [...prev, response]);
     } catch (err: any) {

@@ -8,13 +8,19 @@ export interface User {
 
 export interface UserApiKeys {
   serpapi_key?: string;
+  serpapiKey?: string;
   serper_key?: string;
+  serperKey?: string;
   gemini_api_key?: string;
+  geminiApiKey?: string;
   leadocean_api_key?: string;
+  leadoceanApiKey?: string;
   leadocean_endpoint?: string;
+  leadoceanEndpoint?: string;
   apify_token?: string;
   openai_api_key?: string;
   default_engine?: 'serpapi' | 'serper';
+  defaultEngine?: 'serpapi' | 'serper';
   updated_at?: string;
 }
 

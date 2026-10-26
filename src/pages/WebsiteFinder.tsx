@@ -33,8 +33,10 @@ import { storageService } from '../services/storageService';
 import { authService } from '../services/authService';
 import { historyService } from '../services/historyService';
 import { getApiBaseUrl, getAuthHeaders } from '../config/api';
+import { useAuth } from '../context/AuthContext';
 
 export const WebsiteFinder: React.FC = () => {
+  const { keys: authKeys, updateKeys } = useAuth();
   const [activeTab, setActiveTab] = useState<'table' | 'quick' | 'upload' | 'config'>('table');
   const [records, setRecords] = useState<EnrichmentRecord[]>(() => getSampleInitialRecords());
   const [parsedFile, setParsedFile] = useState<ParsedFileResult | null>(null);
@@ -44,10 +46,16 @@ export const WebsiteFinder: React.FC = () => {
   const [singleLocation, setSingleLocation] = useState('');
   const [bulkPasteText, setBulkPasteText] = useState('');
 
-  // Gemini API Key State in Website Finder
-  const [geminiApiKey, setGeminiApiKey] = useState('');
-  const [hasConfiguredKey, setHasConfiguredKey] = useState<boolean | null>(null);
-  const [maskedKey, setMaskedKey] = useState('');
+  // Gemini API Key State in Website Finder - automatically synchronized with Settings
+  const [geminiApiKey, setGeminiApiKey] = useState(() => storageService.getSettings()?.geminiApiKey || '');
+  const [hasConfiguredKey, setHasConfiguredKey] = useState<boolean>(() => {
+    const localKey = storageService.getSettings()?.geminiApiKey || '';
+    return Boolean(localKey && !localKey.startsWith('your_') && !localKey.startsWith('test_'));
+  });
+  const [maskedKey, setMaskedKey] = useState(() => {
+    const localKey = storageService.getSettings()?.geminiApiKey || '';
+    return localKey.length > 8 ? localKey.slice(0, 4) + '...' + localKey.slice(-4) : '';
+  });
   const [isKeyDrawerOpen, setIsKeyDrawerOpen] = useState(false);
   const [isSavingKey, setIsSavingKey] = useState(false);
   const [keySaveMessage, setKeySaveMessage] = useState<string | null>(null);
@@ -83,14 +91,24 @@ export const WebsiteFinder: React.FC = () => {
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Check Gemini Key status upon mount
+  // Check Gemini Key status upon mount or whenever authKeys / settings update
   const checkKeyStatus = async () => {
+    // 1. Immediately check storageService / settings
+    const settingKey = storageService.getSettings()?.geminiApiKey || authKeys?.gemini_api_key || '';
+    if (settingKey && !settingKey.startsWith('your_') && !settingKey.startsWith('test_')) {
+      setHasConfiguredKey(true);
+      setMaskedKey(settingKey.slice(0, 4) + '...' + settingKey.slice(-4));
+      setGeminiApiKey(settingKey);
+      return;
+    }
+
     try {
       const { keys } = await authService.getMe();
       const hasKey = bool(keys.gemini_api_key && !keys.gemini_api_key.startsWith('your_') && !keys.gemini_api_key.startsWith('test_'));
       setHasConfiguredKey(hasKey);
       if (hasKey && keys.gemini_api_key) {
         setMaskedKey(keys.gemini_api_key.slice(0, 4) + '...' + keys.gemini_api_key.slice(-4));
+        setGeminiApiKey(keys.gemini_api_key);
       } else {
         // Fallback check against backend status
         const apiBase = getApiBaseUrl();
@@ -98,8 +116,10 @@ export const WebsiteFinder: React.FC = () => {
           const res = await fetch(`${apiBase}/api/assistant/status`, { headers: getAuthHeaders() });
           if (res.ok) {
             const data = await res.json();
-            setHasConfiguredKey(data.hasGeminiKey);
-            setMaskedKey(data.maskedKey || '');
+            if (data.hasGeminiKey) {
+              setHasConfiguredKey(true);
+              setMaskedKey(data.maskedKey || '');
+            }
           }
         }
       }
@@ -114,9 +134,9 @@ export const WebsiteFinder: React.FC = () => {
 
   useEffect(() => {
     checkKeyStatus();
-  }, []);
+  }, [authKeys]);
 
-  // Save Gemini Key directly from Website Finder
+  // Save Gemini Key directly from Website Finder and two-way sync with Settings
   const handleSaveGeminiKey = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const cleanKey = geminiApiKey.trim();
@@ -128,10 +148,15 @@ export const WebsiteFinder: React.FC = () => {
     setIsSavingKey(true);
     setKeySaveMessage(null);
     try {
-      await authService.updateUserKeys({ gemini_api_key: cleanKey });
+      // 1. Save to local storage for Settings page
+      storageService.saveSettings({ geminiApiKey: cleanKey });
+      // 2. Save to user keys via AuthContext (syncs everywhere + backend)
+      await updateKeys({ gemini_api_key: cleanKey, geminiApiKey: cleanKey });
+      await authService.updateUserKeys({ gemini_api_key: cleanKey, geminiApiKey: cleanKey });
+
       setHasConfiguredKey(true);
       setMaskedKey(cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4));
-      setKeySaveMessage('✅ Gemini API Key connected successfully!');
+      setKeySaveMessage('✅ Gemini API Key connected & synced with Settings!');
       setTimeout(() => {
         setIsKeyDrawerOpen(false);
         setKeySaveMessage(null);
@@ -244,21 +269,23 @@ export const WebsiteFinder: React.FC = () => {
       return;
     }
 
-    if (!hasConfiguredKey && !geminiApiKey.trim()) {
+    const activeSettings = storageService.getSettings();
+    const effectiveGeminiKey = geminiApiKey.trim() || activeSettings?.geminiApiKey || authKeys?.gemini_api_key || '';
+
+    if (!effectiveGeminiKey || effectiveGeminiKey.startsWith('your_') || effectiveGeminiKey.startsWith('test_')) {
       setIsKeyDrawerOpen(true);
-      alert('Please configure your Google Gemini API Key above to begin searching company websites & founders.');
+      alert('Please configure your Google Gemini API Key above or in Settings to begin searching company websites & founders.');
       return;
     }
 
     abortControllerRef.current = new AbortController();
 
     try {
-      const activeSettings = storageService.getSettings();
       const enrichedBatch = await websiteFinderService.enrichBatch(
         targets,
         {
           ...config,
-          geminiApiKey: geminiApiKey.trim() || activeSettings?.geminiApiKey,
+          geminiApiKey: effectiveGeminiKey,
         },
         (p) => setProgress(p),
         abortControllerRef.current.signal,

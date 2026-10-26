@@ -123,13 +123,21 @@ class LoginPayload(BaseModel):
 
 class UserKeyUpdatePayload(BaseModel):
     serpapiKey: Optional[str] = None
+    serpapi_key: Optional[str] = None
     serperKey: Optional[str] = None
+    serper_key: Optional[str] = None
     geminiApiKey: Optional[str] = None
+    gemini_api_key: Optional[str] = None
     leadoceanApiKey: Optional[str] = None
+    leadocean_api_key: Optional[str] = None
     leadoceanEndpoint: Optional[str] = None
+    leadocean_endpoint: Optional[str] = None
     apifyToken: Optional[str] = None
+    apify_token: Optional[str] = None
     openaiApiKey: Optional[str] = None
+    openai_api_key: Optional[str] = None
     defaultEngine: Optional[str] = None
+    default_engine: Optional[str] = None
 
 
 class ChatMessageItem(BaseModel):
