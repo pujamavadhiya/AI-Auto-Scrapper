@@ -193,15 +193,13 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, A
 def get_effective_user_key(user: Optional[Dict[str, Any]], key_name: str, fallback_env: str = "") -> str:
     """
     Returns the user's isolated configured API key from database.
-    If the user has not configured the key, returns empty string.
-    Only falls back to env if no user is specified (backwards compatibility).
+    If the user has not configured the key, falls back to server environment variable.
     """
     if user:
         user_keys = database.get_user_keys(user["id"])
         val = user_keys.get(key_name, "")
         if val and str(val).strip():
             return str(val).strip()
-        return ""
     if fallback_env:
         return os.environ.get(fallback_env, "").strip()
     return ""
@@ -486,10 +484,10 @@ def get_dashboard_stats(authorization: Optional[str] = Header(None)):
 
     # Check key statuses
     keys_status = {
-        "serpapi": bool(user_keys.get("serpapi_key", "").strip() and not user_keys.get("serpapi_key", "").startswith("your_")),
-        "serper": bool(user_keys.get("serper_key", "").strip() and not user_keys.get("serper_key", "").startswith("your_")),
-        "gemini": bool(user_keys.get("gemini_api_key", "").strip() and not user_keys.get("gemini_api_key", "").startswith("your_")),
-        "leadocean": bool(user_keys.get("leadocean_api_key", "").strip() and not user_keys.get("leadocean_api_key", "").startswith("your_")),
+        "serpapi": bool((user_keys.get("serpapi_key", "").strip() or os.environ.get("SERPAPI_KEY", "").strip()) and not (user_keys.get("serpapi_key", "") or os.environ.get("SERPAPI_KEY", "")).startswith("your_")),
+        "serper": bool((user_keys.get("serper_key", "").strip() or os.environ.get("SERPER_API_KEY", "").strip()) and not (user_keys.get("serper_key", "") or os.environ.get("SERPER_API_KEY", "")).startswith("your_")),
+        "gemini": bool((user_keys.get("gemini_api_key", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()) and not (user_keys.get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")).startswith("your_")),
+        "leadocean": bool((user_keys.get("leadocean_api_key", "").strip() or os.environ.get("LEADOCEAN_API_KEY", "").strip()) and not (user_keys.get("leadocean_api_key", "") or os.environ.get("LEADOCEAN_API_KEY", "")).startswith("your_")),
     }
     keys_configured = sum(1 for v in keys_status.values() if v)
 
@@ -1010,7 +1008,7 @@ def start_keyword_collector(payload: StartCollectorPayload, authorization: Optio
     titles = payload.titles if payload.titles else ["CEO", "Founder", "COO", "Owner", "Director", "VP"]
 
     verify_gemini = bool(payload.verifyWithGemini) if payload.verifyWithGemini is not None else True
-    gemini_key = (payload.geminiApiKey or payload.gemini_api_key or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")).strip()
+    gemini_key = (payload.geminiApiKey or payload.gemini_api_key or user_keys.get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")).strip()
     serpapi_k = (payload.serpapiKey or payload.serpapi_key or user_keys.get("serpapi_key", "") or os.environ.get("SERPAPI_KEY", "")).strip()
     serper_k = (payload.serperKey or payload.serper_key or user_keys.get("serper_key", "") or os.environ.get("SERPER_API_KEY", "")).strip()
 
@@ -1278,7 +1276,7 @@ def verify_collector_gemini(task_id: str, payload: Optional[VerifyGeminiPayload]
 
     user = get_current_user_optional(authorization)
     user_keys = database.get_user_keys(user["id"]) if user else {}
-    api_key = (payload.geminiApiKey if payload else None) or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")
+    api_key = (payload.geminiApiKey if payload else None) or user_keys.get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         raise HTTPException(status_code=400, detail="GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in Platform Settings.")
 
@@ -1332,7 +1330,7 @@ def verify_records_gemini(payload: VerifyRecordsPayload, authorization: Optional
 
     user = get_current_user_optional(authorization)
     user_keys = database.get_user_keys(user["id"]) if user else {}
-    api_key = payload.geminiApiKey or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")
+    api_key = payload.geminiApiKey or user_keys.get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         raise HTTPException(status_code=400, detail="GEMINI_API_KEY is missing. Please configure GEMINI_API_KEY in Platform Settings.")
     cleaned = audit_leads_with_gemini(records, api_key=api_key)
@@ -1351,7 +1349,7 @@ def parse_scraping_idea(payload: ParseIdeaPayload, authorization: Optional[str] 
 
     user = get_current_user_optional(authorization)
     user_keys = database.get_user_keys(user["id"]) if user else {}
-    key = (payload.geminiApiKey or user_keys.get("gemini_api_key", "") or (os.environ.get("GEMINI_API_KEY", "") if not user else "")).strip()
+    key = (payload.geminiApiKey or user_keys.get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")).strip()
     try:
         from gemini_query_expander import parse_scraping_idea_with_gemini
     except ImportError:
@@ -1585,11 +1583,11 @@ def get_decision_makers_config(authorization: Optional[str] = Header(None)):
     user = get_current_user_optional(authorization)
     user_keys = database.get_user_keys(user["id"]) if user else {}
 
-    serp_key = (user_keys.get("serpapi_key", "") or (os.environ.get("SERPAPI_KEY", "") if not user else "")).strip()
+    serp_key = (user_keys.get("serpapi_key", "") or os.environ.get("SERPAPI_KEY", "")).strip()
     serp_set = bool(serp_key and not serp_key.startswith("your_"))
     serp_masked = (serp_key[:4] + "..." + serp_key[-4:]) if serp_set and len(serp_key) > 8 else ("configured" if serp_set else "missing")
 
-    serper_key = (user_keys.get("serper_key", "") or (os.environ.get("SERPER_API_KEY", "") if not user else "")).strip()
+    serper_key = (user_keys.get("serper_key", "") or os.environ.get("SERPER_API_KEY", "")).strip()
     serper_set = bool(serper_key and not serper_key.startswith("your_"))
     serper_masked = (serper_key[:4] + "..." + serper_key[-4:]) if serper_set and len(serper_key) > 8 else ("configured" if serper_set else "missing")
 
@@ -1674,8 +1672,8 @@ def enrich_decision_makers(payload: DecisionMakerPayload, authorization: Optiona
     user_keys = database.get_user_keys(user["id"]) if user else {}
 
     engine = (payload.engine or user_keys.get("default_engine") or "serpapi").lower().strip()
-    serpapi_key = (payload.serpapiKey or user_keys.get("serpapi_key", "") or (os.environ.get("SERPAPI_KEY", "") if not user else "")).strip()
-    serper_key = (payload.serperKey or payload.serperApiKey or user_keys.get("serper_key", "") or (os.environ.get("SERPER_API_KEY", "") if not user else "")).strip()
+    serpapi_key = (payload.serpapiKey or user_keys.get("serpapi_key", "") or os.environ.get("SERPAPI_KEY", "")).strip()
+    serper_key = (payload.serperKey or payload.serperApiKey or user_keys.get("serper_key", "") or os.environ.get("SERPER_API_KEY", "")).strip()
 
     if engine == "serpapi" and not serpapi_key:
         user_msg = f" for account '{user['email']}'" if user else ""
@@ -1781,7 +1779,7 @@ def get_leadocean_config(authorization: Optional[str] = Header(None)):
     user_keys = database.get_user_keys(user["id"]) if user else {}
 
     cfg = load_leadocean_config()
-    api_key = (user_keys.get("leadocean_api_key", "") or (os.environ.get("LEADOCEAN_API_KEY", "") if not user else "")).strip()
+    api_key = (user_keys.get("leadocean_api_key", "") or os.environ.get("LEADOCEAN_API_KEY", "")).strip()
     is_set = bool(api_key and not api_key.startswith("your_"))
     masked = (api_key[:4] + "..." + api_key[-4:]) if is_set and len(api_key) > 8 else ("configured" if is_set else "missing")
     url = user_keys.get("leadocean_endpoint") or cfg.get("url", "https://api.leadocean.io/v1/people/enrich")
@@ -1857,7 +1855,7 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
     user_keys = database.get_user_keys(user["id"]) if user else {}
 
     cfg = load_leadocean_config()
-    api_key = (payload.apiKey or user_keys.get("leadocean_api_key", "") or (os.environ.get("LEADOCEAN_API_KEY", "") if not user else "")).strip()
+    api_key = (payload.apiKey or user_keys.get("leadocean_api_key", "") or os.environ.get("LEADOCEAN_API_KEY", "")).strip()
     delay = payload.delay or 0.3
     overwrite = bool(payload.overwrite)
 

@@ -563,24 +563,85 @@ export const KeywordLeadCollector: React.FC = () => {
     };
   }, []);
 
-  // Download Excel (works both during live scraping and after completion)
+  // Helper to programmatically trigger browser file download without popup blocker interference
+  const triggerDownload = (blob: Blob, name: string) => {
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.style.display = 'none';
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    }, 150);
+  };
+
+  // Instant client-side Excel file generation from in-memory records
+  const downloadClientXlsx = (data: any[], name: string) => {
+    const cleanRecords = data.map((r) => ({
+      ...r,
+      'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
+    }));
+    const ws = XLSX.utils.json_to_sheet(cleanRecords);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Profiles');
+    const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+    const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    triggerDownload(blob, name);
+  };
+
+  // Download Excel (works both during live scraping, after completion, or from history)
   const handleClientDownload = async () => {
     if (records.length === 0) {
       alert('No records available to download yet.');
       return;
     }
 
+    const cleanKw = (keywords[0] || 'leads').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const outName = fileName || `linkedin_profiles_${cleanKw}_${Date.now()}.xlsx`;
     const apiBase = getApiBaseUrl();
 
-    // If scraper is running or stopped, try exporting current snapshot from backend first
+    // 1. If backend generated a file URL, try downloading the binary blob
+    if (downloadUrl && apiBase) {
+      try {
+        const fileUrl = downloadUrl.startsWith('http')
+          ? downloadUrl
+          : `${apiBase}${downloadUrl.startsWith('/') ? '' : '/'}${downloadUrl}`;
+        const res = await fetch(fileUrl, {
+          headers: getAuthHeaders(),
+        });
+        if (res.ok) {
+          const blob = await res.blob();
+          triggerDownload(blob, outName);
+          return;
+        }
+      } catch (err) {
+        console.warn('Backend file download failed, falling back to snapshot/client XLSX:', err);
+      }
+    }
+
+    // 2. If scraper is running or stopped and taskId exists, request backend snapshot
     if (taskId && apiBase) {
       try {
-        const expRes = await fetch(`${apiBase}/api/collector/export-current/${taskId}`);
+        const expRes = await fetch(`${apiBase}/api/collector/export-current/${taskId}`, {
+          headers: getAuthHeaders(),
+        });
         if (expRes.ok) {
           const expData = await expRes.json();
           if (expData.downloadUrl) {
-            window.open(`${apiBase}${expData.downloadUrl}`, '_blank');
-            return;
+            const fileUrl = expData.downloadUrl.startsWith('http')
+              ? expData.downloadUrl
+              : `${apiBase}${expData.downloadUrl.startsWith('/') ? '' : '/'}${expData.downloadUrl}`;
+            const fileRes = await fetch(fileUrl, {
+              headers: getAuthHeaders(),
+            });
+            if (fileRes.ok) {
+              const blob = await fileRes.blob();
+              triggerDownload(blob, expData.fileName || outName);
+              return;
+            }
           }
         }
       } catch (err) {
@@ -588,21 +649,24 @@ export const KeywordLeadCollector: React.FC = () => {
       }
     }
 
-    if (downloadUrl && apiBase) {
-      window.open(`${apiBase}${downloadUrl}`, '_blank');
-      return;
+    // 3. Guaranteed instant client-side Excel file generation from in-memory records
+    try {
+      downloadClientXlsx(records, outName);
+    } catch (clientErr: any) {
+      console.error('Client XLSX export error:', clientErr);
+      try {
+        const cleanRecords = records.map((r) => ({
+          ...r,
+          'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
+        }));
+        const ws = XLSX.utils.json_to_sheet(cleanRecords);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'Profiles');
+        XLSX.writeFile(wb, outName);
+      } catch (e: any) {
+        alert(`Could not export sheet: ${clientErr.message}`);
+      }
     }
-
-    // Instant client-side Excel file generation
-    const cleanRecords = records.map((r) => ({
-      ...r,
-      'Profile URL': cleanLinkedInUrl(r['Profile URL'] || '', r['Full name'] || '', r['Company name'] || ''),
-    }));
-    const ws = XLSX.utils.json_to_sheet(cleanRecords);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Profiles');
-    const outName = fileName || `linkedin_profiles_${keywords[0] || 'leads'}_${Date.now()}.xlsx`;
-    XLSX.writeFile(wb, outName);
   };
 
   useEffect(() => {

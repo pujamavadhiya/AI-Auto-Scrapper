@@ -22,6 +22,11 @@ export const authService = {
         body: JSON.stringify({ email: email.trim(), password }),
       });
     } catch (netErr: any) {
+      if (isLocal) {
+        throw new Error(
+          `Local backend server is not running on ${apiBase}. Please start it by running "npm run server" in another terminal, or connect to the Cloud Backend.`
+        );
+      }
       throw new Error(
         `Unable to reach backend server at "${apiBase}". Please verify your backend is running and CORS is enabled.`
       );

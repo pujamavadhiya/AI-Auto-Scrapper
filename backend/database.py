@@ -148,6 +148,20 @@ def init_db():
                     "UPDATE users SET password_hash = ?, salt = ?, updated_at = ? WHERE email = ?",
                     (p_hash, salt, now_iso, u_clean_email),
                 )
+                user_id = existing[0]
+                # Backfill any empty user keys with server environment variables if available
+                env_defaults = [
+                    ("serpapi_key", os.environ.get("SERPAPI_KEY", "").strip()),
+                    ("serper_key", os.environ.get("SERPER_API_KEY", "").strip()),
+                    ("gemini_api_key", os.environ.get("GEMINI_API_KEY", "").strip()),
+                    ("leadocean_api_key", os.environ.get("LEADOCEAN_API_KEY", "").strip()),
+                ]
+                for col, val in env_defaults:
+                    if val:
+                        cur.execute(
+                            f"UPDATE user_keys SET {col} = ? WHERE user_id = ? AND ({col} IS NULL OR {col} = '')",
+                            (val, user_id),
+                        )
 
         conn.commit()
 

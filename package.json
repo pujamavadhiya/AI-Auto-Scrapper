@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "server": "./venv/bin/python backend/server.py",
+    "start": "./venv/bin/python backend/server.py",
     "test:python": "./venv/bin/python backend/test_linkedin_finder.py",
     "build": "tsc && vite build",
     "preview": "vite preview"

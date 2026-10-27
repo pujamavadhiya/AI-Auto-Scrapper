@@ -19,7 +19,7 @@ import { Settings } from './pages/Settings';
 export function App() {
   return (
     <AuthProvider>
-      <BrowserRouter>
+      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Routes>
           {/* Public Login Route (No signup form) */}
           <Route path="/login" element={<Login />} />
