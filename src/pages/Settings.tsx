@@ -1085,7 +1085,6 @@ export const Settings: React.FC = () => {
                   id="create-user-email-input"
                   type="email"
                   required
-                  placeholder="colleague@company.com"
                   value={newUserData.email}
                   onChange={(e) => setNewUserData({ ...newUserData, email: e.target.value })}
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
@@ -1097,7 +1096,6 @@ export const Settings: React.FC = () => {
                 <input
                   id="create-user-name-input"
                   type="text"
-                  placeholder="Jane Doe"
                   value={newUserData.name}
                   onChange={(e) => setNewUserData({ ...newUserData, name: e.target.value })}
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
@@ -1113,7 +1111,6 @@ export const Settings: React.FC = () => {
                   type="password"
                   required
                   minLength={6}
-                  placeholder="••••••••••••"
                   value={newUserData.password}
                   onChange={(e) => setNewUserData({ ...newUserData, password: e.target.value })}
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
@@ -1194,7 +1191,6 @@ export const Settings: React.FC = () => {
                 <label className="block font-semibold text-slate-700 mb-1">Display Name</label>
                 <input
                   type="text"
-                  placeholder="Jane Doe"
                   value={editUserData.name}
                   onChange={(e) => setEditUserData({ ...editUserData, name: e.target.value })}
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
@@ -1228,7 +1224,6 @@ export const Settings: React.FC = () => {
                 <input
                   type="password"
                   minLength={6}
-                  placeholder="Leave empty to keep unchanged"
                   value={editUserData.password || ''}
                   onChange={(e) => setEditUserData({ ...editUserData, password: e.target.value })}
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
@@ -1290,7 +1285,6 @@ export const Settings: React.FC = () => {
                   type="password"
                   required
                   minLength={6}
-                  placeholder="Enter new password (min 6 chars)"
                   value={newPasswordValue}
                   onChange={(e) => setNewPasswordValue(e.target.value)}
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
