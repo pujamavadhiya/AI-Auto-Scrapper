@@ -54,13 +54,25 @@ export const setCustomApiBaseUrl = (url: string | null): void => {
 
 export const getApiBaseUrl = (): string => {
   try {
-    // 1. Direct explicit API base URL override
+    // 1. If running locally in browser on localhost / 127.0.0.1, prioritize local backend unless explicitly custom
+    if (typeof window !== 'undefined') {
+      const host = window.location.hostname;
+      if (host === 'localhost' || host === '127.0.0.1') {
+        const explicitUrl = localStorage.getItem(API_BASE_URL_STORAGE_KEY);
+        if (explicitUrl && explicitUrl.trim() && !explicitUrl.includes('onrender.com')) {
+          return explicitUrl.trim().replace(/\/+$/, '');
+        }
+        return 'http://127.0.0.1:8000';
+      }
+    }
+
+    // 2. Direct explicit API base URL override
     const explicitUrl = localStorage.getItem(API_BASE_URL_STORAGE_KEY);
     if (explicitUrl && explicitUrl.trim()) {
       return explicitUrl.trim().replace(/\/+$/, '');
     }
 
-    // 2. Check user configured endpoint in Settings (saved in localStorage)
+    // 3. Check user configured endpoint in Settings (saved in localStorage)
     const rawStorage = localStorage.getItem('leadpulse_app_settings');
     if (rawStorage) {
       const parsed = JSON.parse(rawStorage);
@@ -73,18 +85,10 @@ export const getApiBaseUrl = (): string => {
     // ignore json parse error
   }
 
-  // 3. Check Vite build-time environment variable
+  // 4. Check Vite build-time environment variable
   const envUrl = (import.meta as any).env?.VITE_API_URL;
   if (envUrl && typeof envUrl === 'string' && envUrl.trim()) {
     return envUrl.trim().replace(/\/+$/, '');
-  }
-
-  // 4. Fallback for local development
-  if (typeof window !== 'undefined') {
-    const host = window.location.hostname;
-    if (host === 'localhost' || host === '127.0.0.1') {
-      return 'http://127.0.0.1:8000';
-    }
   }
 
   // 5. Default production backend fallback for deployed Vercel

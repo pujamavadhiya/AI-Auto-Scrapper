@@ -174,6 +174,28 @@ class AdminDeleteUserPayload(BaseModel):
     email: str
 
 
+class AdminUpdateUserPayload(BaseModel):
+    email: str
+    name: Optional[str] = None
+    role: Optional[str] = None
+    password: Optional[str] = None
+
+
+class ProjectPayload(BaseModel):
+    id: Optional[str] = None
+    name: str
+    description: Optional[str] = ""
+    moduleType: Optional[str] = "decision-maker"
+    records: Optional[List[Dict[str, Any]]] = []
+    config: Optional[Dict[str, Any]] = {}
+    status: Optional[str] = "completed"
+    sourceFileName: Optional[str] = ""
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    totalRecords: Optional[int] = None
+    enrichedRecords: Optional[int] = None
+
+
 def get_current_user_optional(authorization: Optional[str] = Header(None)) -> Optional[Dict[str, Any]]:
     """Resolves authenticated user from Bearer token if present."""
     if not authorization:
@@ -263,35 +285,36 @@ def update_user_keys_endpoint(payload: UserKeyUpdatePayload, authorization: Opti
     }
 
 
-def require_puja_admin(user: Dict[str, Any]) -> None:
+def require_admin(user: Dict[str, Any]) -> None:
     """
-    Restricts access to user and team management exclusively to user Puja (puja@gmail.com).
-    Raises HTTP 403 Forbidden for any other user.
+    Restricts access to user and team management exclusively to administrators.
+    Allows users with role='admin' or Puja (puja@gmail.com).
+    Raises HTTP 403 Forbidden for regular users.
     """
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required.")
+    role = (user.get("role") or "").strip().lower()
     email = (user.get("email") or "").strip().lower()
-    name = (user.get("name") or "").strip().lower()
-    if email != "puja@gmail.com" and name != "puja":
+    if role != "admin" and email != "puja@gmail.com":
         raise HTTPException(
             status_code=403,
-            detail="Access denied. Only Puja has access to view or manage team members and user accounts."
+            detail="Access denied. Administrator privileges are required to view or manage user accounts."
         )
 
 
 @app.get("/api/admin/users")
 def admin_list_users(authorization: Optional[str] = Header(None)):
-    """Lists all users for team management - restricted strictly to user Puja."""
+    """Lists all users for team management - restricted to administrators."""
     user = get_current_user(authorization)
-    require_puja_admin(user)
+    require_admin(user)
     return {"status": "ok", "users": database.list_users()}
 
 
 @app.post("/api/admin/users/create")
 def admin_create_user(payload: AdminCreateUserPayload, authorization: Optional[str] = Header(None)):
-    """Creates a new user directly from the web interface - restricted strictly to user Puja."""
+    """Creates a new user directly from the web interface - restricted to administrators."""
     user = get_current_user(authorization)
-    require_puja_admin(user)
+    require_admin(user)
     clean_email = payload.email.strip().lower()
     try:
         new_user = database.create_user(
@@ -312,11 +335,35 @@ def admin_create_user(payload: AdminCreateUserPayload, authorization: Optional[s
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/api/admin/users/update")
+def admin_update_user(payload: AdminUpdateUserPayload, authorization: Optional[str] = Header(None)):
+    """Updates user details (name, role, password) - restricted to administrators."""
+    user = get_current_user(authorization)
+    require_admin(user)
+    clean_email = payload.email.strip().lower()
+    if clean_email == "puja@gmail.com" and payload.role and payload.role != "admin":
+        raise HTTPException(status_code=400, detail="Cannot revoke admin privileges from the primary admin account Puja.")
+    try:
+        ok = database.update_user(
+            email=clean_email,
+            name=payload.name,
+            role=payload.role,
+            new_password=payload.password
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail="User not found.")
+        return {"status": "ok", "message": f"User {clean_email} updated successfully."}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.post("/api/admin/users/change-password")
 def admin_change_password(payload: AdminChangePasswordPayload, authorization: Optional[str] = Header(None)):
-    """Updates password for a user - restricted strictly to user Puja."""
+    """Updates password for a user - restricted to administrators."""
     user = get_current_user(authorization)
-    require_puja_admin(user)
+    require_admin(user)
     try:
         ok = database.update_user_password(payload.email, payload.password)
         if not ok:
@@ -328,15 +375,44 @@ def admin_change_password(payload: AdminChangePasswordPayload, authorization: Op
 
 @app.post("/api/admin/users/delete")
 def admin_delete_user(payload: AdminDeleteUserPayload, authorization: Optional[str] = Header(None)):
-    """Deletes a user account - restricted strictly to user Puja."""
+    """Deletes a user account - restricted to administrators."""
     user = get_current_user(authorization)
-    require_puja_admin(user)
-    if user["email"].lower() == payload.email.lower():
+    require_admin(user)
+    clean_email = payload.email.strip().lower()
+    if user["email"].lower() == clean_email:
         raise HTTPException(status_code=400, detail="Cannot delete your own active account.")
-    ok = database.delete_user(payload.email)
+    if clean_email == "puja@gmail.com":
+        raise HTTPException(status_code=400, detail="Cannot delete the primary admin account Puja.")
+    ok = database.delete_user(clean_email)
     if not ok:
         raise HTTPException(status_code=404, detail="User not found.")
-    return {"status": "ok", "message": f"User {payload.email} deleted successfully."}
+    return {"status": "ok", "message": f"User {clean_email} deleted successfully."}
+
+
+@app.get("/api/projects")
+def get_projects_endpoint(authorization: Optional[str] = Header(None)):
+    """Returns all saved projects for the authenticated user, restoring work history across logins."""
+    user = get_current_user(authorization)
+    projects = database.get_user_projects(user["id"])
+    return {"status": "ok", "projects": projects}
+
+
+@app.post("/api/projects")
+def save_project_endpoint(payload: ProjectPayload, authorization: Optional[str] = Header(None)):
+    """Saves or updates a project for the authenticated user."""
+    user = get_current_user(authorization)
+    saved = database.save_user_project(user["id"], payload.model_dump())
+    return {"status": "ok", "project": saved}
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project_endpoint(project_id: str, authorization: Optional[str] = Header(None)):
+    """Deletes a project belonging to authenticated user."""
+    user = get_current_user(authorization)
+    ok = database.delete_user_project(user["id"], project_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return {"status": "ok", "message": "Project deleted successfully."}
 
 
 class SaveHistoryPayload(BaseModel):

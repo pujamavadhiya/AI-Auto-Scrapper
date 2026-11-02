@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import {
   FolderGit2,
@@ -24,6 +24,12 @@ export const AllProjects: React.FC = () => {
   const [projects, setProjects] = useState<Project[]>(() => storageService.getProjects());
   const [searchTerm, setSearchTerm] = useState('');
   const [moduleFilter, setModuleFilter] = useState<string>('all');
+
+  useEffect(() => {
+    storageService.syncProjectsWithBackend().then((synced) => {
+      setProjects(synced);
+    });
+  }, []);
 
   const filteredProjects = projects.filter((p) => {
     if (searchTerm) {

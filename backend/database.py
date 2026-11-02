@@ -89,11 +89,33 @@ def init_db():
             ON search_history (user_id, created_at DESC);
         """)
 
-        # Auto-seed predefined admin/team users automatically without requiring shell access
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_projects (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                module_type TEXT NOT NULL,
+                records_json TEXT NOT NULL,
+                config_json TEXT DEFAULT '{}',
+                status TEXT DEFAULT 'completed',
+                total_records INTEGER DEFAULT 0,
+                enriched_records INTEGER DEFAULT 0,
+                source_file_name TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_projects_user_date
+            ON user_projects (user_id, updated_at DESC);
+        """)
+
+        # Auto-seed predefined admin user Puja (only Puja, no hardcoded Dhruv or admin user)
         seed_users = [
             ("puja@gmail.com", "Puja@1234", "Puja", "admin"),
-            ("dhruv@gmail.com", "Dhruv@1234", "Dhruv", "admin"),
-            ("admin@example.com", "password123", "Admin User", "admin"),
         ]
 
         # Also support custom environment variable: INITIAL_USERS="email:pass:name:role,email2:pass2:name2"
@@ -141,14 +163,12 @@ def init_db():
                     ),
                 )
             else:
-                # User exists: update password to match seed password so changing it here or via env works immediately
-                salt = secrets.token_hex(16)
-                p_hash, _ = hash_password(u_pass, salt)
-                cur.execute(
-                    "UPDATE users SET password_hash = ?, salt = ?, updated_at = ? WHERE email = ?",
-                    (p_hash, salt, now_iso, u_clean_email),
-                )
                 user_id = existing[0]
+                # User exists: ensure role and name are kept in sync with seed definition (e.g. role='admin' for Puja)
+                cur.execute(
+                    "UPDATE users SET role = ?, name = ?, updated_at = ? WHERE email = ?",
+                    (u_role, u_name, now_iso, u_clean_email),
+                )
                 # Backfill any empty user keys with server environment variables if available
                 env_defaults = [
                     ("serpapi_key", os.environ.get("SERPAPI_KEY", "").strip()),
@@ -162,6 +182,64 @@ def init_db():
                             f"UPDATE user_keys SET {col} = ? WHERE user_id = ? AND ({col} IS NULL OR {col} = '')",
                             (val, user_id),
                         )
+
+        # -------------------------------------------------------------
+        # Data Migration & Cleanup:
+        # 1. Ensure puja@gmail.com is strictly an admin
+        # 2. Reassign search_history and keys from old accounts (admin@example.com, dhruv@gmail.com, user2@example.com) to Puja
+        # 3. Delete preexisting users except Puja
+        # 4. Restore search_history into user_projects for Puja if user_projects is empty
+        # -------------------------------------------------------------
+        cur.execute("SELECT id FROM users WHERE email = 'puja@gmail.com'")
+        puja_row = cur.fetchone()
+        if puja_row:
+            puja_id = puja_row["id"]
+            cur.execute("UPDATE users SET role = 'admin', name = 'Puja' WHERE id = ?", (puja_id,))
+
+            # Find old accounts to remove
+            cur.execute("SELECT id, email FROM users WHERE email IN ('admin@example.com', 'dhruv@gmail.com', 'user2@example.com')")
+            old_users = cur.fetchall()
+            for old_u in old_users:
+                old_id = old_u["id"]
+                # Reassign history so no user data is lost
+                cur.execute("UPDATE search_history SET user_id = ? WHERE user_id = ?", (puja_id, old_id))
+                cur.execute("UPDATE user_projects SET user_id = ? WHERE user_id = ?", (puja_id, old_id))
+                cur.execute("DELETE FROM sessions WHERE user_id = ?", (old_id,))
+                cur.execute("DELETE FROM user_keys WHERE user_id = ?", (old_id,))
+                cur.execute("DELETE FROM users WHERE id = ?", (old_id,))
+
+            # Backfill projects from search history for Puja if projects is empty
+            cur.execute("SELECT COUNT(*) FROM user_projects WHERE user_id = ?", (puja_id,))
+            proj_count = cur.fetchone()[0]
+            if proj_count == 0:
+                cur.execute(
+                    """
+                    SELECT id, module_type, search_query, record_count, enriched_count, results_json, filters_json, status, created_at, updated_at
+                    FROM search_history WHERE user_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (puja_id,)
+                )
+                for hr in cur.fetchall():
+                    p_id = f"proj-{hr['id']}"
+                    module_name = hr["module_type"].replace("-", " ").title()
+                    p_name = f"{hr['search_query']} ({module_name})"
+                    p_desc = f"Extracted leads from {module_name}: '{hr['search_query']}'"
+                    cur.execute(
+                        """
+                        INSERT OR IGNORE INTO user_projects (
+                            id, user_id, name, description, module_type,
+                            records_json, config_json, status, total_records,
+                            enriched_records, source_file_name, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            p_id, puja_id, p_name, p_desc, hr["module_type"],
+                            hr["results_json"], hr["filters_json"] or "{}", hr["status"] or "completed",
+                            hr["record_count"] or 0, hr["enriched_count"] or 0, "", hr["created_at"], hr["updated_at"]
+                        )
+                    )
 
         conn.commit()
 
@@ -437,7 +515,7 @@ def delete_user(email: str) -> bool:
     """Deletes a user by email."""
     clean_email = email.strip().lower()
     with get_db_connection() as conn:
-        cur = conn.execute("DELETE FROM users WHERE email = ?", (clean_email,))
+        cur = conn.execute("DELETE FROM users WHERE email = ? COLLATE NOCASE", (clean_email,))
         conn.commit()
         return cur.rowcount > 0
 
@@ -456,10 +534,55 @@ def update_user_password(email: str, new_password: str) -> bool:
             """
             UPDATE users
             SET password_hash = ?, salt = ?, updated_at = ?
-            WHERE email = ?
+            WHERE email = ? COLLATE NOCASE
             """,
             (pwd_hash, salt, now, clean_email)
         )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def update_user(
+    email: str,
+    name: Optional[str] = None,
+    role: Optional[str] = None,
+    new_password: Optional[str] = None
+) -> bool:
+    """Updates user name, role, and/or password."""
+    clean_email = email.strip().lower()
+    now = datetime.now(timezone.utc).isoformat()
+    updates = []
+    params = []
+
+    if name is not None:
+        updates.append("name = ?")
+        params.append(name.strip())
+
+    if role is not None:
+        clean_role = role.strip().lower()
+        if clean_role not in ("admin", "user"):
+            clean_role = "user"
+        updates.append("role = ?")
+        params.append(clean_role)
+
+    if new_password:
+        if len(new_password) < 6:
+            raise ValueError("Password must be at least 6 characters.")
+        p_hash, salt = hash_password(new_password)
+        updates.append("password_hash = ?")
+        params.append(p_hash)
+        updates.append("salt = ?")
+        params.append(salt)
+
+    if not updates:
+        return True
+
+    updates.append("updated_at = ?")
+    params.append(now)
+    params.append(clean_email)
+
+    with get_db_connection() as conn:
+        cur = conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE email = ? COLLATE NOCASE", params)
         conn.commit()
         return cur.rowcount > 0
 
@@ -646,6 +769,138 @@ def clear_user_search_history(user_id: str) -> int:
         )
         conn.commit()
         return cur.rowcount
+
+
+def save_user_project(user_id: str, project: Dict[str, Any]) -> Dict[str, Any]:
+    """Saves or updates a project belonging to user_id."""
+    proj_id = project.get("id") or f"proj-{int(datetime.now(timezone.utc).timestamp()*1000)}"
+    name = project.get("name") or "Untitled Project"
+    description = project.get("description") or ""
+    module_type = project.get("moduleType") or "decision-maker"
+    records = project.get("records") or []
+    config = project.get("config") or {}
+    status = project.get("status") or "completed"
+    source_file_name = project.get("sourceFileName") or ""
+    now = datetime.now(timezone.utc).isoformat()
+    created_at = project.get("createdAt") or now
+    updated_at = project.get("updatedAt") or now
+    total_records = project.get("totalRecords") or len(records)
+    enriched_records = project.get("enrichedRecords") or sum(
+        1 for r in records if r.get("enrichmentStatus") == "enriched" or r.get("linkedinUrl") or r.get("email")
+    )
+
+    records_json = json.dumps(records, ensure_ascii=False)
+    config_json = json.dumps(config, ensure_ascii=False)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_projects (
+                id, user_id, name, description, module_type,
+                records_json, config_json, status, total_records,
+                enriched_records, source_file_name, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                description = excluded.description,
+                module_type = excluded.module_type,
+                records_json = excluded.records_json,
+                config_json = excluded.config_json,
+                status = excluded.status,
+                total_records = excluded.total_records,
+                enriched_records = excluded.enriched_records,
+                source_file_name = excluded.source_file_name,
+                updated_at = excluded.updated_at
+            """,
+            (
+                proj_id, user_id, name, description, module_type,
+                records_json, config_json, status, total_records,
+                enriched_records, source_file_name, created_at, updated_at
+            )
+        )
+        conn.commit()
+
+    return {
+        "id": proj_id,
+        "name": name,
+        "description": description,
+        "moduleType": module_type,
+        "records": records,
+        "config": config,
+        "status": status,
+        "totalRecords": total_records,
+        "enrichedRecords": enriched_records,
+        "sourceFileName": source_file_name,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    }
+
+
+def get_user_projects(user_id: str) -> List[Dict[str, Any]]:
+    """Retrieves all projects saved by user_id."""
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, description, module_type, records_json,
+                   config_json, status, total_records, enriched_records,
+                   source_file_name, created_at, updated_at
+            FROM user_projects
+            WHERE user_id = ?
+            ORDER BY updated_at DESC
+            """,
+            (user_id,)
+        ).fetchall()
+
+        results = []
+        for r in rows:
+            try:
+                records = json.loads(r["records_json"]) if r["records_json"] else []
+            except Exception:
+                records = []
+            try:
+                config = json.loads(r["config_json"]) if r["config_json"] else {}
+            except Exception:
+                config = {}
+
+            results.append({
+                "id": r["id"],
+                "name": r["name"],
+                "description": r["description"],
+                "moduleType": r["module_type"],
+                "records": records,
+                "config": config,
+                "status": r["status"],
+                "totalRecords": r["total_records"],
+                "enrichedRecords": r["enriched_records"],
+                "sourceFileName": r["source_file_name"],
+                "createdAt": r["created_at"],
+                "updatedAt": r["updated_at"],
+            })
+        return results
+
+
+def delete_user_project(user_id: str, project_id: str) -> bool:
+    """Deletes a specific project belonging to user_id."""
+    with get_db_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM user_projects WHERE id = ? AND user_id = ?",
+            (project_id, user_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def sync_user_projects(user_id: str, projects: List[Dict[str, Any]]) -> int:
+    """Batch imports/synchronizes multiple projects for user_id."""
+    count = 0
+    for p in projects:
+        try:
+            save_user_project(user_id, p)
+            count += 1
+        except Exception:
+            pass
+    return count
 
 
 # Automatically run table migrations upon import

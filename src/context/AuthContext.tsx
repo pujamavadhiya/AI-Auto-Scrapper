@@ -14,20 +14,28 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
   // Sync isolated keys with storageService so UI components immediately reflect user's settings
-  const syncSettingsWithKeys = (k: UserApiKeys) => {
-    storageService.saveSettings({
-      serpApiKey: k.serpapi_key || '',
-      serperApiKey: k.serper_key || '',
-      geminiApiKey: k.gemini_api_key || '',
-      leadoceanApiKey: k.leadocean_api_key || '',
-      leadoceanEndpoint: k.leadocean_endpoint || 'https://api.leadocean.io/v1/people/enrich',
-      defaultDecisionMakerEngine: (k.default_engine as 'serpapi' | 'serper') || 'serpapi',
-    });
+  const syncSettingsWithKeys = (k: UserApiKeys, currentUserId?: string | null) => {
+    if (currentUserId !== undefined) {
+      storageService.setUserId(currentUserId);
+    }
+    const settingsUpdate: any = {};
+    if (k.serpapi_key !== undefined) settingsUpdate.serpApiKey = k.serpapi_key;
+    if (k.serper_key !== undefined) settingsUpdate.serperApiKey = k.serper_key;
+    if (k.gemini_api_key !== undefined) settingsUpdate.geminiApiKey = k.gemini_api_key;
+    if (k.leadocean_api_key !== undefined) settingsUpdate.leadoceanApiKey = k.leadocean_api_key;
+    if (k.leadocean_endpoint !== undefined) settingsUpdate.leadoceanEndpoint = k.leadocean_endpoint || 'https://api.leadocean.io/v1/people/enrich';
+    if (k.default_engine !== undefined) settingsUpdate.defaultDecisionMakerEngine = (k.default_engine as 'serpapi' | 'serper') || 'serpapi';
+    if (k.openai_api_key !== undefined) settingsUpdate.openAiApiKey = k.openai_api_key;
+
+    storageService.saveSettings(settingsUpdate);
+    // Asynchronously restore user projects from backend database into local workspace
+    storageService.syncProjectsWithBackend().catch(() => {});
   };
 
   const refreshAuth = async () => {
     const currentToken = getAuthToken();
     if (!currentToken) {
+      storageService.setUserId(null);
       setUser(null);
       setKeys({});
       setIsAuthenticated(false);
@@ -37,12 +45,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
     try {
       const data = await authService.getMe();
+      storageService.setUserId(data.user.id);
       setUser(data.user);
       setKeys(data.keys);
       setIsAuthenticated(true);
       setTokenState(currentToken);
-      syncSettingsWithKeys(data.keys);
+      syncSettingsWithKeys(data.keys, data.user.id);
     } catch {
+      storageService.setUserId(null);
       setUser(null);
       setKeys({});
       setAuthToken(null);
@@ -60,11 +70,12 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const login = async (email: string, password: string): Promise<{ success: boolean; error?: string }> => {
     try {
       const data = await authService.login(email, password);
+      storageService.setUserId(data.user.id);
       setUser(data.user);
       setKeys(data.keys || {});
       setTokenState(data.token);
       setIsAuthenticated(true);
-      syncSettingsWithKeys(data.keys || {});
+      syncSettingsWithKeys(data.keys || {}, data.user.id);
       return { success: true };
     } catch (err: any) {
       return { success: false, error: err.message || 'Login failed' };
@@ -75,6 +86,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     try {
       await authService.logout();
     } finally {
+      storageService.setUserId(null);
       setUser(null);
       setKeys({});
       setTokenState(null);

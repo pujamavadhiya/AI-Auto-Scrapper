@@ -26,6 +26,7 @@ import {
   X,
   Lock,
   RefreshCw,
+  UserCog,
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -46,6 +47,7 @@ export const Settings: React.FC = () => {
   const [loadingUsers, setLoadingUsers] = useState(false);
   const [isCreateUserModalOpen, setIsCreateUserModalOpen] = useState(false);
   const [newUserData, setNewUserData] = useState({ email: '', password: '', name: '', role: 'user' });
+  const [editUserData, setEditUserData] = useState<{ email: string; name: string; role: string; password?: string } | null>(null);
   const [userActionError, setUserActionError] = useState<string | null>(null);
   const [userActionSuccess, setUserActionSuccess] = useState<string | null>(null);
   const [passwordModalUser, setPasswordModalUser] = useState<string | null>(null);
@@ -62,6 +64,7 @@ export const Settings: React.FC = () => {
         leadoceanApiKey: authKeys.leadocean_api_key || prev.leadoceanApiKey,
         leadoceanEndpoint: authKeys.leadocean_endpoint || prev.leadoceanEndpoint,
         defaultDecisionMakerEngine: authKeys.default_engine || prev.defaultDecisionMakerEngine,
+        openAiApiKey: authKeys.openai_api_key || prev.openAiApiKey,
       }));
     }
   }, [authKeys]);
@@ -78,15 +81,16 @@ export const Settings: React.FC = () => {
     message: '',
   });
 
-  // User management is strictly restricted to user Puja
-  const isPuja = !!(
+  // User management is available to all admin accounts (including Puja and any admin added)
+  const isAdmin = !!(
     user &&
-    (user.email?.trim().toLowerCase() === 'puja@gmail.com' ||
+    (user.role === 'admin' ||
+     user.email?.trim().toLowerCase() === 'puja@gmail.com' ||
      user.name?.trim().toLowerCase() === 'puja')
   );
 
   const loadTeamUsers = async () => {
-    if (!isPuja) return;
+    if (!isAdmin) return;
     setLoadingUsers(true);
     try {
       const list = await authService.listUsers();
@@ -99,10 +103,30 @@ export const Settings: React.FC = () => {
   };
 
   useEffect(() => {
-    if (isPuja) {
+    if (isAdmin) {
       loadTeamUsers();
     }
-  }, [isPuja]);
+  }, [isAdmin]);
+
+  const handleEditUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editUserData) return;
+    setUserActionError(null);
+    setUserActionSuccess(null);
+    try {
+      await authService.updateUser({
+        email: editUserData.email,
+        name: editUserData.name,
+        role: editUserData.role,
+        password: editUserData.password?.trim() ? editUserData.password.trim() : undefined,
+      });
+      setUserActionSuccess(`User "${editUserData.email}" updated successfully!`);
+      setEditUserData(null);
+      loadTeamUsers();
+    } catch (err: any) {
+      setUserActionError(err.message || 'Failed to update user.');
+    }
+  };
 
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -171,7 +195,7 @@ export const Settings: React.FC = () => {
 
     if (Object.keys(backendKeys).length > 0) {
       await updateKeys(backendKeys);
-      if (isPuja) {
+      if (isAdmin) {
         loadTeamUsers();
       }
     }
@@ -848,8 +872,8 @@ export const Settings: React.FC = () => {
         </CardContent>
       </Card>
 
-      {/* User & Team Account Management (Strictly restricted to user Puja) */}
-      {isPuja && (
+      {/* User & Team Account Management (Available to Admins including Puja) */}
+      {isAdmin && (
         <Card className="border-blue-100 shadow-xs">
         <CardHeader className="p-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
@@ -973,6 +997,25 @@ export const Settings: React.FC = () => {
                               onClick={() => {
                                 setUserActionError(null);
                                 setUserActionSuccess(null);
+                                setEditUserData({
+                                  email: u.email,
+                                  name: u.name || '',
+                                  role: u.role || 'user',
+                                  password: '',
+                                });
+                              }}
+                              className="h-7 px-2 text-[11px] text-slate-700 hover:text-blue-700 hover:border-blue-300"
+                              title="Edit user details"
+                            >
+                              <UserCog className="w-3 h-3 mr-1 text-blue-600" />
+                              Edit
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                setUserActionError(null);
+                                setUserActionSuccess(null);
                                 setPasswordModalUser(u.email);
                                 setNewPasswordValue('');
                               }}
@@ -1009,8 +1052,8 @@ export const Settings: React.FC = () => {
       </Card>
       )}
 
-      {/* Modal: Create User (Web-based Admin - Strictly Puja) */}
-      {isPuja && isCreateUserModalOpen && (
+      {/* Modal: Create User (Admins) */}
+      {isAdmin && isCreateUserModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
           <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
             <div className="p-5 border-b border-slate-100 flex items-center justify-between">
@@ -1078,16 +1121,19 @@ export const Settings: React.FC = () => {
               </div>
 
               <div>
-                <label className="block font-semibold text-slate-700 mb-1">Role</label>
+                <label className="block font-semibold text-slate-700 mb-1">Role & Permissions</label>
                 <select
                   id="create-user-role-select"
                   value={newUserData.role}
                   onChange={(e) => setNewUserData({ ...newUserData, role: e.target.value })}
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
                 >
-                  <option value="user">User (Standard Access)</option>
-                  <option value="admin">Admin (User Management Access)</option>
+                  <option value="user">User (Standard Access - Cannot access other users)</option>
+                  <option value="admin">Admin (Full Access - Can add, update & delete users)</option>
                 </select>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Users with Admin access can manage team members, change passwords, and configure accounts.
+                </p>
               </div>
 
               <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
@@ -1109,8 +1155,106 @@ export const Settings: React.FC = () => {
         </div>
       )}
 
-      {/* Modal: Change Password (Web-based Admin - Strictly Puja) */}
-      {isPuja && passwordModalUser && (
+      {/* Modal: Edit User (Admins) */}
+      {isAdmin && editUserData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <UserCog className="w-5 h-5 text-blue-600" />
+                <h3 className="font-bold text-slate-900 text-sm">Edit User Account</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditUserData(null)}
+                className="text-slate-400 hover:text-slate-600 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleEditUser} className="p-5 space-y-3.5 text-xs">
+              {userActionError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center gap-2">
+                  <X className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{userActionError}</span>
+                </div>
+              )}
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Email Address</label>
+                <input
+                  type="email"
+                  disabled
+                  value={editUserData.email}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-mono bg-slate-50 text-slate-500 cursor-not-allowed"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Display Name</label>
+                <input
+                  type="text"
+                  placeholder="Jane Doe"
+                  value={editUserData.name}
+                  onChange={(e) => setEditUserData({ ...editUserData, name: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Role & Permissions</label>
+                <select
+                  value={editUserData.role}
+                  onChange={(e) => setEditUserData({ ...editUserData, role: e.target.value })}
+                  disabled={editUserData.email.toLowerCase() === 'puja@gmail.com'}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 disabled:bg-slate-50 disabled:cursor-not-allowed"
+                >
+                  <option value="user">User (Standard Access - Cannot access other users)</option>
+                  <option value="admin">Admin (Full Access - Can add, update & delete users)</option>
+                </select>
+                {editUserData.email.toLowerCase() === 'puja@gmail.com' ? (
+                  <p className="text-[10px] text-amber-600 mt-1">Puja is the primary administrator account.</p>
+                ) : (
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Promoting to Admin gives access to manage all team accounts. Changing to User restricts access to their own data only.
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">
+                  New Password <span className="text-slate-400 font-normal">(leave blank to keep current)</span>
+                </label>
+                <input
+                  type="password"
+                  minLength={6}
+                  placeholder="Leave empty to keep unchanged"
+                  value={editUserData.password || ''}
+                  onChange={(e) => setEditUserData({ ...editUserData, password: e.target.value })}
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500/20"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setEditUserData(null)}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" size="sm" className="bg-blue-600 hover:bg-blue-700 text-white font-semibold cursor-pointer">
+                  Save Changes
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Change Password (Admins) */}
+      {isAdmin && passwordModalUser && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
           <div className="w-full max-w-sm bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
             <div className="p-5 border-b border-slate-100 flex items-center justify-between">

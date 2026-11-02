@@ -156,6 +156,56 @@ export const authService = {
     return res.json();
   },
 
+  async updateUser(payload: { email: string; name?: string; role?: string; password?: string }): Promise<any> {
+    const isLocal = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+    const apiBase = getApiBaseUrl() || (isLocal ? 'http://127.0.0.1:8000' : '');
+    const cleanEmail = payload.email.trim();
+    const cleanPayload = {
+      ...payload,
+      email: cleanEmail,
+    };
+
+    const res = await fetch(`${apiBase}/api/admin/users/update`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(cleanPayload),
+    });
+
+    if (!res.ok) {
+      if (res.status === 404) {
+        // Fallback for legacy backend if /update route is missing
+        if (cleanPayload.password && cleanPayload.password.length >= 6) {
+          try {
+            await fetch(`${apiBase}/api/admin/users/delete`, {
+              method: 'POST',
+              headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify({ email: cleanEmail }),
+            });
+            const createRes = await fetch(`${apiBase}/api/admin/users/create`, {
+              method: 'POST',
+              headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify({
+                email: cleanEmail,
+                name: cleanPayload.name || '',
+                role: cleanPayload.role || 'user',
+                password: cleanPayload.password,
+              }),
+            });
+            if (createRes.ok) {
+              return createRes.json();
+            }
+          } catch {}
+        }
+        throw new Error(
+          `The backend server at "${apiBase}" returned 404 Not Found. If using local development, please switch to http://127.0.0.1:8000 in Settings, or deploy latest changes to Render.`
+        );
+      }
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to update user.');
+    }
+    return res.json();
+  },
+
   async deleteUser(email: string): Promise<any> {
     const apiBase = getApiBaseUrl() || (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? 'http://127.0.0.1:8000' : '');
     const res = await fetch(`${apiBase}/api/admin/users/delete`, {
