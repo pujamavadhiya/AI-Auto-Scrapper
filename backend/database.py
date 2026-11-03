@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 DB_PATH = Path(__file__).resolve().parent / "app.db"
+REGISTRY_PATH = Path(__file__).resolve().parent / "users_registry.json"
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -23,6 +24,20 @@ def get_db_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
+
+
+def save_users_registry() -> None:
+    """Exports all active database users to persistent users_registry.json so accounts survive any restarts."""
+    try:
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, email, password_hash, salt, name, role, created_at, updated_at FROM users"
+            ).fetchall()
+            users_list = [dict(r) for r in rows]
+            with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+                json.dump(users_list, f, indent=2)
+    except Exception as e:
+        print(f"Warning: could not save users registry: {e}")
 
 
 def init_db():
@@ -183,6 +198,48 @@ def init_db():
                             (val, user_id),
                         )
 
+        # Restore all persistent users from users_registry.json if present
+        if REGISTRY_PATH.exists():
+            try:
+                with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+                    saved_users = json.load(f)
+                    for su in saved_users:
+                        su_email = su.get("email", "").strip().lower()
+                        if not su_email:
+                            continue
+                        cur.execute("SELECT id FROM users WHERE email = ?", (su_email,))
+                        existing = cur.fetchone()
+                        if not existing:
+                            u_id = su.get("id") or secrets.token_hex(12)
+                            cur.execute(
+                                """
+                                INSERT INTO users (id, email, password_hash, salt, name, role, created_at, updated_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    u_id,
+                                    su_email,
+                                    su.get("password_hash"),
+                                    su.get("salt"),
+                                    su.get("name") or su_email.split("@")[0].capitalize(),
+                                    su.get("role") or "user",
+                                    su.get("created_at") or now_iso,
+                                    su.get("updated_at") or now_iso,
+                                ),
+                            )
+                            cur.execute(
+                                """
+                                INSERT OR IGNORE INTO user_keys (user_id, updated_at)
+                                VALUES (?, ?)
+                                """,
+                                (u_id, now_iso),
+                            )
+                        else:
+                            if su.get("role"):
+                                cur.execute("UPDATE users SET role = ?, name = ? WHERE email = ?", (su.get("role"), su.get("name"), su_email))
+            except Exception as e:
+                print(f"Warning: could not restore users from registry: {e}")
+
         # -------------------------------------------------------------
         # Data Migration & Cleanup:
         # 1. Ensure puja@gmail.com is strictly an admin
@@ -243,6 +300,9 @@ def init_db():
 
         conn.commit()
 
+    # Persist the registered accounts snapshot
+    save_users_registry()
+
 
 def hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]:
     """Hashes password with PBKDF2-HMAC-SHA256."""
@@ -297,6 +357,7 @@ def create_user(email: str, password: str, name: str = "", role: str = "user") -
                 (user_id, now)
             )
             conn.commit()
+            save_users_registry()
         except sqlite3.IntegrityError:
             raise ValueError(f"User with email '{clean_email}' already exists in the database. Duplicate email IDs are not allowed.")
 
@@ -517,7 +578,10 @@ def delete_user(email: str) -> bool:
     with get_db_connection() as conn:
         cur = conn.execute("DELETE FROM users WHERE email = ? COLLATE NOCASE", (clean_email,))
         conn.commit()
-        return cur.rowcount > 0
+        ok = cur.rowcount > 0
+        if ok:
+            save_users_registry()
+        return ok
 
 
 def update_user_password(email: str, new_password: str) -> bool:
@@ -539,7 +603,10 @@ def update_user_password(email: str, new_password: str) -> bool:
             (pwd_hash, salt, now, clean_email)
         )
         conn.commit()
-        return cur.rowcount > 0
+        ok = cur.rowcount > 0
+        if ok:
+            save_users_registry()
+        return ok
 
 
 def update_user(
@@ -584,7 +651,45 @@ def update_user(
     with get_db_connection() as conn:
         cur = conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE email = ? COLLATE NOCASE", params)
         conn.commit()
-        return cur.rowcount > 0
+        ok = cur.rowcount > 0
+        if ok:
+            save_users_registry()
+        return ok
+
+
+def sync_user_account(email: str, password: Optional[str] = None, name: str = "", role: str = "user") -> Dict[str, Any]:
+    """Ensures a user account exists; if missing, creates it; if existing, updates role and name."""
+    clean_email = email.strip().lower()
+    now = datetime.now(timezone.utc).isoformat()
+    clean_role = role.strip().lower() if role in ("admin", "user") else "user"
+    clean_name = name.strip() if name else clean_email.split("@")[0].capitalize()
+
+    with get_db_connection() as conn:
+        existing = conn.execute("SELECT id, role, name FROM users WHERE email = ? COLLATE NOCASE", (clean_email,)).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE users SET role = ?, name = ?, updated_at = ? WHERE email = ? COLLATE NOCASE",
+                (clean_role, clean_name, now, clean_email)
+            )
+            conn.commit()
+            save_users_registry()
+            return {"id": existing["id"], "email": clean_email, "name": clean_name, "role": clean_role, "action": "updated"}
+        else:
+            user_id = secrets.token_hex(12)
+            pwd = password if password and len(password) >= 6 else "Password@123"
+            pwd_hash, salt = hash_password(pwd)
+            conn.execute(
+                """
+                INSERT INTO users (id, email, password_hash, salt, name, role, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, clean_email, pwd_hash, salt, clean_name, clean_role, now, now)
+            )
+            conn.execute("INSERT OR IGNORE INTO user_keys (user_id, updated_at) VALUES (?, ?)", (user_id, now))
+            conn.commit()
+            save_users_registry()
+            return {"id": user_id, "email": clean_email, "name": clean_name, "role": clean_role, "action": "created"}
+
 
 
 def save_search_history(

@@ -181,6 +181,17 @@ class AdminUpdateUserPayload(BaseModel):
     password: Optional[str] = None
 
 
+class AdminSyncUserItem(BaseModel):
+    email: str
+    password: Optional[str] = None
+    name: Optional[str] = ""
+    role: Optional[str] = "user"
+
+
+class AdminSyncUsersPayload(BaseModel):
+    users: List[AdminSyncUserItem]
+
+
 class ProjectPayload(BaseModel):
     id: Optional[str] = None
     name: str
@@ -387,6 +398,25 @@ def admin_delete_user(payload: AdminDeleteUserPayload, authorization: Optional[s
     if not ok:
         raise HTTPException(status_code=404, detail="User not found.")
     return {"status": "ok", "message": f"User {clean_email} deleted successfully."}
+
+
+@app.post("/api/admin/users/sync")
+def admin_sync_users(payload: AdminSyncUsersPayload, authorization: Optional[str] = Header(None)):
+    """Restores/syncs team members from verified admin state into persistent database."""
+    user = get_current_user(authorization)
+    require_admin(user)
+    synced = []
+    for u in payload.users:
+        clean_email = u.email.strip().lower()
+        if clean_email and "@" in clean_email:
+            res = database.sync_user_account(
+                email=clean_email,
+                password=u.password,
+                name=u.name or "",
+                role=u.role or "user"
+            )
+            synced.append(res)
+    return {"status": "ok", "synced": synced, "users": database.list_users()}
 
 
 @app.get("/api/projects")

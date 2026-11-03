@@ -29,6 +29,7 @@ serp_cache.jsonl
 *.db
 *.db-wal
 *.db-shm
+!backend/users_registry.json
 
 # Editor directories and files
 .vscode/*

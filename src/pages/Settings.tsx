@@ -93,7 +93,37 @@ export const Settings: React.FC = () => {
     if (!isAdmin) return;
     setLoadingUsers(true);
     try {
-      const list = await authService.listUsers();
+      let list = await authService.listUsers();
+
+      // Persistent resiliency: check localStorage backup
+      const backupRaw = localStorage.getItem('leadpulse_team_users_backup');
+      if (backupRaw) {
+        try {
+          const backupList: any[] = JSON.parse(backupRaw);
+          // If the backend has missing team users that were previously created, auto-sync them to backend
+          const missing = backupList.filter(
+            (bu) => bu.email && !list.some((lu) => lu.email?.toLowerCase() === bu.email.toLowerCase())
+          );
+          if (missing.length > 0) {
+            const syncRes = await authService.syncUsers(
+              missing.map((m) => ({
+                email: m.email,
+                name: m.name || '',
+                role: m.role || 'user',
+              }))
+            );
+            if (syncRes && syncRes.users && syncRes.users.length > 0) {
+              list = syncRes.users;
+            }
+          }
+        } catch {
+          // ignore parse error
+        }
+      }
+
+      if (list && list.length > 0) {
+        localStorage.setItem('leadpulse_team_users_backup', JSON.stringify(list));
+      }
       setTeamUsers(list);
     } catch (e: any) {
       console.warn('Could not load team users:', e);
@@ -174,6 +204,13 @@ export const Settings: React.FC = () => {
     try {
       await authService.deleteUser(emailToDelete);
       setUserActionSuccess(`User "${emailToDelete}" deleted.`);
+      try {
+        const backupRaw = localStorage.getItem('leadpulse_team_users_backup');
+        if (backupRaw) {
+          const parsed = JSON.parse(backupRaw).filter((u: any) => u.email?.toLowerCase() !== emailToDelete.toLowerCase());
+          localStorage.setItem('leadpulse_team_users_backup', JSON.stringify(parsed));
+        }
+      } catch {}
       loadTeamUsers();
     } catch (err: any) {
       setUserActionError(err.message || 'Failed to delete user.');

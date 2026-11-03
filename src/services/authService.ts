@@ -219,4 +219,21 @@ export const authService = {
     }
     return res.json();
   },
+
+  async syncUsers(users: { email: string; name?: string; role?: string; password?: string }[]): Promise<any> {
+    const apiBase = getApiBaseUrl() || (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? 'http://127.0.0.1:8000' : '');
+    try {
+      const res = await fetch(`${apiBase}/api/admin/users/sync`, {
+        method: 'POST',
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ users }),
+      });
+      if (!res.ok) {
+        return null;
+      }
+      return res.json();
+    } catch {
+      return null;
+    }
+  },
 };
