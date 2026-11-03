@@ -9,12 +9,16 @@ import hashlib
 import secrets
 import hmac
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 DB_PATH = Path(__file__).resolve().parent / "app.db"
 REGISTRY_PATH = Path(__file__).resolve().parent / "users_registry.json"
+RENDER_YAML_PATH = Path(__file__).resolve().parent.parent / "render.yaml"
+
+_last_render_yaml_mtime = 0.0
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -38,6 +42,163 @@ def save_users_registry() -> None:
                 json.dump(users_list, f, indent=2)
     except Exception as e:
         print(f"Warning: could not save users registry: {e}")
+
+
+def sync_from_render_yaml(force: bool = False) -> bool:
+    """
+    Synchronizes users, credentials, and roles from render.yaml (or INITIAL_USERS env) directly into the database.
+    Checks file mtime so any manual edits to render.yaml are instantly updated in the database and frontend.
+    """
+    global _last_render_yaml_mtime
+    users_raw_string = ""
+
+    if RENDER_YAML_PATH.exists():
+        try:
+            mtime = RENDER_YAML_PATH.stat().st_mtime
+            if not force and mtime == _last_render_yaml_mtime:
+                return False
+            _last_render_yaml_mtime = mtime
+            content = RENDER_YAML_PATH.read_text(encoding="utf-8")
+            m = re.search(r"- key:\s*INITIAL_USERS\s*\n\s*value:\s*([^\n]*)", content)
+            if m:
+                users_raw_string = m.group(1).strip()
+        except Exception as e:
+            print(f"Warning: could not read render.yaml: {e}")
+
+    if not users_raw_string:
+        users_raw_string = os.environ.get("INITIAL_USERS", "").strip()
+
+    if not users_raw_string:
+        return False
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    parsed_users = []
+    for item in users_raw_string.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) >= 2:
+            u_email = parts[0].strip().lower()
+            u_pass = parts[1].strip()
+            u_name = parts[2].strip() if len(parts) >= 3 else u_email.split("@")[0].capitalize()
+            u_role = parts[3].strip().lower() if len(parts) >= 4 else "user"
+            if u_role not in ("admin", "user"):
+                u_role = "user"
+            parsed_users.append((u_email, u_pass, u_name, u_role))
+
+    if not parsed_users:
+        return False
+
+    with get_db_connection() as conn:
+        for u_email, u_pass, u_name, u_role in parsed_users:
+            row = conn.execute(
+                "SELECT id, password_hash, salt, name, role FROM users WHERE email = ? COLLATE NOCASE",
+                (u_email,)
+            ).fetchone()
+
+            if row:
+                user_id = row["id"]
+                # Update role and name
+                conn.execute(
+                    "UPDATE users SET name = ?, role = ?, updated_at = ? WHERE id = ?",
+                    (u_name, u_role, now_iso, user_id)
+                )
+                # If password changed in render.yaml, update password hash & salt
+                if not verify_password(u_pass, row["salt"], row["password_hash"]):
+                    pwd_hash, salt = hash_password(u_pass)
+                    conn.execute(
+                        "UPDATE users SET password_hash = ?, salt = ?, updated_at = ? WHERE id = ?",
+                        (pwd_hash, salt, now_iso, user_id)
+                    )
+            else:
+                user_id = secrets.token_hex(12)
+                pwd_hash, salt = hash_password(u_pass)
+                conn.execute(
+                    """
+                    INSERT INTO users (id, email, password_hash, salt, name, role, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (user_id, u_email, pwd_hash, salt, u_name, u_role, now_iso, now_iso)
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO user_keys (user_id, serpapi_key, serper_key, gemini_api_key, leadocean_api_key, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        os.environ.get("SERPAPI_KEY", ""),
+                        os.environ.get("SERPER_API_KEY", ""),
+                        os.environ.get("GEMINI_API_KEY", ""),
+                        os.environ.get("LEADOCEAN_API_KEY", ""),
+                        now_iso
+                    )
+                )
+        conn.commit()
+
+    save_users_registry()
+    return True
+
+
+def sync_to_render_yaml(known_passwords: Optional[Dict[str, str]] = None) -> None:
+    """
+    Reflects any user addition, role update, password change, or deletion from frontend/database back into render.yaml.
+    """
+    global _last_render_yaml_mtime
+    if not RENDER_YAML_PATH.exists():
+        return
+
+    try:
+        content = RENDER_YAML_PATH.read_text(encoding="utf-8")
+        # Extract existing passwords from render.yaml
+        passwords_map: Dict[str, str] = {}
+        m = re.search(r"- key:\s*INITIAL_USERS\s*\n\s*value:\s*([^\n]*)", content)
+        if m:
+            val = m.group(1).strip()
+            for item in val.split(","):
+                parts = item.strip().split(":")
+                if len(parts) >= 2:
+                    passwords_map[parts[0].strip().lower()] = parts[1].strip()
+
+        if known_passwords:
+            for k, v in known_passwords.items():
+                if v and len(v) >= 6:
+                    passwords_map[k.strip().lower()] = v.strip()
+
+        # Get all non-Puja users from database (Puja is default primary admin)
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                "SELECT email, name, role FROM users WHERE email != 'puja@gmail.com' COLLATE NOCASE ORDER BY created_at ASC"
+            ).fetchall()
+
+        items = []
+        for r in rows:
+            em = r["email"].strip().lower()
+            nm = r["name"].strip() if r["name"] else em.split("@")[0].capitalize()
+            rl = r["role"].strip().lower() if r["role"] else "user"
+            pw = passwords_map.get(em, "Password@123")
+            items.append(f"{em}:{pw}:{nm}:{rl}")
+
+        new_val = ",".join(items)
+
+        if "INITIAL_USERS" in content:
+            new_content = re.sub(
+                r"(- key:\s*INITIAL_USERS\s*\n\s*value:\s*)([^\n]*)",
+                r"\g<1>" + new_val,
+                content
+            )
+        else:
+            new_content = content.replace(
+                "envVars:\n",
+                f"envVars:\n      - key: INITIAL_USERS\n        value: {new_val}\n"
+            )
+
+        RENDER_YAML_PATH.write_text(new_content, encoding="utf-8")
+        _last_render_yaml_mtime = RENDER_YAML_PATH.stat().st_mtime
+    except Exception as e:
+        print(f"Warning: could not write to render.yaml: {e}")
+
 
 
 def init_db():
@@ -302,6 +463,7 @@ def init_db():
 
     # Persist the registered accounts snapshot
     save_users_registry()
+    sync_from_render_yaml(force=True)
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]:
@@ -358,6 +520,7 @@ def create_user(email: str, password: str, name: str = "", role: str = "user") -
             )
             conn.commit()
             save_users_registry()
+            sync_to_render_yaml({clean_email: password})
         except sqlite3.IntegrityError:
             raise ValueError(f"User with email '{clean_email}' already exists in the database. Duplicate email IDs are not allowed.")
 
@@ -372,6 +535,7 @@ def create_user(email: str, password: str, name: str = "", role: str = "user") -
 
 def authenticate_user(email: str, password: str) -> Optional[Dict[str, Any]]:
     """Authenticates email and password. Returns user dict or None."""
+    sync_from_render_yaml()
     clean_email = email.strip().lower()
     with get_db_connection() as conn:
         row = conn.execute(
@@ -417,6 +581,7 @@ def get_user_by_token(token: str) -> Optional[Dict[str, Any]]:
     if not token:
         return None
 
+    sync_from_render_yaml()
     clean_token = token.replace("Bearer ", "").strip()
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -547,6 +712,7 @@ def update_user_keys(user_id: str, keys_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 def list_users() -> List[Dict[str, Any]]:
     """Lists all registered users with summary of configured keys."""
+    sync_from_render_yaml()
     with get_db_connection() as conn:
         rows = conn.execute("""
             SELECT u.id, u.email, u.name, u.role, u.created_at,
@@ -581,6 +747,7 @@ def delete_user(email: str) -> bool:
         ok = cur.rowcount > 0
         if ok:
             save_users_registry()
+            sync_to_render_yaml()
         return ok
 
 
@@ -606,6 +773,7 @@ def update_user_password(email: str, new_password: str) -> bool:
         ok = cur.rowcount > 0
         if ok:
             save_users_registry()
+            sync_to_render_yaml({clean_email: new_password})
         return ok
 
 
@@ -654,6 +822,7 @@ def update_user(
         ok = cur.rowcount > 0
         if ok:
             save_users_registry()
+            sync_to_render_yaml({clean_email: new_password} if new_password else None)
         return ok
 
 
@@ -673,6 +842,7 @@ def sync_user_account(email: str, password: Optional[str] = None, name: str = ""
             )
             conn.commit()
             save_users_registry()
+            sync_to_render_yaml({clean_email: password} if password else None)
             return {"id": existing["id"], "email": clean_email, "name": clean_name, "role": clean_role, "action": "updated"}
         else:
             user_id = secrets.token_hex(12)
@@ -688,6 +858,7 @@ def sync_user_account(email: str, password: Optional[str] = None, name: str = ""
             conn.execute("INSERT OR IGNORE INTO user_keys (user_id, updated_at) VALUES (?, ?)", (user_id, now))
             conn.commit()
             save_users_registry()
+            sync_to_render_yaml({clean_email: pwd})
             return {"id": user_id, "email": clean_email, "name": clean_name, "role": clean_role, "action": "created"}
 
 

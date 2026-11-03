@@ -7,26 +7,26 @@
     "name": "Puja",
     "role": "admin",
     "created_at": "2026-10-26T05:04:16.360445+00:00",
-    "updated_at": "2026-11-03T04:40:09.725635+00:00"
+    "updated_at": "2026-11-03T05:05:01.464211+00:00"
   },
   {
     "id": "74d2105e9237a0083ac6bafa",
     "email": "ketan@gmail.com",
-    "password_hash": "4de174009ebe2af7d8e5e95535607630e04f6d698babbaea964c5b86f3595649",
-    "salt": "bc8681418c9c72e2fd1ae8d61afaf699",
+    "password_hash": "c47ae932e62ff661503c74757814a0f167718337225a0170fa35af7f3302fda3",
+    "salt": "86331bec18b42ae95fba554524b20a0a",
     "name": "Ketan",
-    "role": "admin",
+    "role": "user",
     "created_at": "2026-11-02T05:24:04.314413+00:00",
-    "updated_at": "2026-11-03T04:40:00.734495+00:00"
+    "updated_at": "2026-11-03T05:05:54.882639+00:00"
   },
   {
     "id": "4c55880a1ef6fc6ce93d00b6",
     "email": "deep@gmail.com",
-    "password_hash": "47626e69f04c839917a8fd91e037c0647f40bc6a150637328dcdb09fada51ecd",
-    "salt": "d76e423560c09050190ecd36eb986366",
+    "password_hash": "c904e5e6ebf0b618a4020fcb8f9e4ae05d34b1ad1dada93f2eaf36fae2ae4a90",
+    "salt": "bea1df448de763bb8fadea0856ac6989",
     "name": "Deep",
     "role": "user",
     "created_at": "2026-11-02T05:57:25.628533+00:00",
-    "updated_at": "2026-11-03T04:40:09.770912+00:00"
+    "updated_at": "2026-11-03T05:05:43.985141+00:00"
   }
 ]
