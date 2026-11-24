@@ -292,7 +292,11 @@ def build_request(cfg: Dict[str, Any], ctx: Dict[str, str], api_key: str) -> Tup
             except Exception:
                 pass
 
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
     params: Dict[str, str] = {}
     auth_in = cfg.get("auth_in", "header")
     auth_name = cfg.get("auth_name", "x-api-key")
@@ -329,13 +333,15 @@ def call_api(cfg: Dict[str, Any], ctx: Dict[str, str], api_key: str) -> Tuple[Op
                 time.sleep(wait)
                 continue
             if r.status_code in (401, 403):
-                return None, f"auth_failed_http_{r.status_code}"
+                return None, f"auth_failed_http_{r.status_code}: {r.text[:200]}"
             if r.status_code == 402:
-                return None, "credits_required_http_402"
+                return None, f"credits_required_http_402: {r.text[:200]}"
             if r.status_code == 404:
                 return {}, "not_found"
             if r.status_code >= 400:
-                return None, f"http_{r.status_code}: {r.text[:140]}"
+                if any(w in r.text.lower() for w in ["credit", "balance", "quota", "payment", "insufficient"]):
+                    return None, f"credits_required_http_{r.status_code}: {r.text[:200]}"
+                return None, f"http_{r.status_code}: {r.text[:200]}"
             try:
                 return r.json(), ""
             except ValueError:

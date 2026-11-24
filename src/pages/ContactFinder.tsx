@@ -57,7 +57,7 @@ export const ContactFinder: React.FC = () => {
 
   useEffect(() => {
     const key = authKeys?.leadocean_api_key || authKeys?.leadoceanApiKey;
-    if (key && !leadoceanApiKey) {
+    if (key) {
       setLeadoceanApiKey(key);
     }
   }, [authKeys?.leadocean_api_key, authKeys?.leadoceanApiKey]);
@@ -177,7 +177,7 @@ export const ContactFinder: React.FC = () => {
       setLeadoceanApiKey(key);
       storageService.saveSettings({ leadoceanApiKey: key });
       try {
-        await updateKeys({ leadocean_api_key: key });
+        await updateKeys({ leadocean_api_key: key, leadoceanApiKey: key });
       } catch (e) {
         console.warn('Failed to update auth keys:', e);
       }
@@ -185,7 +185,7 @@ export const ContactFinder: React.FC = () => {
     if (url) {
       storageService.saveSettings({ leadoceanEndpoint: url });
       try {
-        await updateKeys({ leadocean_endpoint: url });
+        await updateKeys({ leadocean_endpoint: url, leadoceanEndpoint: url });
       } catch (e) {
         console.warn('Failed to update auth endpoint:', e);
       }
@@ -558,7 +558,7 @@ export const ContactFinder: React.FC = () => {
       setLeadoceanApiKey(effectiveKey);
       storageService.saveSettings({ leadoceanApiKey: effectiveKey });
       try {
-        await updateKeys({ leadocean_api_key: effectiveKey });
+        await updateKeys({ leadocean_api_key: effectiveKey, leadoceanApiKey: effectiveKey });
       } catch (e) {
         console.warn('Failed to update auth keys:', e);
       }

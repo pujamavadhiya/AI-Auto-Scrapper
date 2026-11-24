@@ -1964,6 +1964,61 @@ def enrich_decision_makers(payload: DecisionMakerPayload, authorization: Optiona
 # LeadOcean Phone & Email Contact Enricher
 # =====================================================================
 
+@app.get("/api/leadocean/debug")
+@app.post("/api/leadocean/debug")
+def debug_leadocean_endpoint(payload: Optional[Dict[str, Any]] = None, authorization: Optional[str] = Header(None)):
+    """Diagnostic tool to inspect live LeadOcean connectivity, headers, status codes, and raw API responses."""
+    import requests
+    user = get_current_user_optional(authorization)
+    user_keys = database.get_user_keys(user["id"]) if user else {}
+    payload = payload or {}
+    key = (payload.get("apiKey") or user_keys.get("leadocean_api_key") or os.environ.get("LEADOCEAN_API_KEY", "")).strip()
+
+    enricher = LeadOceanEnricher(api_key=key)
+    res = enricher.enrich_single(
+        company="Microsoft",
+        name="Satya Nadella",
+        linkedin_url="https://www.linkedin.com/in/satyanadella",
+        api_key=key,
+    )
+
+    raw_status = None
+    raw_body = None
+    raw_headers = {}
+    try:
+        r = requests.post(
+            "https://api.leadocean.io/v1/people/enrich",
+            headers={
+                "x-api-key": key,
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            },
+            json={
+                "linkedin_url": "https://www.linkedin.com/in/satyanadella",
+                "reveal_email": True,
+                "reveal_phone": True,
+            },
+            timeout=15,
+        )
+        raw_status = r.status_code
+        raw_body = r.text[:300]
+        raw_headers = dict(r.headers)
+    except Exception as e:
+        raw_body = f"Exception: {e}"
+
+    return {
+        "user": user["email"] if user else None,
+        "key_preview": (key[:6] + "..." + key[-4:]) if len(key) > 10 else key,
+        "enrich_status": res.enrich_status,
+        "raw_error": res.raw_error,
+        "email": res.email,
+        "phone": res.phone,
+        "direct_status": raw_status,
+        "direct_body": raw_body,
+        "direct_headers": raw_headers,
+    }
+
+
 @app.get("/api/leadocean/config")
 def get_leadocean_config(authorization: Optional[str] = Header(None)):
     """Returns current LeadOcean API and endpoint configuration for authenticated user."""
@@ -2228,10 +2283,9 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
         )
 
         if is_credit_or_auth_error:
+            raw_msg = res.raw_error or res.enrich_status or "Key is out of credits or unauthorized (HTTP 401/402)."
             out_record["enrichmentStatus"] = "out_of_credits"
-            out_record["notes"] = (
-                "Key is out of credits or unauthorized (HTTP 401/402). Please update LeadOcean API key."
-            )
+            out_record["notes"] = raw_msg
             out_record["customFields"]["Enrich Status"] = "out_of_credits"
             enriched_results.append(out_record)
 
@@ -2243,10 +2297,8 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
                 "status": "out_of_credits",
                 "outOfCredits": True,
                 "provider": "leadocean",
-                "message": (
-                    "LeadOcean API key is invalid, expired, or out of credits (HTTP 401/402). "
-                    "Please update your API key to continue."
-                ),
+                "message": f"LeadOcean: {raw_msg}",
+                "detail": raw_msg,
                 "results": enriched_results,
             }
 
