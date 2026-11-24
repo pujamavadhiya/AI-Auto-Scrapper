@@ -525,12 +525,12 @@ export const ContactFinder: React.FC = () => {
           status: 'cancelled',
           stageMessage: 'LeadOcean enrichment cancelled.',
         }));
-      } else if (err.outOfCredits) {
+      } else if (err.outOfCredits || err.isIpBlocked) {
         setProgress((prev) => ({
           ...prev,
           isActive: false,
           status: 'error',
-          stageMessage: 'Halted: Key is invalid or out of credits.',
+          stageMessage: err.isIpBlocked ? 'LeadOcean cloud access restricted.' : 'Halted: Key is invalid or out of credits.',
         }));
         setOutOfCredits({
           active: true,

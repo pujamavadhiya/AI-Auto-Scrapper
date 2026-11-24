@@ -222,6 +222,7 @@ export class ContactFinderAdapter implements IResearchAdapter {
         const data = await response.json();
         const serverResults: EnrichmentRecord[] = data.results || [];
         const isOutOfCredits = data.outOfCredits || data.status === 'out_of_credits';
+        const isAuthBlocked = data.isIpBlocked || data.status === 'leadocean_auth_blocked';
 
         const mergedChunk: EnrichmentRecord[] = chunk.map((orig, idx) => {
           const enriched = serverResults[idx];
@@ -263,10 +264,11 @@ export class ContactFinderAdapter implements IResearchAdapter {
           onRecordEnriched(mergedChunk[0]);
         }
 
-        // If out of credits, halt immediately and preserve whatever has been fetched
-        if (isOutOfCredits) {
+        // If out of credits or cloud blocked, halt immediately and preserve whatever has been fetched
+        if (isOutOfCredits || isAuthBlocked) {
           const creditErr: any = new Error(data.message || 'Key is out of credits');
-          creditErr.outOfCredits = true;
+          creditErr.outOfCredits = isOutOfCredits;
+          creditErr.isIpBlocked = isAuthBlocked;
           creditErr.partialResults = enrichedList;
           throw creditErr;
         }

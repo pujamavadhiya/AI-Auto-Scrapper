@@ -2318,6 +2318,7 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
 
         if is_credit_or_auth_error:
             raw_msg = res.raw_error or res.enrich_status or "Key is out of credits or unauthorized (HTTP 401/402)."
+            is_support_contact = "contact support@leadocean.io" in raw_msg.lower() or "unauthorized." in raw_msg.lower()
             out_record["enrichmentStatus"] = "out_of_credits"
             out_record["notes"] = raw_msg
             out_record["customFields"]["Enrich Status"] = "out_of_credits"
@@ -2328,10 +2329,16 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
                 enriched_results.append(dict(remaining_rec))
 
             return {
-                "status": "out_of_credits",
-                "outOfCredits": True,
+                "status": "leadocean_auth_blocked" if is_support_contact else "out_of_credits",
+                "outOfCredits": not is_support_contact,
+                "isIpBlocked": is_support_contact,
                 "provider": "leadocean",
-                "message": f"LeadOcean: {raw_msg}",
+                "message": (
+                    "LeadOcean Cloud Access Restriction: 'Unauthorized. Contact support@leadocean.io for access.' "
+                    "LeadOcean restricts API requests from cloud datacenter servers. Please email support@leadocean.io to authorize your account, or run the application in localhost where requests succeed."
+                    if is_support_contact
+                    else f"LeadOcean: {raw_msg}"
+                ),
                 "detail": raw_msg,
                 "results": enriched_results,
             }
