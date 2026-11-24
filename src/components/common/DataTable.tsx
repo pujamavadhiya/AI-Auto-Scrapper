@@ -529,6 +529,11 @@ export const DataTable: React.FC<DataTableProps> = ({
                                 {record.emailStatus || 'Probable'}
                               </span>
                             </div>
+                          ) : record.enrichmentStatus === 'processing' ? (
+                            <span className="text-sky-600 text-[11px] font-medium flex items-center gap-1 animate-pulse">
+                              <span className="w-1.5 h-1.5 rounded-full bg-sky-500 animate-ping"></span>
+                              Fetching email...
+                            </span>
                           ) : (
                             <span className="text-slate-400 text-[11px] italic">No email</span>
                           )}
@@ -545,6 +550,11 @@ export const DataTable: React.FC<DataTableProps> = ({
                                 </span>
                               )}
                             </div>
+                          ) : record.enrichmentStatus === 'processing' ? (
+                            <span className="text-sky-600 text-[11px] font-medium flex items-center gap-1 animate-pulse">
+                              <span className="w-1.5 h-1.5 rounded-full bg-sky-500 animate-ping"></span>
+                              Fetching phone...
+                            </span>
                           ) : (
                             <span className="text-slate-400 text-[11px] italic">No phone</span>
                           )}
@@ -678,6 +688,8 @@ export const DataTable: React.FC<DataTableProps> = ({
                               ? 'success'
                               : record.enrichmentStatus === 'processing'
                               ? 'info'
+                              : record.enrichmentStatus === 'out_of_credits'
+                              ? 'warning'
                               : record.enrichmentStatus === 'not_found'
                               ? 'danger'
                               : 'secondary'
@@ -687,7 +699,9 @@ export const DataTable: React.FC<DataTableProps> = ({
                           {record.enrichmentStatus === 'enriched'
                             ? 'Enriched'
                             : record.enrichmentStatus === 'processing'
-                            ? 'Processing'
+                            ? 'Processing...'
+                            : record.enrichmentStatus === 'out_of_credits'
+                            ? 'Out of Credits'
                             : record.enrichmentStatus === 'not_found'
                             ? 'Not Found'
                             : 'Pending'}

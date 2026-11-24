@@ -293,71 +293,175 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
     records: EnrichmentRecord[],
     config: ResearchConfig,
     onProgress?: (progress: ResearchProgress) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onChunk?: (chunkResults: EnrichmentRecord[]) => void,
+    onRecordEnriched?: (record: EnrichmentRecord) => void
   ): Promise<EnrichmentRecord[]> {
     const totalCount = records.length;
+    if (totalCount === 0) return [];
     const startTime = Date.now();
+    const enrichedList: EnrichmentRecord[] = [];
+    const chunkSize = 1;
 
     // Check if backend with SERPAPI_KEY is available
     const health = await this.checkBackendHealth();
 
     if (health.isOnline && health.hasKey) {
-      onProgress?.({
-        isActive: true,
-        currentIndex: 1,
-        totalCount,
-        percentage: 10,
-        status: 'running',
-        stageMessage: 'Executing SerpAPI LinkedIn Finder engine...',
-        currentItemName: records[0]?.companyName || '',
-        leadsFound: 0,
-        leadsProcessed: 0,
-        elapsedSeconds: 0,
-      });
+      const apiBase = getApiBaseUrl();
 
-      try {
-        const apiBase = getApiBaseUrl();
-        const response = await fetch(`${apiBase}/api/enrich/linkedin-rows`, {
-          method: 'POST',
-          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-          body: JSON.stringify({
-            records,
-            config: {
-              minConfidence: 'medium',
-              maxSearches: 3,
-              allowLocationConflict: false,
-            },
-          }),
-          signal,
+      for (let i = 0; i < totalCount; i += chunkSize) {
+        if (signal?.aborted) {
+          throw new DOMException('Operation cancelled', 'AbortError');
+        }
+
+        const chunk = records.slice(i, i + chunkSize);
+        const displayName = chunk[0]?.personName || chunk[0]?.companyName || `Lead #${i + 1}`;
+
+        // Real-time processing indicator
+        const processingChunk = chunk.map((r) => ({
+          ...r,
+          enrichmentStatus: 'processing' as const,
+        }));
+        onChunk?.(processingChunk);
+        if (onRecordEnriched && processingChunk[0]) {
+          onRecordEnriched(processingChunk[0]);
+        }
+
+        onProgress?.({
+          isActive: true,
+          currentIndex: i + 1,
+          totalCount,
+          percentage: Math.round(((i + 0.3) / totalCount) * 100),
+          status: 'running',
+          stageMessage: `Verifying LinkedIn profile for "${displayName}" via SerpAPI...`,
+          currentItemName: displayName,
+          leadsFound: enrichedList.filter((r) => r.linkedinUrl).length,
+          leadsProcessed: i,
+          elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
         });
 
-        if (response.ok) {
-          const data = await response.json();
-          const enrichedRecords: EnrichmentRecord[] = data.records;
-
-          onProgress?.({
-            isActive: false,
-            currentIndex: totalCount,
-            totalCount,
-            percentage: 100,
-            status: 'completed',
-            stageMessage: `SerpAPI run complete. Found ${data.summary?.found || 0} verified profiles (${data.summary?.blank || 0} blank/unverified).`,
-            currentItemName: '',
-            leadsFound: data.summary?.found || 0,
-            leadsProcessed: totalCount,
-            elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
+        try {
+          const response = await fetch(`${apiBase}/api/enrich/linkedin-rows`, {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({
+              records: chunk,
+              config: {
+                minConfidence: 'medium',
+                maxSearches: 3,
+                allowLocationConflict: false,
+              },
+            }),
+            signal,
           });
 
-          return enrichedRecords;
+          if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            const errMsg = errData.detail || errData.message || `Server error (${response.status})`;
+            if (
+              response.status === 402 ||
+              errMsg.toLowerCase().includes('credit') ||
+              errMsg.toLowerCase().includes('searches') ||
+              errMsg.toLowerCase().includes('fatal serpapi error')
+            ) {
+              const creditErr: any = new Error(errMsg);
+              creditErr.outOfCredits = true;
+              creditErr.provider = 'serpapi';
+              creditErr.partialResults = enrichedList;
+              throw creditErr;
+            }
+            throw new Error(errMsg);
+          }
+
+          const data = await response.json();
+
+          if (data.status === 'out_of_credits' || data.outOfCredits) {
+            const serverResults: EnrichmentRecord[] = data.records || [];
+            const pausedChunk = chunk.map((orig, idx) => {
+              const enriched = serverResults[idx];
+              return {
+                ...orig,
+                enrichmentStatus: 'out_of_credits' as const,
+                notes: enriched?.notes || 'Paused: SerpAPI key is out of credits',
+              };
+            });
+            enrichedList.push(...pausedChunk);
+            onChunk?.(pausedChunk);
+            if (onRecordEnriched && pausedChunk[0]) {
+              onRecordEnriched(pausedChunk[0]);
+            }
+
+            const creditErr: any = new Error(data.message || 'SerpAPI key is out of credits');
+            creditErr.outOfCredits = true;
+            creditErr.provider = 'serpapi';
+            creditErr.partialResults = enrichedList;
+            throw creditErr;
+          }
+
+          const serverResults: EnrichmentRecord[] = data.records || [];
+          const mergedChunk = chunk.map((orig, idx) => {
+            const enriched = serverResults[idx];
+            if (!enriched) return orig;
+            return {
+              ...orig,
+              linkedinUrl: enriched.linkedinUrl || orig.linkedinUrl,
+              matchStatus: enriched.matchStatus || orig.matchStatus,
+              confidenceLevel: enriched.confidenceLevel || orig.confidenceLevel,
+              confidenceScore: enriched.confidenceScore ?? orig.confidenceScore,
+              matchedName: enriched.matchedName || orig.matchedName,
+              matchedHeadline: enriched.matchedHeadline || orig.matchedHeadline,
+              evidence: enriched.evidence || orig.evidence,
+              enrichmentStatus: enriched.enrichmentStatus || 'enriched',
+              notes: enriched.notes || orig.notes,
+              lastEnrichedAt: new Date().toISOString(),
+              customFields: {
+                ...(orig.customFields || {}),
+                ...(enriched.customFields || {}),
+              },
+            };
+          });
+
+          enrichedList.push(...mergedChunk);
+          onChunk?.(mergedChunk);
+          if (onRecordEnriched && mergedChunk[0]) {
+            onRecordEnriched(mergedChunk[0]);
+          }
+        } catch (err: any) {
+          if (err.name === 'AbortError' || err.outOfCredits) {
+            throw err;
+          }
+          console.error('SerpAPI row error:', err);
+          const errorChunk = chunk.map((r) => ({
+            ...r,
+            enrichmentStatus: 'error' as const,
+            notes: `SerpAPI error: ${err.message}`,
+          }));
+          enrichedList.push(...errorChunk);
+          onChunk?.(errorChunk);
+          if (onRecordEnriched && errorChunk[0]) {
+            onRecordEnriched(errorChunk[0]);
+          }
         }
-      } catch (err: any) {
-        if (err.name === 'AbortError') throw err;
-        console.warn('Backend call failed, falling back to client-side precision engine:', err);
       }
+
+      onProgress?.({
+        isActive: false,
+        currentIndex: totalCount,
+        totalCount,
+        percentage: 100,
+        status: 'completed',
+        stageMessage: `SerpAPI run complete. Found ${enrichedList.filter((r) => r.linkedinUrl).length} verified profiles.`,
+        currentItemName: '',
+        leadsFound: enrichedList.filter((r) => r.linkedinUrl).length,
+        leadsProcessed: totalCount,
+        elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
+      });
+
+      return enrichedList;
     }
 
     // Client-side precision engine execution
-    const enrichedList: EnrichmentRecord[] = [];
+    const fallbackList: EnrichmentRecord[] = [];
     const delayPerItem = config.simulationSpeedMs || 350;
 
     for (let i = 0; i < totalCount; i++) {
@@ -375,7 +479,7 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
         status: 'running',
         stageMessage: `Evaluating candidate profiles for "${current.personName || current.companyName}"...`,
         currentItemName: current.companyName,
-        leadsFound: enrichedList.filter((r) => r.linkedinUrl).length,
+        leadsFound: fallbackList.filter((r) => r.linkedinUrl).length,
         leadsProcessed: i,
         elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
       });
@@ -383,7 +487,7 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
       await simulateDelay(delayPerItem, signal);
 
       const enriched = await this.enrichSingle(current, config);
-      enrichedList.push(enriched);
+      fallbackList.push(enriched);
 
       onProgress?.({
         isActive: true,
@@ -395,13 +499,13 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
           ? `Verified: ${enriched.linkedinUrl} (${enriched.matchStatus})`
           : `Precision rule: ${enriched.matchStatus} (left blank)`,
         currentItemName: current.companyName,
-        leadsFound: enrichedList.filter((r) => r.linkedinUrl).length,
+        leadsFound: fallbackList.filter((r) => r.linkedinUrl).length,
         leadsProcessed: i + 1,
         elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
       });
     }
 
-    const verifiedCount = enrichedList.filter((r) => r.linkedinUrl).length;
+    const verifiedCount = fallbackList.filter((r) => r.linkedinUrl).length;
 
     onProgress?.({
       isActive: false,
@@ -416,6 +520,6 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
       elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
     });
 
-    return enrichedList;
+    return fallbackList;
   }
 }

@@ -24,7 +24,8 @@ export class DecisionMakerAdapter implements IResearchAdapter {
     config: ResearchConfig,
     onProgress?: (progress: ResearchProgress) => void,
     signal?: AbortSignal,
-    onChunk?: (chunkResults: EnrichmentRecord[]) => void
+    onChunk?: (chunkResults: EnrichmentRecord[]) => void,
+    onRecordEnriched?: (record: EnrichmentRecord) => void
   ): Promise<EnrichmentRecord[]> {
     const totalCount = records.length;
     if (totalCount === 0) return [];
@@ -51,6 +52,16 @@ export class DecisionMakerAdapter implements IResearchAdapter {
 
       const engine = config.decisionMakerEngine || 'serpapi';
       const engineLabel = engine === 'serper' ? 'Serper.dev' : 'SerpApi';
+
+      // Mark row as processing in real time
+      const processingChunk = chunk.map((r) => ({
+        ...r,
+        enrichmentStatus: 'processing' as const,
+      }));
+      onChunk?.(processingChunk);
+      if (onRecordEnriched && processingChunk[0]) {
+        onRecordEnriched(processingChunk[0]);
+      }
 
       onProgress?.({
         isActive: true,
@@ -118,10 +129,43 @@ export class DecisionMakerAdapter implements IResearchAdapter {
 
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
-          throw new Error(errData.detail || `Server error (${response.status})`);
+          const errMsg = errData.detail || errData.message || `Server error (${response.status})`;
+          if (response.status === 402 || errMsg.toLowerCase().includes('credit') || errMsg.toLowerCase().includes('searches')) {
+            const creditErr: any = new Error(errMsg);
+            creditErr.outOfCredits = true;
+            creditErr.provider = engine;
+            creditErr.partialResults = enrichedList;
+            throw creditErr;
+          }
+          throw new Error(errMsg);
         }
 
         const data = await response.json();
+
+        // Check if backend returned out of credits status
+        if (data.status === 'out_of_credits' || data.outOfCredits) {
+          const serverResults: EnrichmentRecord[] = data.results || [];
+          const pausedChunk: EnrichmentRecord[] = chunk.map((orig, idx) => {
+            const enriched = serverResults[idx];
+            return {
+              ...orig,
+              enrichmentStatus: 'out_of_credits' as const,
+              notes: enriched?.notes || `Paused: ${engineLabel} key is out of credits`,
+            };
+          });
+          enrichedList.push(...pausedChunk);
+          onChunk?.(pausedChunk);
+          if (onRecordEnriched && pausedChunk[0]) {
+            onRecordEnriched(pausedChunk[0]);
+          }
+
+          const creditErr: any = new Error(data.message || `${engineLabel} key is out of credits`);
+          creditErr.outOfCredits = true;
+          creditErr.provider = engine;
+          creditErr.partialResults = enrichedList;
+          throw creditErr;
+        }
+
         const serverResults: EnrichmentRecord[] = data.results || [];
 
         const mergedChunk: EnrichmentRecord[] = chunk.map((orig, idx) => {
@@ -150,6 +194,9 @@ export class DecisionMakerAdapter implements IResearchAdapter {
         if (onChunk) {
           onChunk(mergedChunk);
         }
+        if (onRecordEnriched && mergedChunk[0]) {
+          onRecordEnriched(mergedChunk[0]);
+        }
 
         const foundSoFar = enrichedList.filter((r) => r.enrichmentStatus === 'enriched').length;
         const lastEnriched = mergedChunk[0];
@@ -169,7 +216,7 @@ export class DecisionMakerAdapter implements IResearchAdapter {
           elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
         });
       } catch (err: any) {
-        if (err.name === 'AbortError') {
+        if (err.name === 'AbortError' || err.outOfCredits) {
           throw err;
         }
 
@@ -183,6 +230,9 @@ export class DecisionMakerAdapter implements IResearchAdapter {
         enrichedList.push(...errorChunk);
         if (onChunk) {
           onChunk(errorChunk);
+        }
+        if (onRecordEnriched && errorChunk[0]) {
+          onRecordEnriched(errorChunk[0]);
         }
       }
     }

@@ -36,22 +36,19 @@ import { getSampleInitialRecords } from '../services/mockData';
 import { getApiBaseUrl, getAuthHeaders } from '../config/api';
 import { historyService } from '../services/historyService';
 import { storageService } from '../services/storageService';
+import { OutOfCreditsBanner } from '../components/common/OutOfCreditsBanner';
 
 export const ContactFinder: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'table' | 'quick' | 'bulk' | 'upload' | 'config'>('table');
-  const [records, setRecords] = useState<EnrichmentRecord[]>(() => {
-    // Start with a clean list or sample
-    return getSampleInitialRecords().map((r) => ({
-      ...r,
-      customFields: {
-        ...(r.customFields || {}),
-        Email: r.email || '',
-        Phone: r.phone || '',
-        'Enrich Status': r.email || r.phone ? 'found' : 'no_data',
-      },
-    }));
-  });
+  const [records, setRecords] = useState<EnrichmentRecord[]>([]);
   const [parsedFile, setParsedFile] = useState<ParsedFileResult | null>(null);
+
+  // Out of credits tracking state
+  const [outOfCredits, setOutOfCredits] = useState<{
+    active: boolean;
+    message: string;
+    newApiKey: string;
+  } | null>(null);
 
   // Quick single form input state
   const [quickForm, setQuickForm] = useState({
@@ -168,6 +165,12 @@ export const ContactFinder: React.FC = () => {
       if (res.ok) {
         setConfigSaveNotice('LeadOcean settings updated successfully!');
         await refreshServerConfig();
+        if (outOfCredits?.active) {
+          setOutOfCredits(null);
+          setTimeout(() => {
+            handleResumeEnrichment();
+          }, 300);
+        }
         setTimeout(() => setConfigSaveNotice(null), 3000);
       }
     } catch (e: any) {
@@ -340,9 +343,8 @@ export const ContactFinder: React.FC = () => {
     setActiveTab('table');
 
     if (andEnrich) {
-      setTimeout(() => {
-        handleStartEnrichment([newRecord.id]);
-      }, 100);
+      // Pass newRecord directly to avoid stale state closure
+      handleStartEnrichment([newRecord.id], [newRecord]);
     }
   };
 
@@ -401,10 +403,13 @@ export const ContactFinder: React.FC = () => {
     setActiveTab('table');
   };
 
-  const handleStartEnrichment = async (subsetIds?: string[]) => {
-    const targets = subsetIds
-      ? records.filter((r) => subsetIds.includes(r.id))
-      : records;
+  const handleStartEnrichment = async (subsetIds?: string[], targetRecords?: EnrichmentRecord[]) => {
+    const targets =
+      targetRecords && targetRecords.length > 0
+        ? targetRecords
+        : subsetIds && subsetIds.length > 0
+        ? records.filter((r) => subsetIds.includes(r.id))
+        : records;
 
     if (targets.length === 0) return;
 
@@ -415,13 +420,21 @@ export const ContactFinder: React.FC = () => {
         targets,
         config,
         (p) => setProgress(p),
-        abortControllerRef.current.signal
+        abortControllerRef.current.signal,
+        // onChunk: immediately stream completed chunk into the table
+        (chunk) => {
+          const map = new Map(chunk.map((item) => [item.id, item]));
+          setRecords((prev) =>
+            prev.map((r) => map.get(r.id) || r)
+          );
+        },
+        // onRecordEnriched: update row immediately as each record starts processing or finishes
+        (record) => {
+          setRecords((prev) =>
+            prev.map((r) => (r.id === record.id ? record : r))
+          );
+        }
       );
-
-      setRecords((prev) => {
-        const enrichedMap = new Map(enrichedBatch.map((item) => [item.id, item]));
-        return prev.map((item) => enrichedMap.get(item.id) || item);
-      });
 
       // Auto-save into user's private history archive
       const queryTitle =
@@ -443,10 +456,56 @@ export const ContactFinder: React.FC = () => {
           status: 'cancelled',
           stageMessage: 'LeadOcean enrichment cancelled.',
         }));
+      } else if (err.outOfCredits) {
+        setProgress((prev) => ({
+          ...prev,
+          isActive: false,
+          status: 'error',
+          stageMessage: 'Halted: Key is out of credits.',
+        }));
+        setOutOfCredits({
+          active: true,
+          message: 'Key is out of credits. All data fetched so far has been preserved.',
+          newApiKey: '',
+        });
       } else {
         alert(`LeadOcean enrichment error: ${err.message}`);
       }
     }
+  };
+
+  const handleResumeEnrichment = async (overrideApiKey?: string) => {
+    if (overrideApiKey && overrideApiKey.trim()) {
+      const apiBase = getApiBaseUrl();
+      if (apiBase) {
+        try {
+          const res = await fetch(`${apiBase}/api/leadocean/config`, {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ apiKey: overrideApiKey.trim() }),
+          });
+          if (res.ok) {
+            await refreshServerConfig();
+          }
+        } catch (e) {
+          console.error('Failed to update API key:', e);
+        }
+      }
+    }
+
+    setOutOfCredits(null);
+
+    // Identify remaining pending/unenriched records to resume exactly where stopped
+    const remaining = records.filter(
+      (r) => !r.email && !r.phone && r.enrichmentStatus !== 'enriched'
+    );
+
+    if (remaining.length === 0) {
+      alert('All records have already been enriched!');
+      return;
+    }
+
+    handleStartEnrichment(remaining.map((r) => r.id), remaining);
   };
 
   const handleCancelEnrichment = () => {
@@ -545,6 +604,17 @@ export const ContactFinder: React.FC = () => {
         </div>
       </div>
 
+      {/* Out of Credits Alert Banner */}
+      {outOfCredits?.active && (
+        <OutOfCreditsBanner
+          providerName="LeadOcean"
+          message={outOfCredits.message}
+          onSaveAndResume={(newKey) => handleResumeEnrichment(newKey)}
+          onResume={() => handleResumeEnrichment()}
+          onDismiss={() => setOutOfCredits(null)}
+        />
+      )}
+
       {/* Navigation Tabs */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-2 rounded-xl border border-slate-200/80 shadow-xs">
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -614,7 +684,16 @@ export const ContactFinder: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
-          {pendingCount > 0 && (
+          {outOfCredits?.active ? (
+            <Button
+              size="sm"
+              onClick={() => handleResumeEnrichment()}
+              className="text-xs bg-amber-600 hover:bg-amber-700 text-white font-semibold animate-pulse"
+            >
+              <Play className="w-3.5 h-3.5 mr-1" />
+              Resume Enrichment
+            </Button>
+          ) : pendingCount > 0 ? (
             <Button
               size="sm"
               onClick={() => handleStartEnrichment()}
@@ -624,20 +703,23 @@ export const ContactFinder: React.FC = () => {
               <Play className="w-3.5 h-3.5 mr-1" />
               Enrich {pendingCount} Pending Leads
             </Button>
-          )}
+          ) : null}
 
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => {
-              setRecords(getSampleInitialRecords());
-              setActiveTab('table');
-            }}
-            className="text-xs text-slate-500 hover:text-slate-800"
-          >
-            <RotateCcw className="w-3.5 h-3.5 mr-1" />
-            Reset Samples
-          </Button>
+          {records.length > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setRecords([]);
+                setOutOfCredits(null);
+                setActiveTab('table');
+              }}
+              className="text-xs text-slate-500 hover:text-rose-600 hover:bg-rose-50"
+            >
+              <RotateCcw className="w-3.5 h-3.5 mr-1" />
+              Clear Table
+            </Button>
+          )}
         </div>
       </div>
 

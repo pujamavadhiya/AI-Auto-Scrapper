@@ -47,6 +47,8 @@ export class ContactFinderAdapter implements IResearchAdapter {
 
       return {
         ...record,
+        personName: enriched.personName || record.personName,
+        linkedinUrl: enriched.linkedinUrl || record.linkedinUrl,
         email: enriched.email || record.email,
         phone: enriched.phone || record.phone,
         emailStatus: enriched.email ? 'verified' : record.emailStatus,
@@ -58,6 +60,8 @@ export class ContactFinderAdapter implements IResearchAdapter {
         customFields: {
           ...(record.customFields || {}),
           ...(enriched.customFields || {}),
+          'Decision Maker Name': enriched.personName || record.personName || '',
+          'Decision Maker Linkedin': enriched.linkedinUrl || record.linkedinUrl || '',
           Email: enriched.email || record.email || '',
           Phone: enriched.phone || record.phone || '',
           'Enrich Status': enriched.customFields?.['Enrich Status'] || (enriched.email || enriched.phone ? 'found' : 'no_data'),
@@ -80,15 +84,17 @@ export class ContactFinderAdapter implements IResearchAdapter {
     records: EnrichmentRecord[],
     config: ResearchConfig,
     onProgress?: (progress: ResearchProgress) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onChunk?: (chunkResults: EnrichmentRecord[]) => void,
+    onRecordEnriched?: (record: EnrichmentRecord) => void
   ): Promise<EnrichmentRecord[]> {
     const totalCount = records.length;
     const enrichedList: EnrichmentRecord[] = [];
     const startTime = Date.now();
     const apiBase = getApiBaseUrl();
 
-    // Process in small batches of 3-5 for live real-time UI updates
-    const chunkSize = 4;
+    // Process 1 lead at a time for true real-time streaming updates into the UI
+    const chunkSize = 1;
 
     for (let i = 0; i < totalCount; i += chunkSize) {
       if (signal?.aborted) {
@@ -98,6 +104,16 @@ export class ContactFinderAdapter implements IResearchAdapter {
       const chunk = records.slice(i, i + chunkSize);
       const currentItemName = chunk[0]?.personName || chunk[0]?.companyName || `Lead ${i + 1}`;
 
+      // Notify UI that this chunk is currently processing so the row shows fetching indicator
+      const processingChunk = chunk.map((r) => ({
+        ...r,
+        enrichmentStatus: 'processing' as const,
+      }));
+      onChunk?.(processingChunk);
+      if (onRecordEnriched && processingChunk[0]) {
+        onRecordEnriched(processingChunk[0]);
+      }
+
       onProgress?.({
         isActive: true,
         currentIndex: i + 1,
@@ -106,7 +122,7 @@ export class ContactFinderAdapter implements IResearchAdapter {
         status: 'running',
         stageMessage: `Querying LeadOcean API for ${currentItemName}...`,
         currentItemName,
-        leadsFound: enrichedList.filter((r) => r.enrichmentStatus === 'enriched').length,
+        leadsFound: enrichedList.filter((r) => r.enrichmentStatus === 'enriched' || r.email || r.phone).length,
         leadsProcessed: i,
         elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
       });
@@ -162,19 +178,27 @@ export class ContactFinderAdapter implements IResearchAdapter {
           }),
           body: JSON.stringify({
             records: payloadRecords,
-            delay: 0.3,
-            overwrite: false,
+            delay: 0.2,
+            overwrite: true,
           }),
           signal,
         });
 
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
-          throw new Error(errData.detail || `Server error (${response.status})`);
+          const errMsg = errData.detail || errData.message || `Server error (${response.status})`;
+          if (response.status === 402 || errMsg.toLowerCase().includes('credit')) {
+            const creditErr: any = new Error('Key is out of credits');
+            creditErr.outOfCredits = true;
+            creditErr.partialResults = enrichedList;
+            throw creditErr;
+          }
+          throw new Error(errMsg);
         }
 
         const data = await response.json();
         const serverResults: EnrichmentRecord[] = data.results || [];
+        const isOutOfCredits = data.outOfCredits || data.status === 'out_of_credits';
 
         const mergedChunk: EnrichmentRecord[] = chunk.map((orig, idx) => {
           const enriched = serverResults[idx];
@@ -186,6 +210,8 @@ export class ContactFinderAdapter implements IResearchAdapter {
 
           return {
             ...orig,
+            personName: enriched.personName || orig.personName,
+            linkedinUrl: enriched.linkedinUrl || orig.linkedinUrl,
             email: email || undefined,
             phone: phone || undefined,
             emailStatus: email ? 'verified' : orig.emailStatus,
@@ -197,6 +223,8 @@ export class ContactFinderAdapter implements IResearchAdapter {
             customFields: {
               ...(orig.customFields || {}),
               ...(enriched.customFields || {}),
+              'Decision Maker Name': enriched.personName || orig.personName || '',
+              'Decision Maker Linkedin': enriched.linkedinUrl || orig.linkedinUrl || '',
               Email: email,
               Phone: phone,
               'Enrich Status': enrichStatus,
@@ -205,22 +233,38 @@ export class ContactFinderAdapter implements IResearchAdapter {
         });
 
         enrichedList.push(...mergedChunk);
+
+        // Immediately stream this completed chunk to the UI
+        onChunk?.(mergedChunk);
+        if (onRecordEnriched && mergedChunk[0]) {
+          onRecordEnriched(mergedChunk[0]);
+        }
+
+        // If out of credits, halt immediately and preserve whatever has been fetched
+        if (isOutOfCredits) {
+          const creditErr: any = new Error(data.message || 'Key is out of credits');
+          creditErr.outOfCredits = true;
+          creditErr.partialResults = enrichedList;
+          throw creditErr;
+        }
       } catch (err: any) {
         if (err.name === 'AbortError') throw err;
+        if (err.outOfCredits) throw err;
 
         console.error('LeadOcean chunk error:', err);
         // Fallback gracefully for chunk records
-        for (const item of chunk) {
-          enrichedList.push({
-            ...item,
-            enrichmentStatus: 'error',
-            notes: `LeadOcean error: ${err.message}`,
-            customFields: {
-              ...(item.customFields || {}),
-              'Enrich Status': 'error',
-            },
-          });
-        }
+        const fallbackChunk = chunk.map((item) => ({
+          ...item,
+          enrichmentStatus: 'error' as const,
+          notes: `LeadOcean error: ${err.message}`,
+          customFields: {
+            ...(item.customFields || {}),
+            'Enrich Status': 'error',
+          },
+        }));
+
+        enrichedList.push(...fallbackChunk);
+        onChunk?.(fallbackChunk);
       }
 
       onProgress?.({

@@ -24,12 +24,13 @@ export class WebsiteFinderAdapter implements IResearchAdapter {
     config: ResearchConfig,
     onProgress?: (progress: ResearchProgress) => void,
     signal?: AbortSignal,
-    onChunkCompleted?: (chunkResults: EnrichmentRecord[]) => void
+    onChunk?: (chunkResults: EnrichmentRecord[]) => void,
+    onRecordEnriched?: (record: EnrichmentRecord) => void
   ): Promise<EnrichmentRecord[]> {
     const totalCount = records.length;
     const enrichedList: EnrichmentRecord[] = [];
     const startTime = Date.now();
-    const CHUNK_SIZE = 8;
+    const CHUNK_SIZE = 3;
     const apiBase = getApiBaseUrl();
 
     if (!apiBase) {
@@ -43,6 +44,16 @@ export class WebsiteFinderAdapter implements IResearchAdapter {
 
       const chunk = records.slice(i, i + CHUNK_SIZE);
       const currentCompany = chunk[0]?.companyName || 'Target companies';
+
+      // Live processing indication
+      const processingChunk = chunk.map((r) => ({
+        ...r,
+        enrichmentStatus: 'processing' as const,
+      }));
+      onChunk?.(processingChunk);
+      if (onRecordEnriched && processingChunk[0]) {
+        onRecordEnriched(processingChunk[0]);
+      }
 
       onProgress?.({
         isActive: true,
@@ -71,10 +82,44 @@ export class WebsiteFinderAdapter implements IResearchAdapter {
 
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));
-          throw new Error(errData.detail || `Server error (${res.status}) while searching websites.`);
+          const errMsg = errData.detail || errData.message || `Server error (${res.status}) while searching websites.`;
+          if (
+            res.status === 402 ||
+            res.status === 429 ||
+            errMsg.toLowerCase().includes('quota') ||
+            errMsg.toLowerCase().includes('credit') ||
+            errMsg.toLowerCase().includes('resource_exhausted')
+          ) {
+            const creditErr: any = new Error(errMsg);
+            creditErr.outOfCredits = true;
+            creditErr.provider = 'gemini';
+            creditErr.partialResults = enrichedList;
+            throw creditErr;
+          }
+          throw new Error(errMsg);
         }
 
         const data = await res.json();
+
+        if (data.status === 'out_of_credits' || data.outOfCredits) {
+          const pausedChunk = chunk.map((r) => ({
+            ...r,
+            enrichmentStatus: 'out_of_credits' as const,
+            notes: 'Paused: Google Gemini key out of credits / quota exceeded',
+          }));
+          enrichedList.push(...pausedChunk);
+          onChunk?.(pausedChunk);
+          if (onRecordEnriched && pausedChunk[0]) {
+            onRecordEnriched(pausedChunk[0]);
+          }
+
+          const creditErr: any = new Error(data.message || 'Google Gemini key is out of credits');
+          creditErr.outOfCredits = true;
+          creditErr.provider = 'gemini';
+          creditErr.partialResults = enrichedList;
+          throw creditErr;
+        }
+
         const serverResults: EnrichmentRecord[] = data.results || [];
 
         const mergedChunk = chunk.map((orig, idx) => {
@@ -102,7 +147,10 @@ export class WebsiteFinderAdapter implements IResearchAdapter {
         });
 
         enrichedList.push(...mergedChunk);
-        onChunkCompleted?.(mergedChunk);
+        onChunk?.(mergedChunk);
+        if (onRecordEnriched && mergedChunk[0]) {
+          onRecordEnriched(mergedChunk[0]);
+        }
 
         onProgress?.({
           isActive: true,
@@ -117,7 +165,7 @@ export class WebsiteFinderAdapter implements IResearchAdapter {
           elapsedSeconds: Math.floor((Date.now() - startTime) / 1000),
         });
       } catch (err: any) {
-        if (err.name === 'AbortError') throw err;
+        if (err.name === 'AbortError' || err.outOfCredits) throw err;
         console.error('Error enriching chunk with Gemini:', err);
         // Fallback gracefully for chunk if error
         const fallbackChunk = chunk.map((r) => ({
@@ -126,7 +174,10 @@ export class WebsiteFinderAdapter implements IResearchAdapter {
           notes: err.message || 'Gemini website research error',
         }));
         enrichedList.push(...fallbackChunk);
-        onChunkCompleted?.(fallbackChunk);
+        onChunk?.(fallbackChunk);
+        if (onRecordEnriched && fallbackChunk[0]) {
+          onRecordEnriched(fallbackChunk[0]);
+        }
       }
     }
 

@@ -14,6 +14,7 @@ import {
   Plus,
   CheckCircle2,
   Search,
+  Trash2,
 } from 'lucide-react';
 import { ModuleHeader } from '../components/common/ModuleHeader';
 import { FileUploader } from '../components/common/FileUploader';
@@ -34,12 +35,20 @@ import { authService } from '../services/authService';
 import { historyService } from '../services/historyService';
 import { getApiBaseUrl, getAuthHeaders } from '../config/api';
 import { useAuth } from '../context/AuthContext';
+import { OutOfCreditsBanner } from '../components/common/OutOfCreditsBanner';
 
 export const WebsiteFinder: React.FC = () => {
   const { keys: authKeys, updateKeys } = useAuth();
   const [activeTab, setActiveTab] = useState<'table' | 'quick' | 'upload' | 'config'>('table');
-  const [records, setRecords] = useState<EnrichmentRecord[]>(() => getSampleInitialRecords());
+  const [records, setRecords] = useState<EnrichmentRecord[]>([]);
   const [parsedFile, setParsedFile] = useState<ParsedFileResult | null>(null);
+
+  // Out of credits pause / resume state
+  const [outOfCredits, setOutOfCredits] = useState<{
+    active: boolean;
+    provider: string;
+    message: string;
+  } | null>(null);
 
   // Quick / Single Company Input State
   const [singleCompany, setSingleCompany] = useState('');
@@ -323,12 +332,61 @@ export const WebsiteFinder: React.FC = () => {
           status: 'cancelled',
           stageMessage: 'Website & founder search cancelled by user.',
         }));
+      } else if (err.outOfCredits) {
+        setOutOfCredits({
+          active: true,
+          provider: 'Google Gemini',
+          message: err.message || 'Google Gemini API key has exceeded its quota or is out of credits. All discovered websites have been preserved.',
+        });
+
+        if (err.partialResults && Array.isArray(err.partialResults)) {
+          const partialMap = new Map<string, EnrichmentRecord>(
+            err.partialResults.map((r: EnrichmentRecord) => [r.id, r])
+          );
+          setRecords((prev: EnrichmentRecord[]) => prev.map((item) => partialMap.get(item.id) || item));
+        }
+
+        setProgress((prev) => ({
+          ...prev,
+          isActive: false,
+          status: 'paused',
+          stageMessage: 'Paused: Google Gemini key quota exceeded / out of credits.',
+        }));
       } else {
         alert(`Website & founder search failed: ${err.message}`);
         if (err.message && err.message.toLowerCase().includes('gemini')) {
           setIsKeyDrawerOpen(true);
         }
       }
+    }
+  };
+
+  const handleResumeEnrichment = async (newKey?: string) => {
+    if (newKey && newKey.trim()) {
+      const cleanKey = newKey.trim();
+      try {
+        await updateKeys({ gemini_api_key: cleanKey });
+        storageService.saveSettings({ geminiApiKey: cleanKey });
+        setGeminiApiKey(cleanKey);
+        setHasConfiguredKey(true);
+        setMaskedKey(cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4));
+      } catch (e) {
+        console.warn('Failed to update Gemini key:', e);
+      }
+    }
+
+    setOutOfCredits(null);
+
+    // Resume ONLY un-enriched or pending records from wherever stopped
+    const unEnriched = records.filter(
+      (r) => r.enrichmentStatus !== 'enriched' && !r.companyWebsite
+    );
+
+    if (unEnriched.length > 0) {
+      const ids = unEnriched.map((r) => r.id);
+      await handleStartEnrichment(ids);
+    } else {
+      alert('All records have already been researched!');
     }
   };
 
@@ -502,19 +560,58 @@ export const WebsiteFinder: React.FC = () => {
           </button>
         </div>
 
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => {
-            setRecords(getSampleInitialRecords());
-            setActiveTab('table');
-          }}
-          className="text-xs text-slate-500 hover:text-slate-800"
-        >
-          <RotateCcw className="w-3.5 h-3.5 mr-1" />
-          Load Sample Accounts
-        </Button>
+        <div className="flex items-center gap-2">
+          {outOfCredits?.active ? (
+            <Button
+              size="sm"
+              onClick={() => handleResumeEnrichment()}
+              className="text-xs bg-amber-600 hover:bg-amber-700 text-white font-semibold animate-pulse"
+            >
+              <Play className="w-3.5 h-3.5 mr-1" />
+              Resume Search
+            </Button>
+          ) : records.length > 0 ? (
+            <Button
+              size="sm"
+              onClick={() => handleStartEnrichment()}
+              disabled={progress.isActive}
+              className="text-xs bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+            >
+              <Play className="w-3.5 h-3.5 mr-1" />
+              Research Websites ({records.length})
+            </Button>
+          ) : null}
+
+          {records.length > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                if (confirm('Clear all loaded companies?')) {
+                  setRecords([]);
+                  setOutOfCredits(null);
+                }
+              }}
+              disabled={progress.isActive}
+              className="text-xs text-rose-600 hover:bg-rose-50"
+            >
+              <Trash2 className="w-3.5 h-3.5 mr-1" />
+              Clear
+            </Button>
+          )}
+        </div>
       </div>
+
+      {/* Out of Credits Alert Banner */}
+      {outOfCredits?.active && (
+        <OutOfCreditsBanner
+          providerName="Google Gemini"
+          message={outOfCredits.message}
+          onSaveAndResume={(newKey) => handleResumeEnrichment(newKey)}
+          onResume={() => handleResumeEnrichment()}
+          onDismiss={() => setOutOfCredits(null)}
+        />
+      )}
 
       <ProgressIndicator
         progress={progress}

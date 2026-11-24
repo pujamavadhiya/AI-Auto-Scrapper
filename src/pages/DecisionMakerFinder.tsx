@@ -29,11 +29,21 @@ import { decisionMakerService } from '../services/adapters';
 import { storageService } from '../services/storageService';
 import { getApiBaseUrl, getAuthHeaders } from '../config/api';
 import { historyService } from '../services/historyService';
+import { useAuth } from '../context/AuthContext';
+import { OutOfCreditsBanner } from '../components/common/OutOfCreditsBanner';
 
 export const DecisionMakerFinder: React.FC = () => {
+  const { updateKeys } = useAuth();
   const [activeTab, setActiveTab] = useState<'table' | 'quick' | 'upload'>('table');
   const [records, setRecords] = useState<EnrichmentRecord[]>([]);
   const [parsedFile, setParsedFile] = useState<ParsedFileResult | null>(null);
+
+  // Out of credits pause / resume state
+  const [outOfCredits, setOutOfCredits] = useState<{
+    active: boolean;
+    provider: 'serpapi' | 'serper';
+    message: string;
+  } | null>(null);
 
   // Quick form input state
   const [quickForm, setQuickForm] = useState({
@@ -381,9 +391,74 @@ export const DecisionMakerFinder: React.FC = () => {
           status: 'cancelled',
           stageMessage: 'Discovery cancelled by user.',
         }));
+      } else if (err.outOfCredits) {
+        // External key ran out of search credits
+        const engineLabel = (err.provider || selectedEngine) === 'serper' ? 'Serper.dev' : 'SerpApi';
+        setOutOfCredits({
+          active: true,
+          provider: (err.provider || selectedEngine) as 'serpapi' | 'serper',
+          message: err.message || `${engineLabel} key is out of credits. All fetched decision makers have been preserved.`,
+        });
+
+        // Ensure all partially completed records are retained in table
+        if (err.partialResults && Array.isArray(err.partialResults)) {
+          const partialMap = new Map<string, EnrichmentRecord>(
+            err.partialResults.map((r: EnrichmentRecord) => [r.id, r])
+          );
+          setRecords((prev: EnrichmentRecord[]) => prev.map((item) => partialMap.get(item.id) || item));
+        }
+
+        setProgress((prev) => ({
+          ...prev,
+          isActive: false,
+          status: 'paused',
+          stageMessage: `Paused: ${engineLabel} key is out of credits.`,
+        }));
       } else {
         alert(`Discovery error: ${err.message}`);
       }
+    }
+  };
+
+  const handleResumeEnrichment = async (newKey?: string) => {
+    const isSerper = (outOfCredits?.provider || selectedEngine) === 'serper';
+
+    if (newKey && newKey.trim()) {
+      const cleanKey = newKey.trim();
+      try {
+        await updateKeys(isSerper ? { serper_key: cleanKey } : { serpapi_key: cleanKey });
+        if (isSerper) {
+          storageService.saveSettings({ serperApiKey: cleanKey });
+          setServerConfig((prev) => ({
+            ...prev,
+            hasSerperApiKey: true,
+            serperApiKeyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
+          }));
+        } else {
+          storageService.saveSettings({ serpApiKey: cleanKey });
+          setServerConfig((prev) => ({
+            ...prev,
+            hasSerpApiKey: true,
+            serpApiKeyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
+          }));
+        }
+      } catch (e) {
+        console.warn('Failed to update key:', e);
+      }
+    }
+
+    setOutOfCredits(null);
+
+    // Resume ONLY un-enriched or pending records from wherever it stopped!
+    const unEnriched = records.filter(
+      (r) => r.enrichmentStatus !== 'enriched' && !r.personName
+    );
+
+    if (unEnriched.length > 0) {
+      const ids = unEnriched.map((r) => r.id);
+      await handleStartEnrichment(ids);
+    } else {
+      alert('All records have already been enriched!');
     }
   };
 
@@ -590,22 +665,34 @@ export const DecisionMakerFinder: React.FC = () => {
 
         {records.length > 0 && (
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => handleStartEnrichment()}
-              disabled={progress.isActive}
-              className="text-xs bg-blue-600 hover:bg-blue-700 text-white"
-            >
-              <Play className="w-3.5 h-3.5 mr-1" />
-              Find All Decision Makers ({records.length})
-            </Button>
+            {outOfCredits?.active ? (
+              <Button
+                size="sm"
+                onClick={() => handleResumeEnrichment()}
+                className="text-xs bg-amber-600 hover:bg-amber-700 text-white font-semibold animate-pulse"
+              >
+                <Play className="w-3.5 h-3.5 mr-1" />
+                Resume Discovery
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => handleStartEnrichment()}
+                disabled={progress.isActive}
+                className="text-xs bg-blue-600 hover:bg-blue-700 text-white"
+              >
+                <Play className="w-3.5 h-3.5 mr-1" />
+                Find All Decision Makers ({records.length})
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
               onClick={() => {
                 if (confirm('Clear all loaded companies and start fresh?')) {
                   setRecords([]);
+                  setOutOfCredits(null);
                 }
               }}
               disabled={progress.isActive}
@@ -617,6 +704,17 @@ export const DecisionMakerFinder: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Out of Credits Alert Banner */}
+      {outOfCredits?.active && (
+        <OutOfCreditsBanner
+          providerName={outOfCredits.provider === 'serper' ? 'Serper.dev' : 'SerpApi'}
+          message={outOfCredits.message}
+          onSaveAndResume={(newKey) => handleResumeEnrichment(newKey)}
+          onResume={() => handleResumeEnrichment()}
+          onDismiss={() => setOutOfCredits(null)}
+        />
+      )}
 
       {/* Progress Indicator */}
       <ProgressIndicator

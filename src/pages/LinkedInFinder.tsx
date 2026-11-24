@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Info,
   Layers,
+  Trash2,
 } from 'lucide-react';
 import { ModuleHeader } from '../components/common/ModuleHeader';
 import { FileUploader } from '../components/common/FileUploader';
@@ -33,31 +34,20 @@ import { linkedinFinderService } from '../services/adapters';
 import { getSampleInitialRecords } from '../services/mockData';
 import { storageService } from '../services/storageService';
 import { historyService } from '../services/historyService';
+import { useAuth } from '../context/AuthContext';
+import { OutOfCreditsBanner } from '../components/common/OutOfCreditsBanner';
 
 export const LinkedInFinder: React.FC = () => {
+  const { updateKeys } = useAuth();
   const [activeTab, setActiveTab] = useState<'table' | 'upload' | 'config' | 'review'>('table');
-  const [records, setRecords] = useState<EnrichmentRecord[]>(() => {
-    return getSampleInitialRecords().map((r, i) => {
-      if (i < 3) {
-        return {
-          ...r,
-          matchStatus: 'Found (High)',
-          confidenceLevel: 'High',
-          matchedName: r.personName,
-          matchedHeadline: `${r.title} - ${r.companyName}`,
-          evidence: 'name:exact; company:strong(headline); location:match_city',
-        };
-      }
-      return {
-        ...r,
-        linkedinUrl: '', // Precision rule demo: leave blank if not confirmed
-        matchStatus: 'Not verified - see Review sheet',
-        confidenceLevel: '',
-        evidence: 'company not confirmed in search result',
-        enrichmentStatus: 'not_found',
-      };
-    });
-  });
+  const [records, setRecords] = useState<EnrichmentRecord[]>([]);
+
+  // Out of credits pause / resume state
+  const [outOfCredits, setOutOfCredits] = useState<{
+    active: boolean;
+    provider: string;
+    message: string;
+  } | null>(null);
 
   const [parsedFile, setParsedFile] = useState<ParsedFileResult | null>(null);
   const [rawUploadedFile, setRawUploadedFile] = useState<File | null>(null);
@@ -183,7 +173,13 @@ export const LinkedInFinder: React.FC = () => {
         targets,
         config,
         (p) => setProgress(p),
-        abortControllerRef.current.signal
+        abortControllerRef.current.signal,
+        (chunkResults) => {
+          setRecords((prev) => {
+            const chunkMap = new Map(chunkResults.map((r) => [r.id, r]));
+            return prev.map((item) => chunkMap.get(item.id) || item);
+          });
+        }
       );
 
       setRecords((prev) => {
@@ -211,9 +207,60 @@ export const LinkedInFinder: React.FC = () => {
           status: 'cancelled',
           stageMessage: 'Search cancelled by user.',
         }));
+      } else if (err.outOfCredits) {
+        setOutOfCredits({
+          active: true,
+          provider: 'serpapi',
+          message: err.message || 'SerpAPI key is out of search credits. All verified records have been preserved.',
+        });
+
+        if (err.partialResults && Array.isArray(err.partialResults)) {
+          const partialMap = new Map<string, EnrichmentRecord>(
+            err.partialResults.map((r: EnrichmentRecord) => [r.id, r])
+          );
+          setRecords((prev: EnrichmentRecord[]) => prev.map((item) => partialMap.get(item.id) || item));
+        }
+
+        setProgress((prev) => ({
+          ...prev,
+          isActive: false,
+          status: 'paused',
+          stageMessage: 'Paused: SerpAPI key is out of credits.',
+        }));
       } else {
         alert(`Search failed: ${err.message}`);
       }
+    }
+  };
+
+  const handleResumeEnrichment = async (newKey?: string) => {
+    if (newKey && newKey.trim()) {
+      const cleanKey = newKey.trim();
+      try {
+        await updateKeys({ serpapi_key: cleanKey });
+        storageService.saveSettings({ serpApiKey: cleanKey });
+        setBackendHealth((prev) => ({
+          ...prev,
+          hasKey: true,
+          keyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
+        }));
+      } catch (e) {
+        console.warn('Failed to update SerpApi key:', e);
+      }
+    }
+
+    setOutOfCredits(null);
+
+    // Resume ONLY un-enriched or unverified records from wherever stopped
+    const unEnriched = records.filter(
+      (r) => r.enrichmentStatus !== 'enriched' && !r.linkedinUrl
+    );
+
+    if (unEnriched.length > 0) {
+      const ids = unEnriched.map((r) => r.id);
+      await handleStartEnrichment(ids);
+    } else {
+      alert('All records have already been verified!');
     }
   };
 
@@ -436,20 +483,57 @@ export const LinkedInFinder: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => {
-              setRecords(getSampleInitialRecords());
-              setActiveTab('table');
-            }}
-            className="text-xs text-slate-500 hover:text-slate-800"
-          >
-            <RotateCcw className="w-3.5 h-3.5 mr-1" />
-            Reset Sample Leads
-          </Button>
+          {outOfCredits?.active ? (
+            <Button
+              size="sm"
+              onClick={() => handleResumeEnrichment()}
+              className="text-xs bg-amber-600 hover:bg-amber-700 text-white font-semibold animate-pulse"
+            >
+              <Play className="w-3.5 h-3.5 mr-1" />
+              Resume Verification
+            </Button>
+          ) : records.length > 0 ? (
+            <Button
+              size="sm"
+              onClick={() => handleStartEnrichment()}
+              disabled={progress.isActive}
+              className="text-xs bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+            >
+              <Play className="w-3.5 h-3.5 mr-1" />
+              Verify Profiles ({records.length})
+            </Button>
+          ) : null}
+
+          {records.length > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                if (confirm('Clear all loaded records?')) {
+                  setRecords([]);
+                  setOutOfCredits(null);
+                }
+              }}
+              disabled={progress.isActive}
+              className="text-xs text-rose-600 hover:bg-rose-50"
+            >
+              <Trash2 className="w-3.5 h-3.5 mr-1" />
+              Clear
+            </Button>
+          )}
         </div>
       </div>
+
+      {/* Out of Credits Alert Banner */}
+      {outOfCredits?.active && (
+        <OutOfCreditsBanner
+          providerName="SerpApi"
+          message={outOfCredits.message}
+          onSaveAndResume={(newKey) => handleResumeEnrichment(newKey)}
+          onResume={() => handleResumeEnrichment()}
+          onDismiss={() => setOutOfCredits(null)}
+        />
+      )}
 
       {/* Progress Indicator */}
       <ProgressIndicator

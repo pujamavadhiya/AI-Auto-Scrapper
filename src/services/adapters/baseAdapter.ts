@@ -29,7 +29,9 @@ export interface IResearchAdapter {
     records: EnrichmentRecord[],
     config: ResearchConfig,
     onProgress?: (progress: ResearchProgress) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onChunk?: (chunkResults: EnrichmentRecord[]) => void,
+    onRecordEnriched?: (record: EnrichmentRecord) => void
   ): Promise<EnrichmentRecord[]>;
 }
 

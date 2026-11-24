@@ -196,8 +196,73 @@ def first_value(data: Any, paths: List[str]) -> str:
     return ""
 
 
+def resolve_linkedin_profile(name: str = "", company: str = "", website: str = "") -> Tuple[str, str]:
+    """
+    Auto-resolves a decision-maker's LinkedIn profile URL if not provided.
+    Uses multi-engine search (Yahoo, DDG, Bing) from linkedin_profile_collector,
+    and falls back to decision_maker_finder.
+    Returns (cleaned_linkedin_url, resolved_name).
+    """
+    nm = (name or "").strip()
+    comp = (company or "").strip()
+    web = (website or "").strip()
+
+    # 1. Multi-engine search via linkedin_profile_collector.run_search
+    try:
+        try:
+            from backend.linkedin_profile_collector import run_search
+        except ImportError:
+            from linkedin_profile_collector import run_search
+
+        queries = []
+        if nm and comp:
+            queries.append(f'site:linkedin.com/in "{nm}" "{comp}"')
+            queries.append(f'site:linkedin.com/in {nm} {comp}')
+        elif nm:
+            queries.append(f'site:linkedin.com/in "{nm}"')
+        elif comp:
+            queries.append(f'site:linkedin.com/in ("Owner" OR "Founder" OR "CEO" OR "President") "{comp}"')
+
+        for q in queries:
+            try:
+                results = run_search(q, page=1, order=["yahoo", "ddg", "bing"])
+                if results and isinstance(results, list):
+                    for r in results:
+                        u = r.get("url", "")
+                        if "linkedin.com/in/" in u:
+                            cleaned = clean_linkedin(u)
+                            if cleaned:
+                                res_nm = nm
+                                if not res_nm and r.get("title"):
+                                    t_part = r["title"].split("-")[0].split("|")[0].strip()
+                                    if len(t_part.split()) >= 2:
+                                        res_nm = t_part
+                                return cleaned, res_nm
+            except Exception as e:
+                logger.debug(f"run_search query '{q}' error: {e}")
+    except Exception as e:
+        logger.debug(f"Could not load run_search: {e}")
+
+    # 2. Fallback to decision_maker_finder
+    if comp:
+        try:
+            try:
+                from backend.decision_maker_finder import find_decision_maker
+            except ImportError:
+                from decision_maker_finder import find_decision_maker
+            dm = find_decision_maker(comp, web, "")
+            if dm and dm.get("url"):
+                cleaned = clean_linkedin(dm["url"])
+                if cleaned:
+                    return cleaned, nm or dm.get("name", "")
+        except Exception as e:
+            logger.debug(f"DecisionMakerFinder fallback error: {e}")
+
+    return "", nm
+
+
 def extract_email(data: Any, preferred_domain: str = "") -> str:
-    """Extracts the best email from LeadOcean response (matching company domain first)."""
+    """Extracts the best email from LeadOcean response (prioritizing verified & matching domain)."""
     if not isinstance(data, dict):
         return ""
 
@@ -210,20 +275,49 @@ def extract_email(data: Any, preferred_domain: str = "") -> str:
     clean_dom = (preferred_domain or "").lower().replace("www.", "").strip()
 
     if isinstance(contact_emails, list) and contact_emails:
-        # First priority: email matching the company's domain
+        # Priority 1: Verified/valid email matching company domain
+        if clean_dom:
+            for item in contact_emails:
+                if isinstance(item, dict):
+                    em = str(item.get("email") or "").strip()
+                    st = str(item.get("status") or "").lower()
+                    if em and f"@{clean_dom}" in em.lower() and st in ("verified", "valid"):
+                        return em
+
+        # Priority 2: Any email matching company domain (not invalid)
         if clean_dom:
             for item in contact_emails:
                 em = item.get("email") if isinstance(item, dict) else (str(item) if isinstance(item, str) else "")
-                if em and f"@{clean_dom}" in em.lower():
+                st = str(item.get("status") or "").lower() if isinstance(item, dict) else ""
+                if em and f"@{clean_dom}" in em.lower() and st != "invalid":
                     return em.strip()
 
-        # Second priority: work email
+        # Priority 3: Any verified or valid email (regardless of domain)
         for item in contact_emails:
             if isinstance(item, dict):
-                if item.get("type") in ("work", "work_primary") and item.get("email"):
-                    return str(item["email"]).strip()
+                em = str(item.get("email") or "").strip()
+                st = str(item.get("status") or "").lower()
+                if em and "@" in em and st in ("verified", "valid"):
+                    return em
 
-        # Third priority: first valid email
+        # Priority 4: Work email that is not invalid
+        for item in contact_emails:
+            if isinstance(item, dict):
+                em = str(item.get("email") or "").strip()
+                tp = str(item.get("type") or "").lower()
+                st = str(item.get("status") or "").lower()
+                if em and "@" in em and ("work" in tp) and st != "invalid":
+                    return em
+
+        # Priority 5: Any email that is not invalid
+        for item in contact_emails:
+            if isinstance(item, dict):
+                em = str(item.get("email") or "").strip()
+                st = str(item.get("status") or "").lower()
+                if em and "@" in em and st != "invalid":
+                    return em
+
+        # Priority 6: First available email
         for item in contact_emails:
             em = item.get("email") if isinstance(item, dict) else (str(item) if isinstance(item, str) else "")
             if em and "@" in em:
@@ -250,18 +344,42 @@ def extract_phone(data: Any) -> str:
     )
 
     if isinstance(contact_phones, list) and contact_phones:
+        # Priority 1: Verified/valid phones
         for item in contact_phones:
-            ph = item.get("phone") if isinstance(item, dict) else (str(item) if isinstance(item, str) else "")
+            if isinstance(item, dict):
+                ph = str(item.get("phone") or item.get("number") or item.get("phone_number") or item.get("value") or "").strip()
+                st = str(item.get("status") or "").lower()
+                if ph and len(re.sub(r"\D", "", ph)) >= 7 and st in ("verified", "valid"):
+                    return ph
+
+        # Priority 2: Direct or mobile phones
+        for item in contact_phones:
+            if isinstance(item, dict):
+                ph = str(item.get("phone") or item.get("number") or item.get("phone_number") or item.get("value") or "").strip()
+                tp = str(item.get("type") or "").lower()
+                if ph and len(re.sub(r"\D", "", ph)) >= 7 and ("direct" in tp or "mobile" in tp or "work" in tp):
+                    return ph
+
+        # Priority 3: Any valid phone in contact_phones
+        for item in contact_phones:
+            ph = item.get("phone") or item.get("number") or item.get("phone_number") or item.get("value") if isinstance(item, dict) else (str(item) if isinstance(item, str) else "")
             if ph and isinstance(ph, str) and len(re.sub(r"\D", "", ph)) >= 7:
                 return ph.strip()
 
-    # Fallback to configured paths
-    return first_value(data, [
+    # Fallback to alternate paths in LeadOcean response
+    for path in [
         "data.contact_data.contact_phones.0.phone",
+        "data.contact_data.contact_phones.0.number",
         "contact_data.contact_phones.0.phone",
         "data.phone",
         "phone",
-    ])
+        "data.profile_data.phone",
+    ]:
+        val = first_value(data, [path])
+        if val and len(re.sub(r"\D", "", str(val))) >= 7:
+            return str(val).strip()
+
+    return ""
 
 
 def build_request(cfg: Dict[str, Any], ctx: Dict[str, str], api_key: str) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, str]]:
@@ -271,9 +389,8 @@ def build_request(cfg: Dict[str, Any], ctx: Dict[str, str], api_key: str) -> Tup
     payload: Dict[str, Any] = {}
 
     if is_leadocean_enrich:
-        # LeadOcean strictly requires exactly one identifier: linkedin_url, email, phone, or person_id
-        # and rejects unrecognized fields like full_name, company, domain.
-        payload = {"reveal_email": True}
+        # LeadOcean strictly requires reveal_email: True and reveal_phone: True
+        payload = {"reveal_email": True, "reveal_phone": True}
         if ctx.get("linkedin"):
             payload["linkedin_url"] = ctx["linkedin"]
         elif ctx.get("email"):
@@ -283,6 +400,15 @@ def build_request(cfg: Dict[str, Any], ctx: Dict[str, str], api_key: str) -> Tup
     else:
         # Generic provider template
         for k, tmpl in cfg.get("request_map", {}).items():
+            if isinstance(tmpl, bool):
+                payload[k] = tmpl
+                continue
+            try:
+                val = str(tmpl).format(**ctx).strip()
+                if val:
+                    payload[k] = val
+            except Exception:
+                pass
             if isinstance(tmpl, bool):
                 payload[k] = tmpl
                 continue
@@ -336,6 +462,8 @@ def call_api(cfg: Dict[str, Any], ctx: Dict[str, str], api_key: str) -> Tuple[Op
             if r.status_code == 404:
                 return {}, "not_found"
             if r.status_code >= 400:
+                if any(w in r.text.lower() for w in ["credit", "balance", "quota", "payment", "insufficient"]):
+                    return None, "credits_required_http_402"
                 return None, f"http_{r.status_code}: {r.text[:140]}"
             try:
                 return r.json(), ""
@@ -385,18 +513,13 @@ def enrich_dataframe(
         domain = clean_domain(row[cols["website"]]) if "website" in cols else ""
         first, last = split_name(name)
 
-        if not linkedin and name and comp:
-            try:
-                try:
-                    from decision_maker_finder import find_decision_maker
-                except ImportError:
-                    from backend.decision_maker_finder import find_decision_maker
-                dm = find_decision_maker(comp, domain, "")
-                if dm and dm.get("url"):
-                    linkedin = clean_linkedin(dm["url"])
-                    progress(f"    Resolved LinkedIn URL: {linkedin}")
-            except Exception:
-                pass
+        if not linkedin and (name or comp):
+            res_li, res_nm = resolve_linkedin_profile(name, comp, str(row[cols["website"]]).strip() if "website" in cols else "")
+            if res_li:
+                linkedin = res_li
+                if not name and res_nm:
+                    name = res_nm
+                progress(f"    Resolved LinkedIn URL: {linkedin} ({name})")
 
         ctx = {
             "linkedin": linkedin,
@@ -530,20 +653,13 @@ class LeadOceanEnricher:
                 raw_error="LEADOCEAN_API_KEY is missing. Please configure LEADOCEAN_API_KEY in .env or Settings.",
             )
 
-        # If LinkedIn URL is missing, attempt to resolve via SerpApi DecisionMakerFinder
-        if not li and comp:
-            try:
-                try:
-                    from decision_maker_finder import find_decision_maker
-                except ImportError:
-                    from backend.decision_maker_finder import find_decision_maker
-                dm = find_decision_maker(comp, web, "")
-                if dm and dm.get("url"):
-                    li = clean_linkedin(dm["url"])
-                    if not nm and dm.get("name"):
-                        nm = dm["name"]
-            except Exception as e:
-                logger.debug(f"Could not auto-resolve LinkedIn: {e}")
+        # If LinkedIn URL is missing, attempt auto-resolution
+        if not li and (nm or comp):
+            res_li, res_nm = resolve_linkedin_profile(nm, comp, web)
+            if res_li:
+                li = res_li
+                if not nm and res_nm:
+                    nm = res_nm
 
         if not li:
             return ContactEnrichmentResult(

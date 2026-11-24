@@ -463,10 +463,11 @@ class SerpApiClient:
                     results: list = []
                 elif err:
                     if any(x in low for x in ("invalid api key", "run out of searches", "out of searches",
-                                              "account", "plan")) or resp.status_code in (401, 403):
-                        raise FatalSerpError(err)
+                                              "account", "plan", "credit", "quota", "fair usage")) or resp.status_code in (401, 402, 403, 429):
+                        raise FatalSerpError(err or f"HTTP {resp.status_code}: out of credits or quota")
                     raise RuntimeError(err)
-                elif resp.status_code >= 400:
+                elif resp.status_code in (401, 402, 403, 429):
+                    raise FatalSerpError(f"HTTP {resp.status_code}: out of credits or quota")
                     raise RuntimeError(f"HTTP {resp.status_code}")
                 else:
                     results = data.get("organic_results") or []

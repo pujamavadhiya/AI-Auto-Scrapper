@@ -200,6 +200,14 @@ def parse_profile(result: Dict[str, Any]) -> Optional[Dict[str, str]]:
 _SEARCH_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 
 
+class CreditLimitError(RuntimeError):
+    """Raised when an external API runs out of credits or search quota."""
+    def __init__(self, provider: str, message: str):
+        super().__init__(message)
+        self.provider = provider
+        self.message = message
+
+
 def serp_search(query: str, api_key: str, num: int = 10, retries: int = 2) -> List[Dict[str, Any]]:
     cache_key = f"{query.strip()}:{api_key[:6]}"
     if cache_key in _SEARCH_CACHE:
@@ -222,16 +230,22 @@ def serp_search(query: str, api_key: str, num: int = 10, retries: int = 2) -> Li
                 _SEARCH_CACHE[cache_key] = results
                 return results
             err = data.get("error", f"HTTP {r.status_code}")
-            if "no results" in str(err).lower():
+            low_err = str(err).lower()
+            if "no results" in low_err:
                 _SEARCH_CACHE[cache_key] = []
                 return []
-            if r.status_code in (401, 403) or "invalid api key" in str(err).lower():
-                logger.error(f"SerpApi auth error: {err}")
-                return []
-            if "run out of searches" in str(err).lower():
+            if "run out of searches" in low_err or "out of searches" in low_err:
                 logger.error("SerpApi: out of search credits.")
-                return []
+                raise CreditLimitError("serpapi", f"SerpApi out of search credits: {err}")
+            if r.status_code in (401, 403) or "invalid api key" in low_err:
+                logger.error(f"SerpApi auth error: {err}")
+                raise CreditLimitError("serpapi", f"SerpApi key error: {err}")
+            if r.status_code in (402, 429) or "credit" in low_err:
+                logger.error(f"SerpApi quota/credit error: {err}")
+                raise CreditLimitError("serpapi", f"SerpApi out of credits or quota reached: {err}")
             logger.warning(f"    SerpApi error: {err} (attempt {attempt + 1})")
+        except CreditLimitError:
+            raise
         except requests.RequestException as e:
             logger.warning(f"    network error: {e} (attempt {attempt + 1})")
         time.sleep(2 * (attempt + 1))
@@ -315,13 +329,15 @@ def serper_search(query: str, api_key: str, num: int = 10, retries: int = 2) -> 
                 results = r.json().get("organic", []) or []
                 _SERPER_CACHE[cache_key] = results
                 return results
+            if (r.status_code == 400 and "credit" in r.text.lower()) or r.status_code == 402:
+                logger.error("Serper: out of credits.")
+                raise CreditLimitError("serper", f"Serper.dev is out of credits (HTTP {r.status_code}): {r.text[:120]}")
             if r.status_code in (401, 403):
                 logger.error(f"Serper auth error (HTTP {r.status_code}). Check SERPER_API_KEY.")
-                return []
-            if r.status_code == 400 and "credit" in r.text.lower():
-                logger.error("Serper: out of credits.")
-                return []
+                raise CreditLimitError("serper", f"Serper auth error (HTTP {r.status_code}). Check SERPER_API_KEY.")
             logger.warning(f"    Serper HTTP {r.status_code} (attempt {attempt + 1})")
+        except CreditLimitError:
+            raise
         except requests.RequestException as e:
             logger.warning(f"    Serper network error: {e} (attempt {attempt + 1})")
         time.sleep(1.5 * (attempt + 1))
@@ -552,26 +568,37 @@ class DecisionMakerFinder:
                 error_message="Company name or LinkedIn URL is required.",
             )
 
-        if active_engine == "serper":
-            key = (api_key or self.serper_key or os.environ.get("SERPER_API_KEY", "")).strip()
-            if not key:
-                return DecisionMakerResult(
-                    company_name=comp,
-                    status="error",
-                    error_message="SERPER_API_KEY is missing. Please configure SERPER_API_KEY in Settings or .env.",
-                )
-            dm = find_decision_maker_serper(comp, web, li, key)
-            engine_label = "Serper API"
-        else:
-            key = (api_key or self.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
-            if not key:
-                return DecisionMakerResult(
-                    company_name=comp,
-                    status="error",
-                    error_message="SERPAPI_KEY is missing. Please configure SERPAPI_KEY in Settings or .env.",
-                )
-            dm = find_decision_maker_serpapi(comp, web, li, key, max_queries)
-            engine_label = "SerpApi"
+        try:
+            if active_engine == "serper":
+                key = (api_key or self.serper_key or os.environ.get("SERPER_API_KEY", "")).strip()
+                if not key:
+                    return DecisionMakerResult(
+                        company_name=comp,
+                        status="error",
+                        error_message="SERPER_API_KEY is missing. Please configure SERPER_API_KEY in Settings or .env.",
+                    )
+                dm = find_decision_maker_serper(comp, web, li, key)
+                engine_label = "Serper API"
+            else:
+                key = (api_key or self.serpapi_key or os.environ.get("SERPAPI_KEY", "")).strip()
+                if not key:
+                    return DecisionMakerResult(
+                        company_name=comp,
+                        status="error",
+                        error_message="SERPAPI_KEY is missing. Please configure SERPAPI_KEY in Settings or .env.",
+                    )
+                dm = find_decision_maker_serpapi(comp, web, li, key, max_queries)
+                engine_label = "SerpApi"
+        except CreditLimitError as ce:
+            logger.error(f"Credit limit reached during decision maker search: {ce}")
+            return DecisionMakerResult(
+                company_name=comp,
+                company_website=web,
+                company_linkedin_url=li,
+                status="out_of_credits",
+                error_message=ce.message,
+                evidence=f"CREDIT_LIMIT:{ce.provider}",
+            )
 
         if not dm:
             return DecisionMakerResult(

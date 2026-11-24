@@ -44,6 +44,11 @@ GEMINI_MODELS = [
 ]
 
 
+class GeminiCreditError(RuntimeError):
+    """Raised when Google Gemini API runs out of quota or credits."""
+    pass
+
+
 def get_gemini_api_key(explicit_key: Optional[str] = None) -> str:
     key = (explicit_key or os.environ.get("GEMINI_API_KEY", "")).strip()
     return key
@@ -51,6 +56,7 @@ def get_gemini_api_key(explicit_key: Optional[str] = None) -> str:
 
 def call_gemini_api(prompt: str, api_key: str, timeout: int = 35) -> Optional[str]:
     """Calls Google Generative Language API with model fallback."""
+    last_credit_err = None
     for model_name in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
         try:
@@ -75,10 +81,28 @@ def call_gemini_api(prompt: str, api_key: str, timeout: int = 35) -> Optional[st
                     parts = candidates[0]["content"].get("parts", [])
                     if parts and "text" in parts[0]:
                         return parts[0]["text"]
+            
+            # Check for quota exhaustion / out of credits or invalid key
+            if r.status_code in (400, 401, 403, 429) and (
+                "RESOURCE_EXHAUSTED" in r.text
+                or "quota" in r.text.lower()
+                or "api_key_invalid" in r.text.lower()
+                or "invalid api key" in r.text.lower()
+                or "credit" in r.text.lower()
+            ):
+                logger.error(f"Gemini API quota/key error (status {r.status_code}) on {model_name}: {r.text[:200]}")
+                last_credit_err = GeminiCreditError(f"Google Gemini API error (status {r.status_code}): {r.text[:150]}")
+                break
+
             logger.warning(f"Gemini API returned status {r.status_code} on {model_name}: {r.text[:200]}")
+        except GeminiCreditError:
+            raise
         except Exception as e:
             logger.warning(f"Gemini API call failed on {model_name}: {e}")
             time.sleep(1)
+
+    if last_credit_err:
+        raise last_credit_err
 
     return None
 

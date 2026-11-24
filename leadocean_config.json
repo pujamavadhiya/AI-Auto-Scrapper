@@ -1,5 +1,5 @@
 {
-  "_help": "LeadOcean API Configuration. The /v1/people/enrich endpoint requires 'linkedin_url' and 'reveal_email': true.",
+  "_help": "LeadOcean API Configuration. The /v1/people/enrich endpoint requires 'linkedin_url', 'reveal_email': true, and 'reveal_phone': true.",
   "url": "https://api.leadocean.io/v1/people/enrich",
   "method": "POST",
   "api_key_env": "LEADOCEAN_API_KEY",
@@ -8,7 +8,8 @@
   "auth_prefix": "",
   "request_map": {
     "linkedin_url": "{linkedin}",
-    "reveal_email": true
+    "reveal_email": true,
+    "reveal_phone": true
   },
   "email_paths": [
     "data.contact_data.contact_emails.0.email",

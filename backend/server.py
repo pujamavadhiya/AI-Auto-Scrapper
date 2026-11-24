@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 import sys
@@ -18,6 +19,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("server")
 
 # Path setup
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,9 +52,9 @@ from linkedin_finder import (
 )
 from linkedin_collector import CollectorConfig, KeywordLinkedInCollector, clean_linkedin_url
 from social_media_scraper import SocialMediaScraper
-from decision_maker_finder import DecisionMakerFinder
+from decision_maker_finder import DecisionMakerFinder, CreditLimitError
 from leadocean_enricher import LeadOceanEnricher, load_config as load_leadocean_config
-from gemini_lead_auditor import audit_leads_with_gemini, get_gemini_api_key, call_gemini_api
+from gemini_lead_auditor import audit_leads_with_gemini, get_gemini_api_key, call_gemini_api, GeminiCreditError
 
 app = FastAPI(title="AI Auto Scrapper API", version="1.0.0")
 
@@ -286,9 +290,27 @@ def get_user_keys_endpoint(authorization: Optional[str] = Header(None)):
 
 @app.post("/api/user/keys")
 def update_user_keys_endpoint(payload: UserKeyUpdatePayload, authorization: Optional[str] = Header(None)):
-    """Updates API keys for the logged-in user in their private database record."""
+    """Updates API keys for the logged-in user in their private database record and active process environment."""
     user = get_current_user(authorization)
     updated = database.update_user_keys(user["id"], payload.model_dump(exclude_unset=True))
+
+    # Synchronize newly saved keys into runtime environment so all active modules pick them up immediately
+    s_key = (payload.serpapiKey or payload.serpapi_key or "").strip()
+    if s_key:
+        os.environ["SERPAPI_KEY"] = s_key
+    sr_key = (payload.serperKey or payload.serper_key or "").strip()
+    if sr_key:
+        os.environ["SERPER_API_KEY"] = sr_key
+    g_key = (payload.geminiApiKey or payload.gemini_api_key or "").strip()
+    if g_key:
+        os.environ["GEMINI_API_KEY"] = g_key
+    lo_key = (payload.leadoceanApiKey or payload.leadocean_api_key or "").strip()
+    if lo_key:
+        os.environ["LEADOCEAN_API_KEY"] = lo_key
+    ap_key = (payload.apifyToken or payload.apify_token or "").strip()
+    if ap_key:
+        os.environ["APIFY_TOKEN"] = ap_key
+
     return {
         "status": "ok",
         "message": f"API keys updated successfully for {user['email']}.",
@@ -786,7 +808,37 @@ def enrich_linkedin_rows(payload: EnrichRowsPayload, authorization: Optional[str
                 title=title,
             ).prepare()
 
-            res = finder.find(lk)
+            try:
+                res = finder.find(lk)
+            except FatalSerpError as fe:
+                logger.error(f"Fatal SerpAPI credit/key error on record {i + 1}: {fe}")
+                # Preserve this record and subsequent records as paused with out_of_credits status
+                curr_rec = dict(rec)
+                curr_rec["enrichmentStatus"] = "out_of_credits"
+                curr_rec["notes"] = f"Paused: SerpAPI key is out of credits ({str(fe)})"
+                updated_records.append(curr_rec)
+
+                for rem_idx in range(i + 1, len(records)):
+                    rem_rec = dict(records[rem_idx])
+                    rem_rec["enrichmentStatus"] = "out_of_credits"
+                    rem_rec["notes"] = f"Paused: SerpAPI key is out of credits ({str(fe)})"
+                    updated_records.append(rem_rec)
+
+                return {
+                    "status": "out_of_credits",
+                    "outOfCredits": True,
+                    "provider": "serpapi",
+                    "message": f"SerpAPI key is out of search credits: {str(fe)}. Please enter a new key to resume.",
+                    "records": updated_records,
+                    "summary": {
+                        "total": len(records),
+                        "found": found_count,
+                        "blank": len(records) - found_count,
+                        "searchesBilled": client.calls,
+                        "reviewCount": len(review_items),
+                    },
+                    "review": review_items,
+                }
 
             if res.url:
                 found_count += 1
@@ -819,6 +871,7 @@ def enrich_linkedin_rows(payload: EnrichRowsPayload, authorization: Optional[str
             updated_records.append(updated_rec)
 
         return {
+            "status": "ok",
             "records": updated_records,
             "summary": {
                 "total": len(records),
@@ -831,7 +884,19 @@ def enrich_linkedin_rows(payload: EnrichRowsPayload, authorization: Optional[str
         }
 
     except FatalSerpError as e:
-        raise HTTPException(status_code=400, detail=f"Fatal SerpAPI error: {str(e)}")
+        logger.error(f"Fatal SerpAPI error before processing: {e}")
+        return {
+            "status": "out_of_credits",
+            "outOfCredits": True,
+            "provider": "serpapi",
+            "message": f"SerpAPI key is out of credits: {str(e)}",
+            "records": [
+                {**r, "enrichmentStatus": "out_of_credits", "notes": f"Paused: SerpAPI key is out of credits ({str(e)})"}
+                for r in records
+            ],
+            "summary": {"total": len(records), "found": 0, "blank": len(records), "searchesBilled": 0, "reviewCount": 0},
+            "review": [],
+        }
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Scraper error: {str(e)}")
@@ -1840,7 +1905,28 @@ def enrich_decision_makers(payload: DecisionMakerPayload, authorization: Optiona
         )
 
         out_record = dict(r)
-        if res.status == "enriched" and res.decision_maker_name:
+        if res.status == "out_of_credits":
+            out_record["enrichmentStatus"] = "out_of_credits"
+            out_record["notes"] = f"Paused: {engine.title()} key is out of credits ({res.error_message or 'Credit limit reached'})."
+            out_record["confidenceScore"] = 0
+            out_record["confidence"] = "none"
+            enriched_results.append(out_record)
+
+            # Mark all remaining records as paused out_of_credits
+            for rem in records[len(enriched_results):]:
+                rem_rec = dict(rem)
+                rem_rec["enrichmentStatus"] = "out_of_credits"
+                rem_rec["notes"] = f"Paused: {engine.title()} key is out of credits."
+                enriched_results.append(rem_rec)
+
+            return {
+                "status": "out_of_credits",
+                "outOfCredits": True,
+                "provider": engine,
+                "message": f"{engine.title()} key is out of credits: {res.error_message or 'Credit limit reached'}. Please configure a new key to resume.",
+                "results": enriched_results,
+            }
+        elif res.status == "enriched" and res.decision_maker_name:
             out_record["personName"] = res.decision_maker_name
             out_record["title"] = res.position
             out_record["linkedinUrl"] = res.personal_linkedin_url
@@ -1961,7 +2047,7 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
     user_keys = database.get_user_keys(user["id"]) if user else {}
 
     cfg = load_leadocean_config()
-    api_key = (payload.apiKey or user_keys.get("leadocean_api_key", "") or os.environ.get("LEADOCEAN_API_KEY", "")).strip()
+    api_key = (payload.apiKey or (user_keys.get("leadocean_api_key") or "").strip() or os.environ.get("LEADOCEAN_API_KEY", "")).strip()
     delay = payload.delay or 0.3
     overwrite = bool(payload.overwrite)
 
@@ -1969,9 +2055,10 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
     enriched_results: List[Dict[str, Any]] = []
 
     for r in records:
-        # Check if already has email and overwrite is False
+        # Check if already has both email and phone when overwrite is False
         existing_email = r.get("email") or r.get("Email") or (r.get("customFields", {}) or {}).get("Email")
-        if existing_email and not overwrite:
+        existing_phone = r.get("phone") or r.get("Phone") or (r.get("customFields", {}) or {}).get("Phone")
+        if existing_email and existing_phone and not overwrite:
             enriched_results.append(dict(r))
             continue
 
@@ -2066,6 +2153,16 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
         if "customFields" not in out_record or not isinstance(out_record["customFields"], dict):
             out_record["customFields"] = {}
 
+        # Save resolved LinkedIn URL and name if auto-discovered
+        if res.decision_maker_linkedin and not out_record.get("linkedinUrl"):
+            out_record["linkedinUrl"] = res.decision_maker_linkedin
+            out_record["customFields"]["Decision Maker Linkedin"] = res.decision_maker_linkedin
+            out_record["customFields"]["Decision Maker LinkedIn URL"] = res.decision_maker_linkedin
+
+        if res.decision_maker_name and not out_record.get("personName"):
+            out_record["personName"] = res.decision_maker_name
+            out_record["customFields"]["Decision Maker Name"] = res.decision_maker_name
+
         if res.email:
             out_record["email"] = res.email
             out_record["emailStatus"] = "verified"
@@ -2076,6 +2173,26 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
             out_record["customFields"]["Phone"] = res.phone
 
         out_record["customFields"]["Enrich Status"] = res.enrich_status
+
+        is_out_of_credits = (
+            res.enrich_status.startswith("error")
+            and (
+                "credits_required" in res.enrich_status.lower()
+                or any(w in (res.raw_error or "").lower() for w in ["credit", "quota", "balance", "insufficient"])
+            )
+        )
+
+        if is_out_of_credits:
+            out_record["enrichmentStatus"] = "out_of_credits"
+            out_record["notes"] = "Key is out of credits. Please update LeadOcean API key."
+            out_record["customFields"]["Enrich Status"] = "out_of_credits"
+            enriched_results.append(out_record)
+            return {
+                "status": "out_of_credits",
+                "outOfCredits": True,
+                "message": "Key is out of credits. Please update your LeadOcean API key to continue.",
+                "results": enriched_results,
+            }
 
         if res.enrich_status == "found":
             out_record["enrichmentStatus"] = "enriched"
@@ -2178,18 +2295,43 @@ def enrich_company_websites(payload: WebsiteEnrichmentPayload, authorization: Op
     )
 
     raw_response = None
+    is_gemini_credit_error = False
+    gemini_error_msg = ""
     try:
         raw_response = call_gemini_api(prompt, api_key=api_key, timeout=45)
+    except GeminiCreditError as ge:
+        is_gemini_credit_error = True
+        gemini_error_msg = str(ge)
     except Exception as e:
         env_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if env_key and api_key != env_key:
             logger.info("Retrying Gemini website enrichment with environment fallback key...")
             try:
                 raw_response = call_gemini_api(prompt, api_key=env_key, timeout=45)
+            except GeminiCreditError as ge2:
+                is_gemini_credit_error = True
+                gemini_error_msg = str(ge2)
             except Exception as e2:
                 logger.warning(f"Gemini fallback error: {e2}")
         else:
             logger.warning(f"Gemini website research error: {e}")
+
+    if is_gemini_credit_error:
+        logger.error(f"Halting website search: {gemini_error_msg}")
+        return {
+            "status": "out_of_credits",
+            "outOfCredits": True,
+            "provider": "gemini",
+            "message": f"Google Gemini API key has exceeded its quota or is out of credits: {gemini_error_msg}",
+            "results": [
+                {
+                    **r,
+                    "enrichmentStatus": "out_of_credits",
+                    "notes": "Paused: Google Gemini key out of credits / quota exceeded",
+                }
+                for r in records
+            ],
+        }
 
     if raw_response:
         try:
@@ -2255,14 +2397,9 @@ def enrich_company_websites(payload: WebsiteEnrichmentPayload, authorization: Op
             out["lastEnrichedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             out["notes"] = f"Verified via Google Gemini AI (Founder: {founder or 'N/A'})"
         else:
-            cname = out.get("companyName") or "Company"
-            slug = re.sub(r"[^a-zA-Z0-9]", "", cname).lower()
-            clean_dom = f"{slug}.com"
-            out["companyWebsite"] = out.get("companyWebsite") or f"https://www.{clean_dom}"
-            out["domain"] = out.get("domain") or clean_dom
-            out["enrichmentStatus"] = "enriched"
-            out["confidenceScore"] = 80
-            out["notes"] = "Estimated canonical domain via Gemini web resolution"
+            out["enrichmentStatus"] = "not_found"
+            out["confidenceScore"] = 0
+            out["notes"] = "No canonical corporate website or founder match verified by Gemini AI"
 
         enriched_results.append(out)
 

@@ -45,7 +45,7 @@ export interface EnrichmentRecord {
 
   // Metadata & scores
   confidenceScore?: number; // 0 to 100
-  enrichmentStatus: 'idle' | 'processing' | 'enriched' | 'not_found' | 'error';
+  enrichmentStatus: 'idle' | 'processing' | 'enriched' | 'not_found' | 'error' | 'out_of_credits';
   lastEnrichedAt?: string;
   notes?: string;
 
@@ -118,7 +118,7 @@ export interface ResearchProgress {
   currentIndex: number;
   totalCount: number;
   percentage: number;
-  status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
+  status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error' | 'paused';
   stageMessage: string;
   currentItemName: string;
   leadsFound: number;
