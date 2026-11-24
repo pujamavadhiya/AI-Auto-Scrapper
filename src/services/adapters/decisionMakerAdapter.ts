@@ -1,6 +1,7 @@
 import { IResearchAdapter, ModuleMetadata } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
 import { getApiBaseUrl, getAuthHeaders } from '../../config/api';
+import { storageService } from '../storageService';
 
 export class DecisionMakerAdapter implements IResearchAdapter {
   readonly metadata: ModuleMetadata = {
@@ -112,6 +113,10 @@ export class DecisionMakerAdapter implements IResearchAdapter {
           };
         });
 
+        const activeSettings = storageService.getSettings();
+        const effectiveSerperKey = (config.serperApiKey || config.serperKey || activeSettings?.serperApiKey || '').trim();
+        const effectiveSerpApiKey = (config.serpApiKey || config.serpapiKey || activeSettings?.serpApiKey || '').trim();
+
         const response = await fetch(`${apiBase}/api/enrich/decision-makers`, {
           method: 'POST',
           headers: getAuthHeaders({
@@ -120,7 +125,10 @@ export class DecisionMakerAdapter implements IResearchAdapter {
           body: JSON.stringify({
             records: payloadRecords,
             engine: engine,
-            serperKey: config.serperApiKey,
+            serperKey: effectiveSerperKey || undefined,
+            serperApiKey: effectiveSerperKey || undefined,
+            serpapiKey: effectiveSerpApiKey || undefined,
+            serpApiKey: effectiveSerpApiKey || undefined,
             maxQueries: 2,
             delay: engine === 'serper' ? 0.6 : 0.5,
           }),
@@ -130,7 +138,16 @@ export class DecisionMakerAdapter implements IResearchAdapter {
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
           const errMsg = errData.detail || errData.message || `Server error (${response.status})`;
-          if (response.status === 402 || errMsg.toLowerCase().includes('credit') || errMsg.toLowerCase().includes('searches')) {
+          if (
+            response.status === 402 ||
+            response.status === 429 ||
+            errMsg.toLowerCase().includes('credit') ||
+            errMsg.toLowerCase().includes('searches') ||
+            errMsg.toLowerCase().includes('quota') ||
+            errMsg.toLowerCase().includes('missing or unconfigured') ||
+            errMsg.toLowerCase().includes('unauthorized') ||
+            errMsg.toLowerCase().includes('invalid api key')
+          ) {
             const creditErr: any = new Error(errMsg);
             creditErr.outOfCredits = true;
             creditErr.provider = engine;

@@ -231,16 +231,16 @@ def serp_search(query: str, api_key: str, num: int = 10, retries: int = 2) -> Li
                 return results
             err = data.get("error", f"HTTP {r.status_code}")
             low_err = str(err).lower()
-            if "no results" in low_err:
+            if "no results" in low_err or "hasn't returned any results" in low_err or "hasn’t returned any results" in low_err:
                 _SEARCH_CACHE[cache_key] = []
                 return []
             if "run out of searches" in low_err or "out of searches" in low_err:
                 logger.error("SerpApi: out of search credits.")
                 raise CreditLimitError("serpapi", f"SerpApi out of search credits: {err}")
-            if r.status_code in (401, 403) or "invalid api key" in low_err:
+            if r.status_code in (401, 403) or "invalid api key" in low_err or "unauthorized" in low_err:
                 logger.error(f"SerpApi auth error: {err}")
                 raise CreditLimitError("serpapi", f"SerpApi key error: {err}")
-            if r.status_code in (402, 429) or "credit" in low_err:
+            if r.status_code in (402, 429) or any(k in low_err for k in ("credit", "quota", "plan", "searches", "rate limit")):
                 logger.error(f"SerpApi quota/credit error: {err}")
                 raise CreditLimitError("serpapi", f"SerpApi out of credits or quota reached: {err}")
             logger.warning(f"    SerpApi error: {err} (attempt {attempt + 1})")
@@ -329,12 +329,16 @@ def serper_search(query: str, api_key: str, num: int = 10, retries: int = 2) -> 
                 results = r.json().get("organic", []) or []
                 _SERPER_CACHE[cache_key] = results
                 return results
-            if (r.status_code == 400 and "credit" in r.text.lower()) or r.status_code == 402:
+            low_text = r.text.lower()
+            if (r.status_code == 400 and ("credit" in low_text or "not enough" in low_text)) or r.status_code == 402:
                 logger.error("Serper: out of credits.")
                 raise CreditLimitError("serper", f"Serper.dev is out of credits (HTTP {r.status_code}): {r.text[:120]}")
-            if r.status_code in (401, 403):
+            if r.status_code in (401, 403) or "unauthorized" in low_text or "invalid api key" in low_text or "not valid" in low_text:
                 logger.error(f"Serper auth error (HTTP {r.status_code}). Check SERPER_API_KEY.")
-                raise CreditLimitError("serper", f"Serper auth error (HTTP {r.status_code}). Check SERPER_API_KEY.")
+                raise CreditLimitError("serper", f"Serper auth error (HTTP {r.status_code}): {r.text[:120]}")
+            if r.status_code == 429 or any(k in low_text for k in ("credit", "quota", "rate limit")):
+                logger.error(f"Serper quota/credit error (HTTP {r.status_code}): {r.text[:120]}")
+                raise CreditLimitError("serper", f"Serper.dev credit or rate limit exceeded (HTTP {r.status_code}): {r.text[:120]}")
             logger.warning(f"    Serper HTTP {r.status_code} (attempt {attempt + 1})")
         except CreditLimitError:
             raise

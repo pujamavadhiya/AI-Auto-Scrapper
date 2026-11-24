@@ -139,6 +139,26 @@ export const DecisionMakerFinder: React.FC = () => {
     if (!cleanKey) return;
     setIsSavingInlineKey(true);
     try {
+      if (selectedEngine === 'serper') {
+        await updateKeys({ serper_key: cleanKey, serperKey: cleanKey });
+        storageService.saveSettings({ serperApiKey: cleanKey });
+        setConfig((prev) => ({ ...prev, serperApiKey: cleanKey, serperKey: cleanKey }));
+        setServerConfig((prev) => ({
+          ...prev,
+          hasSerperApiKey: true,
+          serperApiKeyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
+        }));
+      } else {
+        await updateKeys({ serpapi_key: cleanKey, serpapiKey: cleanKey });
+        storageService.saveSettings({ serpApiKey: cleanKey });
+        setConfig((prev) => ({ ...prev, serpApiKey: cleanKey, serpapiKey: cleanKey }));
+        setServerConfig((prev) => ({
+          ...prev,
+          hasSerpApiKey: true,
+          serpApiKeyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
+        }));
+      }
+
       const apiBase = getApiBaseUrl();
       if (apiBase) {
         await fetch(`${apiBase}/api/decision-makers/config`, {
@@ -146,25 +166,10 @@ export const DecisionMakerFinder: React.FC = () => {
           headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify(
             selectedEngine === 'serper'
-              ? { serperKey: cleanKey }
-              : { serpapiKey: cleanKey }
+              ? { serperKey: cleanKey, serperApiKey: cleanKey }
+              : { serpapiKey: cleanKey, serpApiKey: cleanKey }
           ),
         });
-      }
-      if (selectedEngine === 'serper') {
-        storageService.saveSettings({ serperApiKey: cleanKey });
-        setServerConfig((prev) => ({
-          ...prev,
-          hasSerperApiKey: true,
-          serperApiKeyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
-        }));
-      } else {
-        storageService.saveSettings({ serpApiKey: cleanKey });
-        setServerConfig((prev) => ({
-          ...prev,
-          hasSerpApiKey: true,
-          serpApiKeyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
-        }));
       }
       setInlineKeyInput('');
       alert(`${selectedEngine === 'serper' ? 'Serper.dev' : 'SerpApi'} key saved successfully!`);
@@ -338,7 +343,7 @@ export const DecisionMakerFinder: React.FC = () => {
     }
   };
 
-  const handleStartEnrichment = async (subsetIds?: string[]) => {
+  const handleStartEnrichment = async (subsetIds?: string[], overrideKey?: string) => {
     const targets = subsetIds
       ? records.filter((r) => subsetIds.includes(r.id))
       : records;
@@ -352,13 +357,25 @@ export const DecisionMakerFinder: React.FC = () => {
 
     try {
       const activeSettings = storageService.getSettings();
+      const effectiveSerperKey = selectedEngine === 'serper'
+        ? (overrideKey?.trim() || config.serperApiKey || config.serperKey || activeSettings?.serperApiKey)
+        : undefined;
+      const effectiveSerpApiKey = selectedEngine === 'serpapi'
+        ? (overrideKey?.trim() || config.serpApiKey || config.serpapiKey || activeSettings?.serpApiKey)
+        : undefined;
+
+      const enrichmentConfig: ResearchConfig = {
+        ...config,
+        decisionMakerEngine: selectedEngine,
+        serperApiKey: effectiveSerperKey,
+        serperKey: effectiveSerperKey,
+        serpApiKey: effectiveSerpApiKey,
+        serpapiKey: effectiveSerpApiKey,
+      };
+
       await decisionMakerService.enrichBatch(
         targets,
-        {
-          ...config,
-          decisionMakerEngine: selectedEngine,
-          serperApiKey: config.serperApiKey || activeSettings?.serperApiKey,
-        },
+        enrichmentConfig,
         (p) => setProgress(p),
         abortControllerRef.current.signal,
         (chunkResults) => {
@@ -422,13 +439,18 @@ export const DecisionMakerFinder: React.FC = () => {
 
   const handleResumeEnrichment = async (newKey?: string) => {
     const isSerper = (outOfCredits?.provider || selectedEngine) === 'serper';
+    let cleanKey = newKey?.trim() || '';
 
-    if (newKey && newKey.trim()) {
-      const cleanKey = newKey.trim();
+    if (cleanKey) {
       try {
-        await updateKeys(isSerper ? { serper_key: cleanKey } : { serpapi_key: cleanKey });
+        await updateKeys(
+          isSerper
+            ? { serper_key: cleanKey, serperKey: cleanKey }
+            : { serpapi_key: cleanKey, serpapiKey: cleanKey }
+        );
         if (isSerper) {
           storageService.saveSettings({ serperApiKey: cleanKey });
+          setConfig((prev) => ({ ...prev, serperApiKey: cleanKey, serperKey: cleanKey }));
           setServerConfig((prev) => ({
             ...prev,
             hasSerperApiKey: true,
@@ -436,15 +458,32 @@ export const DecisionMakerFinder: React.FC = () => {
           }));
         } else {
           storageService.saveSettings({ serpApiKey: cleanKey });
+          setConfig((prev) => ({ ...prev, serpApiKey: cleanKey, serpapiKey: cleanKey }));
           setServerConfig((prev) => ({
             ...prev,
             hasSerpApiKey: true,
             serpApiKeyPreview: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
           }));
         }
+
+        const apiBase = getApiBaseUrl();
+        if (apiBase) {
+          fetch(`${apiBase}/api/decision-makers/config`, {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify(
+              isSerper
+                ? { serperKey: cleanKey, serperApiKey: cleanKey }
+                : { serpapiKey: cleanKey, serpApiKey: cleanKey }
+            ),
+          }).catch((err) => console.warn('Failed to sync decision-makers config:', err));
+        }
       } catch (e) {
         console.warn('Failed to update key:', e);
       }
+    } else {
+      const activeSettings = storageService.getSettings();
+      cleanKey = (isSerper ? activeSettings?.serperApiKey : activeSettings?.serpApiKey) || '';
     }
 
     setOutOfCredits(null);
@@ -456,7 +495,7 @@ export const DecisionMakerFinder: React.FC = () => {
 
     if (unEnriched.length > 0) {
       const ids = unEnriched.map((r) => r.id);
-      await handleStartEnrichment(ids);
+      await handleStartEnrichment(ids, cleanKey);
     } else {
       alert('All records have already been enriched!');
     }

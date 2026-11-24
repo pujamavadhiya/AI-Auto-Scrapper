@@ -83,6 +83,9 @@ export interface ResearchConfig {
   openAiModel?: string;
   decisionMakerEngine?: 'serpapi' | 'serper';
   serperApiKey?: string;
+  serperKey?: string;
+  serpApiKey?: string;
+  serpapiKey?: string;
   leadoceanApiKey?: string;
   apiKey?: string;
 }

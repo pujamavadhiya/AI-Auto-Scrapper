@@ -159,7 +159,7 @@ export const LinkedInFinder: React.FC = () => {
     });
   };
 
-  const handleStartEnrichment = async (subsetIds?: string[]) => {
+  const handleStartEnrichment = async (subsetIds?: string[], overrideKey?: string) => {
     const targets = subsetIds
       ? records.filter((r) => subsetIds.includes(r.id))
       : records;
@@ -168,10 +168,19 @@ export const LinkedInFinder: React.FC = () => {
 
     abortControllerRef.current = new AbortController();
 
+    const activeSettings = storageService.getSettings();
+    const effectiveKey = overrideKey?.trim() || config.serpApiKey || activeSettings?.serpApiKey;
+
+    const enrichmentConfig: ResearchConfig = {
+      ...config,
+      serpApiKey: effectiveKey,
+      serpapiKey: effectiveKey,
+    };
+
     try {
       const enrichedBatch = await linkedinFinderService.enrichBatch(
         targets,
-        config,
+        enrichmentConfig,
         (p) => setProgress(p),
         abortControllerRef.current.signal,
         (chunkResults) => {
@@ -234,11 +243,13 @@ export const LinkedInFinder: React.FC = () => {
   };
 
   const handleResumeEnrichment = async (newKey?: string) => {
-    if (newKey && newKey.trim()) {
-      const cleanKey = newKey.trim();
+    let cleanKey = newKey?.trim() || '';
+
+    if (cleanKey) {
       try {
-        await updateKeys({ serpapi_key: cleanKey });
+        await updateKeys({ serpapi_key: cleanKey, serpapiKey: cleanKey });
         storageService.saveSettings({ serpApiKey: cleanKey });
+        setConfig((prev) => ({ ...prev, serpApiKey: cleanKey, serpapiKey: cleanKey }));
         setBackendHealth((prev) => ({
           ...prev,
           hasKey: true,
@@ -247,6 +258,9 @@ export const LinkedInFinder: React.FC = () => {
       } catch (e) {
         console.warn('Failed to update SerpApi key:', e);
       }
+    } else {
+      const activeSettings = storageService.getSettings();
+      cleanKey = activeSettings?.serpApiKey || '';
     }
 
     setOutOfCredits(null);
@@ -258,7 +272,7 @@ export const LinkedInFinder: React.FC = () => {
 
     if (unEnriched.length > 0) {
       const ids = unEnriched.map((r) => r.id);
-      await handleStartEnrichment(ids);
+      await handleStartEnrichment(ids, cleanKey);
     } else {
       alert('All records have already been verified!');
     }

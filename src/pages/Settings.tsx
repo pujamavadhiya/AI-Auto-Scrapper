@@ -223,12 +223,31 @@ export const Settings: React.FC = () => {
 
     // Sync to backend per-user private keys
     const backendKeys: Record<string, string> = {};
-    if (updated.serpApiKey !== undefined) backendKeys.serpapiKey = updated.serpApiKey;
-    if (updated.serperApiKey !== undefined) backendKeys.serperKey = updated.serperApiKey;
-    if (updated.geminiApiKey !== undefined) backendKeys.geminiApiKey = updated.geminiApiKey;
-    if (updated.leadoceanApiKey !== undefined) backendKeys.leadoceanApiKey = updated.leadoceanApiKey;
-    if (updated.leadoceanEndpoint !== undefined) backendKeys.leadoceanEndpoint = updated.leadoceanEndpoint;
-    if (updated.defaultDecisionMakerEngine !== undefined) backendKeys.defaultEngine = updated.defaultDecisionMakerEngine;
+    if (updated.serpApiKey !== undefined) {
+      backendKeys.serpapiKey = updated.serpApiKey;
+      backendKeys.serpapi_key = updated.serpApiKey;
+    }
+    if (updated.serperApiKey !== undefined) {
+      backendKeys.serperKey = updated.serperApiKey;
+      backendKeys.serper_key = updated.serperApiKey;
+    }
+    if (updated.geminiApiKey !== undefined) {
+      backendKeys.geminiApiKey = updated.geminiApiKey;
+      backendKeys.gemini_api_key = updated.geminiApiKey;
+    }
+    if (updated.leadoceanApiKey !== undefined) {
+      backendKeys.leadoceanApiKey = updated.leadoceanApiKey;
+      backendKeys.leadocean_api_key = updated.leadoceanApiKey;
+      backendKeys.apiKey = updated.leadoceanApiKey;
+    }
+    if (updated.leadoceanEndpoint !== undefined) {
+      backendKeys.leadoceanEndpoint = updated.leadoceanEndpoint;
+      backendKeys.leadocean_endpoint = updated.leadoceanEndpoint;
+    }
+    if (updated.defaultDecisionMakerEngine !== undefined) {
+      backendKeys.defaultEngine = updated.defaultDecisionMakerEngine;
+      backendKeys.default_engine = updated.defaultDecisionMakerEngine;
+    }
 
     if (Object.keys(backendKeys).length > 0) {
       await updateKeys(backendKeys);
@@ -635,8 +654,8 @@ export const Settings: React.FC = () => {
                   if (apiBase) {
                     fetch(`${apiBase}/api/decision-makers/config`, {
                       method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ serpapiKey: key }),
+                      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                      body: JSON.stringify({ serpapiKey: key, serpApiKey: key }),
                     }).catch(() => {});
                   }
                 }}
@@ -673,8 +692,8 @@ export const Settings: React.FC = () => {
                   if (apiBase) {
                     fetch(`${apiBase}/api/decision-makers/config`, {
                       method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ serperKey: key }),
+                      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                      body: JSON.stringify({ serperKey: key, serperApiKey: key }),
                     }).catch(() => {});
                   }
                 }}

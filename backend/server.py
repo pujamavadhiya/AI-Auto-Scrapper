@@ -81,6 +81,9 @@ SOCIAL_TASKS: Dict[str, Dict[str, Any]] = {}
 class EnrichRowsPayload(BaseModel):
     records: List[Dict[str, Any]]
     config: Optional[Dict[str, Any]] = None
+    serpapiKey: Optional[str] = None
+    serpApiKey: Optional[str] = None
+    apiKey: Optional[str] = None
 
 
 class SocialEnrichPayload(BaseModel):
@@ -101,8 +104,10 @@ class SocialStartPayload(BaseModel):
 class DecisionMakerPayload(BaseModel):
     records: List[Dict[str, Any]]
     serpapiKey: Optional[str] = None
+    serpApiKey: Optional[str] = None
     serperKey: Optional[str] = None
     serperApiKey: Optional[str] = None
+    apiKey: Optional[str] = None
     engine: Optional[str] = "serpapi"  # "serpapi" | "serper"
     maxQueries: Optional[int] = 2
     delay: Optional[float] = 0.5
@@ -110,7 +115,9 @@ class DecisionMakerPayload(BaseModel):
 
 class UpdateDecisionMakerConfigPayload(BaseModel):
     serpapiKey: Optional[str] = None
+    serpApiKey: Optional[str] = None
     serperKey: Optional[str] = None
+    serperApiKey: Optional[str] = None
     defaultEngine: Optional[str] = None
 
 
@@ -134,21 +141,27 @@ class LoginPayload(BaseModel):
 
 class UserKeyUpdatePayload(BaseModel):
     serpapiKey: Optional[str] = None
+    serpApiKey: Optional[str] = None
     serpapi_key: Optional[str] = None
     serperKey: Optional[str] = None
+    serperApiKey: Optional[str] = None
     serper_key: Optional[str] = None
+    serper_api_key: Optional[str] = None
     geminiApiKey: Optional[str] = None
     gemini_api_key: Optional[str] = None
     leadoceanApiKey: Optional[str] = None
     leadocean_api_key: Optional[str] = None
+    apiKey: Optional[str] = None
     leadoceanEndpoint: Optional[str] = None
     leadocean_endpoint: Optional[str] = None
+    url: Optional[str] = None
     apifyToken: Optional[str] = None
     apify_token: Optional[str] = None
     openaiApiKey: Optional[str] = None
     openai_api_key: Optional[str] = None
     defaultEngine: Optional[str] = None
     default_engine: Optional[str] = None
+    defaultDecisionMakerEngine: Optional[str] = None
 
 
 class ChatMessageItem(BaseModel):
@@ -291,29 +304,32 @@ def get_user_keys_endpoint(authorization: Optional[str] = Header(None)):
 @app.post("/api/user/keys")
 def update_user_keys_endpoint(payload: UserKeyUpdatePayload, authorization: Optional[str] = Header(None)):
     """Updates API keys for the logged-in user in their private database record and active process environment."""
-    user = get_current_user(authorization)
-    updated = database.update_user_keys(user["id"], payload.model_dump(exclude_unset=True))
+    user = get_current_user_optional(authorization)
+    updated = {}
+    if user:
+        updated = database.update_user_keys(user["id"], payload.model_dump(exclude_unset=True))
 
     # Synchronize newly saved keys into runtime environment so all active modules pick them up immediately
-    s_key = (payload.serpapiKey or payload.serpapi_key or "").strip()
+    s_key = (payload.serpapiKey or payload.serpApiKey or payload.serpapi_key or "").strip()
     if s_key:
         os.environ["SERPAPI_KEY"] = s_key
-    sr_key = (payload.serperKey or payload.serper_key or "").strip()
+    sr_key = (payload.serperKey or payload.serperApiKey or payload.serper_key or payload.serper_api_key or "").strip()
     if sr_key:
         os.environ["SERPER_API_KEY"] = sr_key
     g_key = (payload.geminiApiKey or payload.gemini_api_key or "").strip()
     if g_key:
         os.environ["GEMINI_API_KEY"] = g_key
-    lo_key = (payload.leadoceanApiKey or payload.leadocean_api_key or "").strip()
+    lo_key = (payload.leadoceanApiKey or payload.leadocean_api_key or payload.apiKey or "").strip()
     if lo_key:
         os.environ["LEADOCEAN_API_KEY"] = lo_key
     ap_key = (payload.apifyToken or payload.apify_token or "").strip()
     if ap_key:
         os.environ["APIFY_TOKEN"] = ap_key
 
+    msg = f"API keys updated successfully for {user['email']}." if user else "API keys updated successfully in server environment."
     return {
         "status": "ok",
-        "message": f"API keys updated successfully for {user['email']}.",
+        "message": msg,
         "keys": updated,
     }
 
@@ -768,13 +784,34 @@ def enrich_linkedin_rows(payload: EnrichRowsPayload, authorization: Optional[str
     user_config = payload.config or {}
 
     user = get_current_user_optional(authorization)
-    api_key = get_effective_user_key(user, "serpapi_key", fallback_env="SERPAPI_KEY")
+
+    # Priority: explicit client payload > user_config > database user_keys > environment
+    client_key = (
+        payload.serpapiKey
+        or payload.serpApiKey
+        or payload.apiKey
+        or user_config.get("serpapiKey")
+        or user_config.get("serpApiKey")
+        or ""
+    ).strip()
+
+    if client_key:
+        api_key = client_key
+        if user:
+            database.update_user_keys(user["id"], {"serpapi_key": client_key})
+        os.environ["SERPAPI_KEY"] = client_key
+    else:
+        api_key = get_effective_user_key(user, "serpapi_key", fallback_env="SERPAPI_KEY")
+
     if not api_key or api_key.startswith("your_"):
-        user_msg = f" for account {user['email']}" if user else " in .env file"
-        raise HTTPException(
-            status_code=400,
-            detail=f"SERPAPI_KEY is missing or unconfigured{user_msg}. Please configure your SerpAPI key in Platform Settings."
-        )
+        user_msg = f" for account {user['email']}" if user else ""
+        return {
+            "status": "out_of_credits",
+            "outOfCredits": True,
+            "provider": "serpapi",
+            "message": f"SERPAPI_KEY is missing or unconfigured{user_msg}. Please enter a valid SerpAPI key to proceed.",
+            "records": records,
+        }
 
     cfg = Config(
         min_confidence=user_config.get("minConfidence", "medium"),
@@ -810,35 +847,47 @@ def enrich_linkedin_rows(payload: EnrichRowsPayload, authorization: Optional[str
 
             try:
                 res = finder.find(lk)
-            except FatalSerpError as fe:
-                logger.error(f"Fatal SerpAPI credit/key error on record {i + 1}: {fe}")
-                # Preserve this record and subsequent records as paused with out_of_credits status
-                curr_rec = dict(rec)
-                curr_rec["enrichmentStatus"] = "out_of_credits"
-                curr_rec["notes"] = f"Paused: SerpAPI key is out of credits ({str(fe)})"
-                updated_records.append(curr_rec)
+            except Exception as fe:
+                msg = str(fe).lower()
+                is_credit_err = isinstance(fe, FatalSerpError) or any(
+                    k in msg for k in ("credit", "searches", "quota", "invalid api key", "unauthorized", "plan", "401", "402", "403", "429")
+                )
+                if is_credit_err:
+                    logger.error(f"Fatal SerpAPI credit/key error on record {i + 1}: {fe}")
+                    # Preserve this record and subsequent records as paused with out_of_credits status
+                    curr_rec = dict(rec)
+                    curr_rec["enrichmentStatus"] = "out_of_credits"
+                    curr_rec["notes"] = f"Paused: SerpAPI key is out of credits ({str(fe)})"
+                    updated_records.append(curr_rec)
 
-                for rem_idx in range(i + 1, len(records)):
-                    rem_rec = dict(records[rem_idx])
-                    rem_rec["enrichmentStatus"] = "out_of_credits"
-                    rem_rec["notes"] = f"Paused: SerpAPI key is out of credits ({str(fe)})"
-                    updated_records.append(rem_rec)
+                    for rem_idx in range(i + 1, len(records)):
+                        rem_rec = dict(records[rem_idx])
+                        rem_rec["enrichmentStatus"] = "out_of_credits"
+                        rem_rec["notes"] = f"Paused: SerpAPI key is out of credits ({str(fe)})"
+                        updated_records.append(rem_rec)
 
-                return {
-                    "status": "out_of_credits",
-                    "outOfCredits": True,
-                    "provider": "serpapi",
-                    "message": f"SerpAPI key is out of search credits: {str(fe)}. Please enter a new key to resume.",
-                    "records": updated_records,
-                    "summary": {
-                        "total": len(records),
-                        "found": found_count,
-                        "blank": len(records) - found_count,
-                        "searchesBilled": client.calls,
-                        "reviewCount": len(review_items),
-                    },
-                    "review": review_items,
-                }
+                    return {
+                        "status": "out_of_credits",
+                        "outOfCredits": True,
+                        "provider": "serpapi",
+                        "message": f"SerpAPI key is out of search credits: {str(fe)}. Please enter a new key to resume.",
+                        "records": updated_records,
+                        "summary": {
+                            "total": len(records),
+                            "found": found_count,
+                            "blank": len(records) - found_count,
+                            "searchesBilled": client.calls,
+                            "reviewCount": len(review_items),
+                        },
+                        "review": review_items,
+                    }
+                else:
+                    logger.warning(f"Non-credit error on record {i + 1}: {fe}")
+                    err_rec = dict(rec)
+                    err_rec["enrichmentStatus"] = "error"
+                    err_rec["notes"] = f"Error: {fe}"
+                    updated_records.append(err_rec)
+                    continue
 
             if res.url:
                 found_count += 1
@@ -908,11 +957,19 @@ async def enrich_linkedin_file(
     min_confidence: str = Form("medium"),
     max_searches: int = Form(3),
     allow_location_conflict: bool = Form(False),
+    api_key: Optional[str] = Form(None),
     authorization: Optional[str] = Header(None),
 ):
     user = get_current_user_optional(authorization)
-    api_key = get_effective_user_key(user, "serpapi_key", fallback_env="SERPAPI_KEY")
-    if not api_key or api_key.startswith("your_"):
+    effective_key = (api_key or "").strip()
+    if effective_key:
+        if user:
+            database.update_user_keys(user["id"], {"serpapi_key": effective_key})
+        os.environ["SERPAPI_KEY"] = effective_key
+    else:
+        effective_key = get_effective_user_key(user, "serpapi_key", fallback_env="SERPAPI_KEY")
+
+    if not effective_key or effective_key.startswith("your_"):
         user_msg = f" for account {user['email']}" if user else " in .env"
         raise HTTPException(
             status_code=400,
@@ -940,7 +997,7 @@ async def enrich_linkedin_file(
         summary = process_file(
             input_path=in_path,
             output_path=out_path,
-            api_key=api_key,
+            api_key=effective_key,
             cfg=cfg,
             cache_path=str(BASE_DIR / "serp_cache.jsonl"),
         )
@@ -1778,50 +1835,50 @@ def get_decision_makers_config(authorization: Optional[str] = Header(None)):
 
 @app.post("/api/decision-makers/config")
 def update_decision_makers_config(payload: UpdateDecisionMakerConfigPayload, authorization: Optional[str] = Header(None)):
-    """Updates SERPAPI_KEY or SERPER_API_KEY for the authenticated user, or in .env if unauthenticated."""
+    """Updates SERPAPI_KEY or SERPER_API_KEY for the authenticated user, and updates runtime environment."""
     user = get_current_user_optional(authorization)
-    if user:
-        keys_to_update = {}
-        if payload.serpapiKey is not None:
-            keys_to_update["serpapi_key"] = payload.serpapiKey.strip()
-        if payload.serperKey is not None:
-            keys_to_update["serper_key"] = payload.serperKey.strip()
-        if payload.defaultEngine is not None:
-            keys_to_update["default_engine"] = payload.defaultEngine.strip()
+    keys_to_update = {}
+    serp_key = (payload.serpapiKey or payload.serpApiKey or "").strip()
+    if serp_key:
+        keys_to_update["serpapi_key"] = serp_key
+        os.environ["SERPAPI_KEY"] = serp_key
+    serper_key = (payload.serperKey or payload.serperApiKey or "").strip()
+    if serper_key:
+        keys_to_update["serper_key"] = serper_key
+        os.environ["SERPER_API_KEY"] = serper_key
+    if payload.defaultEngine is not None:
+        keys_to_update["default_engine"] = payload.defaultEngine.strip()
+
+    if user and keys_to_update:
         database.update_user_keys(user["id"], keys_to_update)
-        return {"status": "ok", "message": f"Decision Maker Finder keys saved for account {user['email']}."}
 
     env_file = ROOT_DIR / ".env"
-    lines = []
     if env_file.exists():
-        lines = env_file.read_text(encoding="utf-8").splitlines()
+        try:
+            lines = env_file.read_text(encoding="utf-8").splitlines()
+            updated_vars = {}
+            if serp_key:
+                updated_vars["SERPAPI_KEY"] = serp_key
+            if serper_key:
+                updated_vars["SERPER_API_KEY"] = serper_key
+            for var_name, var_val in updated_vars.items():
+                found = False
+                new_lines = []
+                for line in lines:
+                    if line.startswith(f"{var_name}="):
+                        new_lines.append(f"{var_name}={var_val}")
+                        found = True
+                    else:
+                        new_lines.append(line)
+                if not found:
+                    new_lines.append(f"{var_name}={var_val}")
+                lines = new_lines
+            env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Could not write .env: {e}")
 
-    updated_vars = {}
-    if payload.serpapiKey is not None:
-        clean = payload.serpapiKey.strip()
-        os.environ["SERPAPI_KEY"] = clean
-        updated_vars["SERPAPI_KEY"] = clean
-
-    if payload.serperKey is not None:
-        clean = payload.serperKey.strip()
-        os.environ["SERPER_API_KEY"] = clean
-        updated_vars["SERPER_API_KEY"] = clean
-
-    for var_name, var_val in updated_vars.items():
-        found = False
-        new_lines = []
-        for line in lines:
-            if line.startswith(f"{var_name}="):
-                new_lines.append(f"{var_name}={var_val}")
-                found = True
-            else:
-                new_lines.append(line)
-        if not found:
-            new_lines.append(f"{var_name}={var_val}")
-        lines = new_lines
-
-    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return {"status": "ok", "message": "Decision Maker Finder keys saved successfully."}
+    msg = f"Decision Maker Finder keys saved for account {user['email']}." if user else "Decision Maker Finder keys saved successfully."
+    return {"status": "ok", "message": msg}
 
 
 @app.post("/api/enrich/decision-makers")
@@ -1843,15 +1900,44 @@ def enrich_decision_makers(payload: DecisionMakerPayload, authorization: Optiona
     user_keys = database.get_user_keys(user["id"]) if user else {}
 
     engine = (payload.engine or user_keys.get("default_engine") or "serpapi").lower().strip()
-    serpapi_key = (payload.serpapiKey or user_keys.get("serpapi_key", "") or os.environ.get("SERPAPI_KEY", "")).strip()
-    serper_key = (payload.serperKey or payload.serperApiKey or user_keys.get("serper_key", "") or os.environ.get("SERPER_API_KEY", "")).strip()
+
+    # Priority: explicit client payload > user_keys > environment
+    client_serpapi_key = (payload.serpapiKey or payload.serpApiKey or payload.apiKey or "").strip()
+    if client_serpapi_key:
+        serpapi_key = client_serpapi_key
+        if user:
+            database.update_user_keys(user["id"], {"serpapi_key": client_serpapi_key})
+        os.environ["SERPAPI_KEY"] = client_serpapi_key
+    else:
+        serpapi_key = (user_keys.get("serpapi_key", "") or os.environ.get("SERPAPI_KEY", "")).strip()
+
+    client_serper_key = (payload.serperKey or payload.serperApiKey or "").strip()
+    if client_serper_key:
+        serper_key = client_serper_key
+        if user:
+            database.update_user_keys(user["id"], {"serper_key": client_serper_key})
+        os.environ["SERPER_API_KEY"] = client_serper_key
+    else:
+        serper_key = (user_keys.get("serper_key", "") or os.environ.get("SERPER_API_KEY", "")).strip()
 
     if engine == "serpapi" and not serpapi_key:
         user_msg = f" for account '{user['email']}'" if user else ""
-        raise HTTPException(status_code=400, detail=f"SerpAPI key is missing or unconfigured{user_msg}. Please configure your SerpAPI key in Platform Settings.")
+        return {
+            "status": "out_of_credits",
+            "outOfCredits": True,
+            "provider": "serpapi",
+            "message": f"SerpAPI key is missing or unconfigured{user_msg}. Please enter a valid SerpAPI key to proceed.",
+            "results": records,
+        }
     if engine == "serper" and not serper_key:
         user_msg = f" for account '{user['email']}'" if user else ""
-        raise HTTPException(status_code=400, detail=f"Serper.dev key is missing or unconfigured{user_msg}. Please configure your Serper key in Platform Settings.")
+        return {
+            "status": "out_of_credits",
+            "outOfCredits": True,
+            "provider": "serper",
+            "message": f"Serper.dev key is missing or unconfigured{user_msg}. Please enter a valid Serper key to proceed.",
+            "results": records,
+        }
 
     max_queries = payload.maxQueries or 2
     delay = payload.delay if payload.delay is not None else (0.6 if engine == "serper" else 0.5)

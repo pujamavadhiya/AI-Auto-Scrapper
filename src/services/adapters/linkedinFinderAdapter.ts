@@ -2,6 +2,7 @@ import { IResearchAdapter, ModuleMetadata, simulateDelay } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
 import { MOCK_COMPANIES } from '../mockData';
 import { getApiBaseUrl, getAuthHeaders } from '../../config/api';
+import { storageService } from '../storageService';
 
 // ---------------------------------------------------------------------------
 // Precision Matching Algorithm (Client-side mirror of python linkedin_finder.py)
@@ -169,6 +170,9 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('filename', file.name);
+    const activeSettings = storageService.getSettings();
+    const effectiveKey = (activeSettings?.serpApiKey || '').trim();
+    if (effectiveKey) formData.append('api_key', effectiveKey);
     if (options?.minConfidence) formData.append('min_confidence', options.minConfidence);
     if (options?.maxSearches) formData.append('max_searches', String(options.maxSearches));
     if (options?.allowLocationConflict !== undefined) {
@@ -303,10 +307,13 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
     const enrichedList: EnrichmentRecord[] = [];
     const chunkSize = 1;
 
+    const activeSettings = storageService.getSettings();
+    const effectiveKey = (config.serpApiKey || config.serpapiKey || activeSettings?.serpApiKey || '').trim();
+
     // Check if backend with SERPAPI_KEY is available
     const health = await this.checkBackendHealth();
 
-    if (health.isOnline && health.hasKey) {
+    if (health.isOnline && (health.hasKey || Boolean(effectiveKey))) {
       const apiBase = getApiBaseUrl();
 
       for (let i = 0; i < totalCount; i += chunkSize) {
@@ -346,10 +353,13 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
             headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               records: chunk,
+              serpapiKey: effectiveKey || undefined,
+              apiKey: effectiveKey || undefined,
               config: {
                 minConfidence: 'medium',
                 maxSearches: 3,
                 allowLocationConflict: false,
+                serpApiKey: effectiveKey || undefined,
               },
             }),
             signal,
@@ -360,9 +370,11 @@ export class LinkedInFinderAdapter implements IResearchAdapter {
             const errMsg = errData.detail || errData.message || `Server error (${response.status})`;
             if (
               response.status === 402 ||
+              response.status === 429 ||
               errMsg.toLowerCase().includes('credit') ||
               errMsg.toLowerCase().includes('searches') ||
-              errMsg.toLowerCase().includes('fatal serpapi error')
+              errMsg.toLowerCase().includes('fatal serpapi error') ||
+              errMsg.toLowerCase().includes('serpapi_key is missing')
             ) {
               const creditErr: any = new Error(errMsg);
               creditErr.outOfCredits = true;
