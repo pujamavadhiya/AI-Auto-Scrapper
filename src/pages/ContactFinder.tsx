@@ -37,11 +37,30 @@ import { getApiBaseUrl, getAuthHeaders } from '../config/api';
 import { historyService } from '../services/historyService';
 import { storageService } from '../services/storageService';
 import { OutOfCreditsBanner } from '../components/common/OutOfCreditsBanner';
+import { useAuth } from '../context/AuthContext';
 
 export const ContactFinder: React.FC = () => {
+  const { keys: authKeys, updateKeys } = useAuth();
   const [activeTab, setActiveTab] = useState<'table' | 'quick' | 'bulk' | 'upload' | 'config'>('table');
   const [records, setRecords] = useState<EnrichmentRecord[]>([]);
   const [parsedFile, setParsedFile] = useState<ParsedFileResult | null>(null);
+
+  // Active LeadOcean API key state
+  const [leadoceanApiKey, setLeadoceanApiKey] = useState<string>(() => {
+    return (
+      storageService.getSettings()?.leadoceanApiKey ||
+      authKeys?.leadocean_api_key ||
+      authKeys?.leadoceanApiKey ||
+      ''
+    );
+  });
+
+  useEffect(() => {
+    const key = authKeys?.leadocean_api_key || authKeys?.leadoceanApiKey;
+    if (key && !leadoceanApiKey) {
+      setLeadoceanApiKey(key);
+    }
+  }, [authKeys?.leadocean_api_key, authKeys?.leadoceanApiKey]);
 
   // Out of credits tracking state
   const [outOfCredits, setOutOfCredits] = useState<{
@@ -150,6 +169,28 @@ export const ContactFinder: React.FC = () => {
   }, []);
 
   const handleSaveConfig = async () => {
+    const key = configForm.apiKey.trim();
+    const url = configForm.url.trim();
+    const authName = configForm.authName.trim();
+
+    if (key) {
+      setLeadoceanApiKey(key);
+      storageService.saveSettings({ leadoceanApiKey: key });
+      try {
+        await updateKeys({ leadocean_api_key: key });
+      } catch (e) {
+        console.warn('Failed to update auth keys:', e);
+      }
+    }
+    if (url) {
+      storageService.saveSettings({ leadoceanEndpoint: url });
+      try {
+        await updateKeys({ leadocean_endpoint: url });
+      } catch (e) {
+        console.warn('Failed to update auth endpoint:', e);
+      }
+    }
+
     const apiBase = getApiBaseUrl();
     if (!apiBase) return;
     try {
@@ -157,9 +198,9 @@ export const ContactFinder: React.FC = () => {
         method: 'POST',
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
-          apiKey: configForm.apiKey.trim() || undefined,
-          url: configForm.url.trim() || undefined,
-          authName: configForm.authName.trim() || undefined,
+          apiKey: key || undefined,
+          url: url || undefined,
+          authName: authName || undefined,
         }),
       });
       if (res.ok) {
@@ -168,7 +209,7 @@ export const ContactFinder: React.FC = () => {
         if (outOfCredits?.active) {
           setOutOfCredits(null);
           setTimeout(() => {
-            handleResumeEnrichment();
+            handleResumeEnrichment(key);
           }, 300);
         }
         setTimeout(() => setConfigSaveNotice(null), 3000);
@@ -403,7 +444,29 @@ export const ContactFinder: React.FC = () => {
     setActiveTab('table');
   };
 
-  const handleStartEnrichment = async (subsetIds?: string[], targetRecords?: EnrichmentRecord[]) => {
+  const handleStartEnrichment = async (
+    subsetIds?: string[],
+    targetRecords?: EnrichmentRecord[],
+    overrideKey?: string
+  ) => {
+    const effectiveKey = (
+      overrideKey ||
+      leadoceanApiKey ||
+      storageService.getSettings()?.leadoceanApiKey ||
+      authKeys?.leadocean_api_key ||
+      authKeys?.leadoceanApiKey ||
+      ''
+    ).trim();
+
+    if (!effectiveKey && !serverConfig.hasApiKey) {
+      setOutOfCredits({
+        active: true,
+        message: 'LeadOcean API key is missing. Please enter your API key to begin contact enrichment.',
+        newApiKey: '',
+      });
+      return;
+    }
+
     const targets =
       targetRecords && targetRecords.length > 0
         ? targetRecords
@@ -416,9 +479,15 @@ export const ContactFinder: React.FC = () => {
     abortControllerRef.current = new AbortController();
 
     try {
+      const activeConfig: ResearchConfig = {
+        ...config,
+        leadoceanApiKey: effectiveKey || undefined,
+        apiKey: effectiveKey || undefined,
+      };
+
       const enrichedBatch = await contactFinderService.enrichBatch(
         targets,
-        config,
+        activeConfig,
         (p) => setProgress(p),
         abortControllerRef.current.signal,
         // onChunk: immediately stream completed chunk into the table
@@ -461,11 +530,11 @@ export const ContactFinder: React.FC = () => {
           ...prev,
           isActive: false,
           status: 'error',
-          stageMessage: 'Halted: Key is out of credits.',
+          stageMessage: 'Halted: Key is invalid or out of credits.',
         }));
         setOutOfCredits({
           active: true,
-          message: 'Key is out of credits. All data fetched so far has been preserved.',
+          message: err.message || 'Key is invalid, expired, or out of credits. All data fetched so far has been preserved.',
           newApiKey: '',
         });
       } else {
@@ -475,20 +544,38 @@ export const ContactFinder: React.FC = () => {
   };
 
   const handleResumeEnrichment = async (overrideApiKey?: string) => {
+    let effectiveKey = (
+      overrideApiKey ||
+      leadoceanApiKey ||
+      storageService.getSettings()?.leadoceanApiKey ||
+      authKeys?.leadocean_api_key ||
+      authKeys?.leadoceanApiKey ||
+      ''
+    ).trim();
+
     if (overrideApiKey && overrideApiKey.trim()) {
+      effectiveKey = overrideApiKey.trim();
+      setLeadoceanApiKey(effectiveKey);
+      storageService.saveSettings({ leadoceanApiKey: effectiveKey });
+      try {
+        await updateKeys({ leadocean_api_key: effectiveKey });
+      } catch (e) {
+        console.warn('Failed to update auth keys:', e);
+      }
+
       const apiBase = getApiBaseUrl();
       if (apiBase) {
         try {
           const res = await fetch(`${apiBase}/api/leadocean/config`, {
             method: 'POST',
             headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ apiKey: overrideApiKey.trim() }),
+            body: JSON.stringify({ apiKey: effectiveKey }),
           });
           if (res.ok) {
             await refreshServerConfig();
           }
         } catch (e) {
-          console.error('Failed to update API key:', e);
+          console.error('Failed to update API key on server:', e);
         }
       }
     }
@@ -505,7 +592,7 @@ export const ContactFinder: React.FC = () => {
       return;
     }
 
-    handleStartEnrichment(remaining.map((r) => r.id), remaining);
+    handleStartEnrichment(remaining.map((r) => r.id), remaining, effectiveKey);
   };
 
   const handleCancelEnrichment = () => {

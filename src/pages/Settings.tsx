@@ -33,7 +33,7 @@ import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 import { storageService } from '../services/storageService';
 import { AppSettings } from '../types';
-import { getApiBaseUrl } from '../config/api';
+import { getApiBaseUrl, getAuthHeaders } from '../config/api';
 import { useAuth } from '../context/AuthContext';
 import { authService } from '../services/authService';
 
@@ -717,7 +717,7 @@ export const Settings: React.FC = () => {
                   if (apiBase) {
                     fetch(`${apiBase}/api/leadocean/config`, {
                       method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
+                      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
                       body: JSON.stringify({ apiKey: key }),
                     }).catch(() => {});
                   }
@@ -744,7 +744,7 @@ export const Settings: React.FC = () => {
                   if (apiBase) {
                     fetch(`${apiBase}/api/leadocean/config`, {
                       method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
+                      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
                       body: JSON.stringify({ url }),
                     }).catch(() => {});
                   }

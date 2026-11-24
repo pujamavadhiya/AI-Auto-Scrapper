@@ -1,6 +1,7 @@
 import { IResearchAdapter, ModuleMetadata } from './baseAdapter';
 import { EnrichmentRecord, ResearchConfig, ResearchProgress } from '../../types';
 import { getApiBaseUrl, getAuthHeaders } from '../../config/api';
+import { storageService } from '../storageService';
 
 export class ContactFinderAdapter implements IResearchAdapter {
   readonly metadata: ModuleMetadata = {
@@ -17,6 +18,13 @@ export class ContactFinderAdapter implements IResearchAdapter {
 
   async enrichSingle(record: EnrichmentRecord, config?: ResearchConfig): Promise<EnrichmentRecord> {
     const apiBase = getApiBaseUrl();
+    const effectiveKey = (
+      config?.leadoceanApiKey ||
+      config?.apiKey ||
+      storageService.getSettings()?.leadoceanApiKey ||
+      ''
+    ).trim();
+
     const payloadRecord = {
       ...record,
       companyName: record.companyName || record.customFields?.['Company'] || record.customFields?.['Company Name'] || '',
@@ -31,6 +39,7 @@ export class ContactFinderAdapter implements IResearchAdapter {
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           records: [payloadRecord],
+          apiKey: effectiveKey || undefined,
           delay: 0,
           overwrite: true,
         }),
@@ -92,6 +101,12 @@ export class ContactFinderAdapter implements IResearchAdapter {
     const enrichedList: EnrichmentRecord[] = [];
     const startTime = Date.now();
     const apiBase = getApiBaseUrl();
+    const effectiveKey = (
+      config.leadoceanApiKey ||
+      config.apiKey ||
+      storageService.getSettings()?.leadoceanApiKey ||
+      ''
+    ).trim();
 
     // Process 1 lead at a time for true real-time streaming updates into the UI
     const chunkSize = 1;
@@ -178,6 +193,7 @@ export class ContactFinderAdapter implements IResearchAdapter {
           }),
           body: JSON.stringify({
             records: payloadRecords,
+            apiKey: effectiveKey || undefined,
             delay: 0.2,
             overwrite: true,
           }),
@@ -187,8 +203,15 @@ export class ContactFinderAdapter implements IResearchAdapter {
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
           const errMsg = errData.detail || errData.message || `Server error (${response.status})`;
-          if (response.status === 402 || errMsg.toLowerCase().includes('credit')) {
-            const creditErr: any = new Error('Key is out of credits');
+          if (
+            response.status === 402 ||
+            response.status === 401 ||
+            response.status === 403 ||
+            errMsg.toLowerCase().includes('credit') ||
+            errMsg.toLowerCase().includes('auth') ||
+            errMsg.toLowerCase().includes('key')
+          ) {
+            const creditErr: any = new Error(errMsg || 'Key is invalid or out of credits');
             creditErr.outOfCredits = true;
             creditErr.partialResults = enrichedList;
             throw creditErr;

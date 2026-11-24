@@ -1990,47 +1990,58 @@ def get_leadocean_config(authorization: Optional[str] = Header(None)):
 
 @app.post("/api/leadocean/config")
 def update_leadocean_config(payload: UpdateLeadOceanConfigPayload, authorization: Optional[str] = Header(None)):
-    """Updates LeadOcean config in user profile, or leadocean_config.json/.env as fallback."""
+    """Updates LeadOcean config in user profile, memory, or leadocean_config.json/.env as fallback."""
     user = get_current_user_optional(authorization)
+    clean_key = (payload.apiKey or "").strip()
+    clean_url = (payload.url or "").strip()
+    clean_auth_name = (payload.authName or "").strip()
+
+    if clean_key:
+        os.environ["LEADOCEAN_API_KEY"] = clean_key
+
     if user:
         keys_to_update = {}
-        if payload.apiKey is not None:
-            keys_to_update["leadocean_api_key"] = payload.apiKey.strip()
-        if payload.url is not None:
-            keys_to_update["leadocean_endpoint"] = payload.url.strip()
+        if clean_key:
+            keys_to_update["leadocean_api_key"] = clean_key
+        if clean_url:
+            keys_to_update["leadocean_endpoint"] = clean_url
         database.update_user_keys(user["id"], keys_to_update)
-        return {"status": "ok", "message": f"LeadOcean settings saved for {user['email']}."}
 
-    cfg = load_leadocean_config()
-    if payload.url:
-        cfg["url"] = payload.url.strip()
-    if payload.authName:
-        cfg["auth_name"] = payload.authName.strip()
+    # Also attempt to persist to disk if possible (non-fatal on read-only/cloud environments)
+    try:
+        cfg = load_leadocean_config()
+        if clean_url:
+            cfg["url"] = clean_url
+        if clean_auth_name:
+            cfg["auth_name"] = clean_auth_name
+        cfg_path = ROOT_DIR / "leadocean_config.json"
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as fe:
+        logger.warning(f"Could not persist leadocean_config.json: {fe}")
 
-    cfg_path = ROOT_DIR / "leadocean_config.json"
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-    if payload.apiKey:
-        clean_key = payload.apiKey.strip()
-        os.environ["LEADOCEAN_API_KEY"] = clean_key
-        env_file = ROOT_DIR / ".env"
-        lines = []
-        if env_file.exists():
-            lines = env_file.read_text(encoding="utf-8").splitlines()
-        found = False
-        new_lines = []
-        for line in lines:
-            if line.startswith("LEADOCEAN_API_KEY="):
+    if clean_key:
+        try:
+            env_file = ROOT_DIR / ".env"
+            lines = []
+            if env_file.exists():
+                lines = env_file.read_text(encoding="utf-8").splitlines()
+            found = False
+            new_lines = []
+            for line in lines:
+                if line.startswith("LEADOCEAN_API_KEY="):
+                    new_lines.append(f"LEADOCEAN_API_KEY={clean_key}")
+                    found = True
+                else:
+                    new_lines.append(line)
+            if not found:
                 new_lines.append(f"LEADOCEAN_API_KEY={clean_key}")
-                found = True
-            else:
-                new_lines.append(line)
-        if not found:
-            new_lines.append(f"LEADOCEAN_API_KEY={clean_key}")
-        env_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+            env_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        except Exception as fe:
+            logger.warning(f"Could not persist .env: {fe}")
 
-    return {"status": "ok", "message": "LeadOcean settings updated successfully."}
+    msg = f"LeadOcean settings saved for {user['email']}." if user else "LeadOcean settings updated successfully."
+    return {"status": "ok", "message": msg}
 
 
 @app.post("/api/enrich/contacts")
@@ -2046,15 +2057,41 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
     user = get_current_user_optional(authorization)
     user_keys = database.get_user_keys(user["id"]) if user else {}
 
-    cfg = load_leadocean_config()
-    api_key = (payload.apiKey or (user_keys.get("leadocean_api_key") or "").strip() or os.environ.get("LEADOCEAN_API_KEY", "")).strip()
+    if payload.apiKey is not None:
+        api_key = payload.apiKey.strip()
+    else:
+        api_key = (
+            (user_keys.get("leadocean_api_key") or "").strip()
+            or os.environ.get("LEADOCEAN_API_KEY", "").strip()
+        )
     delay = payload.delay or 0.3
     overwrite = bool(payload.overwrite)
+
+    if not api_key:
+        # Prompt user to enter their key, stop immediately so UI pauses and shows OutOfCreditsBanner
+        return {
+            "status": "out_of_credits",
+            "outOfCredits": True,
+            "provider": "leadocean",
+            "message": "LeadOcean API key is missing. Please enter your API key to begin contact enrichment.",
+            "results": [
+                {
+                    **dict(r),
+                    "enrichmentStatus": "out_of_credits",
+                    "notes": "LeadOcean API key is missing. Please enter your API key to begin.",
+                    "customFields": {
+                        **(r.get("customFields", {}) or {}),
+                        "Enrich Status": "out_of_credits",
+                    },
+                }
+                for r in records
+            ],
+        }
 
     enricher = LeadOceanEnricher(api_key=api_key)
     enriched_results: List[Dict[str, Any]] = []
 
-    for r in records:
+    for idx, r in enumerate(records):
         # Check if already has both email and phone when overwrite is False
         existing_email = r.get("email") or r.get("Email") or (r.get("customFields", {}) or {}).get("Email")
         existing_phone = r.get("phone") or r.get("Phone") or (r.get("customFields", {}) or {}).get("Phone")
@@ -2174,23 +2211,42 @@ def enrich_contacts(payload: ContactEnrichPayload, authorization: Optional[str] 
 
         out_record["customFields"]["Enrich Status"] = res.enrich_status
 
-        is_out_of_credits = (
+        err_msg = (res.raw_error or res.enrich_status or "").lower()
+        is_credit_or_auth_error = (
             res.enrich_status.startswith("error")
             and (
-                "credits_required" in res.enrich_status.lower()
-                or any(w in (res.raw_error or "").lower() for w in ["credit", "quota", "balance", "insufficient"])
+                "credits_required" in err_msg
+                or "auth_failed" in err_msg
+                or "unauthorized" in err_msg
+                or "forbidden" in err_msg
+                or "401" in err_msg
+                or "402" in err_msg
+                or "403" in err_msg
+                or "api_key is missing" in err_msg
+                or any(w in err_msg for w in ["credit", "quota", "balance", "insufficient", "payment"])
             )
         )
 
-        if is_out_of_credits:
+        if is_credit_or_auth_error:
             out_record["enrichmentStatus"] = "out_of_credits"
-            out_record["notes"] = "Key is out of credits. Please update LeadOcean API key."
+            out_record["notes"] = (
+                "Key is out of credits or unauthorized (HTTP 401/402). Please update LeadOcean API key."
+            )
             out_record["customFields"]["Enrich Status"] = "out_of_credits"
             enriched_results.append(out_record)
+
+            # Preserve remaining unprocessed records as-is
+            for remaining_rec in records[idx + 1:]:
+                enriched_results.append(dict(remaining_rec))
+
             return {
                 "status": "out_of_credits",
                 "outOfCredits": True,
-                "message": "Key is out of credits. Please update your LeadOcean API key to continue.",
+                "provider": "leadocean",
+                "message": (
+                    "LeadOcean API key is invalid, expired, or out of credits (HTTP 401/402). "
+                    "Please update your API key to continue."
+                ),
                 "results": enriched_results,
             }
 
