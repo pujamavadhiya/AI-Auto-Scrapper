@@ -1974,24 +1974,20 @@ def debug_leadocean_endpoint(payload: Optional[Dict[str, Any]] = None, authoriza
     payload = payload or {}
     key = (payload.get("apiKey") or user_keys.get("leadocean_api_key") or os.environ.get("LEADOCEAN_API_KEY", "")).strip()
 
-    enricher = LeadOceanEnricher(api_key=key)
-    res = enricher.enrich_single(
-        company="Microsoft",
-        name="Satya Nadella",
-        linkedin_url="https://www.linkedin.com/in/satyanadella",
-        api_key=key,
-    )
-
-    raw_status = None
-    raw_body = None
-    raw_headers = {}
+    my_ip = "unknown"
     try:
-        r = requests.post(
+        my_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+    except Exception as e:
+        my_ip = f"err: {e}"
+
+    # Variation A: standard x-api-key
+    var_a = {}
+    try:
+        r_a = requests.post(
             "https://api.leadocean.io/v1/people/enrich",
             headers={
                 "x-api-key": key,
                 "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             },
             json={
                 "linkedin_url": "https://www.linkedin.com/in/satyanadella",
@@ -2000,22 +1996,60 @@ def debug_leadocean_endpoint(payload: Optional[Dict[str, Any]] = None, authoriza
             },
             timeout=15,
         )
-        raw_status = r.status_code
-        raw_body = r.text[:300]
-        raw_headers = dict(r.headers)
+        var_a = {"status": r_a.status_code, "body": r_a.text[:200]}
     except Exception as e:
-        raw_body = f"Exception: {e}"
+        var_a = {"error": str(e)}
+
+    # Variation B: Bearer token
+    var_b = {}
+    try:
+        r_b = requests.post(
+            "https://api.leadocean.io/v1/people/enrich",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "linkedin_url": "https://www.linkedin.com/in/satyanadella",
+                "reveal_email": True,
+                "reveal_phone": True,
+            },
+            timeout=15,
+        )
+        var_b = {"status": r_b.status_code, "body": r_b.text[:200]}
+    except Exception as e:
+        var_b = {"error": str(e)}
+
+    # Variation C: Browser UA
+    var_c = {}
+    try:
+        r_c = requests.post(
+            "https://api.leadocean.io/v1/people/enrich",
+            headers={
+                "x-api-key": key,
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            },
+            json={
+                "linkedin_url": "https://www.linkedin.com/in/satyanadella",
+                "reveal_email": True,
+                "reveal_phone": True,
+            },
+            timeout=15,
+        )
+        var_c = {"status": r_c.status_code, "body": r_c.text[:200]}
+    except Exception as e:
+        var_c = {"error": str(e)}
 
     return {
         "user": user["email"] if user else None,
         "key_preview": (key[:6] + "..." + key[-4:]) if len(key) > 10 else key,
-        "enrich_status": res.enrich_status,
-        "raw_error": res.raw_error,
-        "email": res.email,
-        "phone": res.phone,
-        "direct_status": raw_status,
-        "direct_body": raw_body,
-        "direct_headers": raw_headers,
+        "key_length": len(key),
+        "server_outbound_ip": my_ip,
+        "var_a_standard": var_a,
+        "var_b_bearer": var_b,
+        "var_c_browser": var_c,
     }
 
 
